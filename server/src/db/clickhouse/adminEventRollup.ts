@@ -57,7 +57,7 @@ export async function initializeAdminEventRollup(client: ClickHouseClient): Prom
   await client.exec({
     query: `
       CREATE TABLE IF NOT EXISTS ${TARGET_TABLE} (
-        event_hour DateTime,
+        event_hour DateTime('UTC'),
         site_id UInt16,
         event_count UInt64
       )

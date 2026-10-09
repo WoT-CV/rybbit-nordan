@@ -100,7 +100,18 @@ export const getGrowthAccounting = async (
     return reply.status(400).send({ error: "Invalid site ID" });
   }
 
-  const parsedQuery = querySchema.safeParse(request.query);
+  // Accept the unified analytics wire format without breaking existing callers.
+  const wire = request.query as Record<string, unknown>;
+  const parsedQuery = querySchema.safeParse({
+    ...wire,
+    timeZone: wire.time_zone ?? wire.timeZone,
+    startDate: wire.start_date || wire.startDate || undefined,
+    endDate: wire.end_date || wire.endDate || undefined,
+    startDateTime: wire.start_date_time ?? wire.startDateTime,
+    endDateTime: wire.end_date_time ?? wire.endDateTime,
+    pastMinutesStart: wire.past_minutes_start ?? wire.pastMinutesStart,
+    pastMinutesEnd: wire.past_minutes_end ?? wire.pastMinutesEnd,
+  });
   if (!parsedQuery.success) {
     return reply.status(400).send({ error: parsedQuery.error.errors[0]?.message ?? "Invalid query" });
   }

@@ -5,16 +5,18 @@ import { useRouter } from "next/navigation";
 import { useEffect } from "react";
 import { useSetPageTitle } from "../../../../hooks/useSetPageTitle";
 
+// Legacy Stripe success URL: checkouts now return to /{siteId} or /settings/billing. Anyone who still
+// lands here goes to billing, keeping session_id so that page can record the conversion.
 export default function StripeSuccessPage() {
   const t = useExtracted();
   const router = useRouter();
   useSetPageTitle(t("Payment Successful"));
 
   useEffect(() => {
-    // Add a small delay to ensure the page has fully loaded before redirecting
+    // Leave the confirmation on screen for a moment before redirecting
     const redirectTimer = setTimeout(() => {
-      // Redirect to the subscription settings page
-      router.push("/organization/subscription");
+      const sessionId = new URLSearchParams(window.location.search).get("session_id");
+      router.replace(sessionId ? `/settings/billing?session_id=${encodeURIComponent(sessionId)}` : "/settings/billing");
     }, 1000);
 
     // Clean up the timer if the component unmounts
@@ -32,7 +34,7 @@ export default function StripeSuccessPage() {
           {t("Your subscription has been processed successfully.")}
         </p>
         <p className="text-neutral-600 dark:text-neutral-400 mt-2">
-          {t("Redirecting you to your subscription details")}...
+          {t("Redirecting you to your subscription details…")}
         </p>
       </div>
     </div>

@@ -2,14 +2,12 @@ import { createElement } from "react";
 // @ts-ignore - React 19 has built-in types
 import { renderToStaticMarkup } from "react-dom/server";
 import * as CountryFlags from "country-flag-icons/react/3x2";
-import { Monitor, Smartphone } from "lucide-react";
 import { getChannelIconComponent } from "../../../../../../components/Channel";
 import { frogAvatarSVG } from "../../../../../../lib/frogAvatar";
-import {
-  escapeHtmlAttribute,
-  resolveUserIdentity,
-  type UserIdentityLike,
-} from "../../../../../../lib/userIdentity";
+import { escapeHtmlAttribute, resolveUserIdentity, type UserIdentityLike } from "../../../../../../lib/userIdentity";
+import { BROWSER_TO_LOGO } from "../../../../components/shared/icons/Browser";
+import { getDeviceIconComponent } from "../../../../components/shared/icons/Device";
+import { OS_TO_LOGO } from "../../../../components/shared/icons/OperatingSystem";
 
 export function generateAvatarSVG(userId: string, size: number): string {
   return frogAvatarSVG(userId, size);
@@ -50,8 +48,7 @@ export function renderCountryFlag(countryCode: string): string {
 
 // Render device icon based on device type
 export function renderDeviceIcon(deviceType: string): string {
-  const type = deviceType?.toLowerCase() || "";
-  const Icon = type.includes("mobile") || type.includes("tablet") ? Smartphone : Monitor;
+  const Icon = getDeviceIconComponent(deviceType);
   const iconElement = createElement(Icon, { size: 14, className: "inline-block" });
   return renderToStaticMarkup(iconElement);
 }
@@ -66,30 +63,10 @@ export function renderChannelIcon(channel: string): string {
 
 // Get browser icon path
 export function getBrowserIconPath(browser: string): string {
-  const BROWSER_TO_LOGO: Record<string, string> = {
-    Chrome: "Chrome.svg",
-    "Mobile Chrome": "Chrome.svg",
-    Firefox: "Firefox.svg",
-    "Mobile Firefox": "Firefox.svg",
-    Safari: "Safari.svg",
-    "Mobile Safari": "Safari.svg",
-    Edge: "Edge.svg",
-    Opera: "Opera.svg",
-    Brave: "Brave.svg",
-  };
   return BROWSER_TO_LOGO[browser] ? `/browsers/${BROWSER_TO_LOGO[browser]}` : "";
 }
 
 // Get OS icon path
 export function getOSIconPath(os: string): string {
-  const OS_TO_LOGO: Record<string, string> = {
-    Windows: "Windows.svg",
-    Android: "Android.svg",
-    android: "Android.svg",
-    Linux: "Tux.svg",
-    macOS: "macOS.svg",
-    iOS: "Apple.svg",
-    "Chrome OS": "Chrome.svg",
-  };
   return OS_TO_LOGO[os] ? `/operating-systems/${OS_TO_LOGO[os]}` : "";
 }

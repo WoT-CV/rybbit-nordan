@@ -19,8 +19,8 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogClose, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Switch } from "@/components/ui/switch";
 import { toast } from "@/components/ui/sonner";
-import { authClient } from "@/lib/auth";
 import { useConfigs } from "@/lib/configs";
+import { useSitePermissions } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 
 import { ScriptBuilder } from "./ScriptBuilder";
@@ -33,7 +33,6 @@ import { EmbedTab } from "./EmbedTab";
 import { DashboardEmbedTab } from "./DashboardEmbedTab";
 import { UsageTab } from "./UsageTab";
 import { useGetSite } from "../../api/admin/hooks/useSites";
-import { useUserOrganizations } from "../../api/admin/hooks/useOrganizations";
 import { useGetSitesFromOrg } from "../../api/admin/hooks/useSites";
 import { SiteResponse, updateSiteConfig } from "../../api/admin/endpoints";
 
@@ -102,11 +101,9 @@ function SiteSettingsInner({
   initialOpen?: boolean;
 }) {
   const t = useExtracted();
-  const { data: session } = authClient.useSession();
   const { configs } = useConfigs();
-  const { data: userOrganizationsData } = useUserOrganizations();
-  const siteOrgMembership = userOrganizationsData?.find(org => org.id === siteMetadata.organizationId);
-  const disabled = session?.user.role !== "admin" && (!siteOrgMembership?.role || siteOrgMembership.role === "member");
+  const { can } = useSitePermissions(siteMetadata.siteId);
+  const canConfigure = can("sites:configure");
 
   const [dialogOpen, setDialogOpen] = useState(initialOpen);
   const [activeTab, setActiveTab] = useState<TabKey>("general");
@@ -219,17 +216,24 @@ function SiteSettingsInner({
                   <Switch
                     aria-label={t("Enable Embed Widget")}
                     checked={embedEnabled}
-                    disabled={togglingEmbed}
+                    disabled={togglingEmbed || !canConfigure}
                     onCheckedChange={handleToggleEmbed}
                   />
                 </label>
               )}
             </header>
             <div className="flex-1 overflow-y-auto px-6 py-5">
+              {!canConfigure && activeTab !== "script" && activeTab !== "usage" && (
+                <p className="mb-4 rounded-md border border-neutral-200 px-3 py-2 text-xs text-muted-foreground dark:border-neutral-800">
+                  {t("You can view these settings, but your role can't change them.")}
+                </p>
+              )}
               {activeTab === "general" && (
                 <GeneralTab
                   siteMetadata={currentSiteMetadata}
-                  disabled={disabled}
+                  disabled={!canConfigure}
+                  canDelete={can("sites:delete")}
+                  canTransfer={can("sites:transfer")}
                   onClose={() => setDialogOpen(false)}
                   onPublicChange={setSitePublic}
                   adminMode={adminMode}
@@ -238,14 +242,14 @@ function SiteSettingsInner({
               {activeTab === "tracking" && (
                 <TrackingTab
                   siteMetadata={currentSiteMetadata}
-                  disabled={disabled}
+                  disabled={!canConfigure}
                   adminMode={adminMode}
                   adminSubscription={adminOrganization?.subscription}
                 />
               )}
-              {activeTab === "exclusions" && <ExclusionsTab siteId={siteMetadata.siteId} disabled={disabled} />}
+              {activeTab === "exclusions" && <ExclusionsTab siteId={siteMetadata.siteId} disabled={!canConfigure} />}
               {activeTab === "integrations" && configs?.capabilities.googleSearchConsole && (
-                <IntegrationsTab disabled={disabled} siteId={siteMetadata.siteId} />
+                <IntegrationsTab disabled={!can("gsc:write")} siteId={siteMetadata.siteId} />
               )}
               {activeTab === "script" && (
                 <ScriptBuilder
@@ -258,9 +262,11 @@ function SiteSettingsInner({
                 <EmbedTab siteMetadata={currentSiteMetadata} embedEnabled={embedEnabled} />
               )}
               {activeTab === "dashboard-embed" && (
-                <DashboardEmbedTab siteMetadata={currentSiteMetadata} disabled={disabled} />
+                <DashboardEmbedTab siteMetadata={currentSiteMetadata} disabled={!canConfigure} />
               )}
-              {activeTab === "import" && <ImportManager siteId={siteMetadata.siteId} disabled={disabled} />}
+              {activeTab === "import" && (
+                <ImportManager siteId={siteMetadata.siteId} disabled={!can("imports:write")} />
+              )}
               {activeTab === "usage" && <UsageTab siteId={siteMetadata.siteId} />}
             </div>
           </main>

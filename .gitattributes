@@ -1,0 +1,6 @@
+# Keep the served source bytes stable across Windows and Linux builds.
+# gzip/Brotli assets are generated from these files during the server build.
+server/public/script.js text eol=lf
+server/public/script-full.js text eol=lf
+server/public/rrweb.min.js text eol=lf
+server/public/web-vitals.iife.js text eol=lf

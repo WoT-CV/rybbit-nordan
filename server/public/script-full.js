@@ -158,7 +158,7 @@
     return /^[0-9a-f]{32}$/.test(id) && !/^0+$/.test(id) ? id : void 0;
   }
   function readResponseCorrelation(getHeader) {
-    const read = (name) => {
+    const read2 = (name) => {
       try {
         return getHeader(name);
       } catch {
@@ -166,8 +166,8 @@
       }
     };
     return {
-      correlationId: normalizeCorrelationId(read("x-correlation-id")),
-      traceId: normalizeTraceId(read("x-trace-id"))
+      correlationId: normalizeCorrelationId(read2("x-correlation-id")),
+      traceId: normalizeTraceId(read2("x-trace-id"))
     };
   }
 
@@ -203,18 +203,23 @@
   var AI_OPERATOR_REFERRER_DOMAINS = {
     OpenAI: ["chatgpt.com", "chat.openai.com"],
     Anthropic: ["claude.ai"],
-    Google: ["gemini.google.com"],
-    Microsoft: ["copilot.microsoft.com"],
+    Google: ["gemini.google.com", "aistudio.google.com", "notebooklm.google.com"],
+    // edgeservices.bing.com is Copilot in the Edge sidebar; the *.cloud.microsoft
+    // hosts are the Microsoft 365 Copilot web app (m365 → copilot redirect, 2026).
+    Microsoft: ["copilot.microsoft.com", "copilot.cloud.microsoft", "m365.cloud.microsoft", "edgeservices.bing.com"],
     Perplexity: ["perplexity.ai"],
     Meta: ["meta.ai"],
     Mistral: ["chat.mistral.ai", "mistral.ai"],
     xAI: ["grok.com"],
     "You.com": ["you.com"],
-    // DuckDuckGo is deliberately absent: DuckAssistBot crawls, but a referral
-    // from duckduckgo.com is organic search, not an AI chat hand-off, and
-    // listing it here would reclassify every DuckDuckGo visit as AI traffic.
+    // Only duck.ai, DuckDuckGo's chat: a referral from duckduckgo.com is organic
+    // search, not an AI chat hand-off, and listing it here would reclassify
+    // every DuckDuckGo visit as AI traffic.
+    DuckDuckGo: ["duck.ai"],
     Cursor: ["cursor.com"],
-    Cohere: ["coral.cohere.com"]
+    Cohere: ["coral.cohere.com"],
+    Manus: ["manus.im"],
+    ByteDance: ["doubao.com"]
   };
   var AI_REFERRER_DOMAIN_TO_OPERATOR = Object.fromEntries(
     Object.entries(AI_OPERATOR_REFERRER_DOMAINS).flatMap(
@@ -234,12 +239,78 @@
     "chatsonic.com",
     "phind.com",
     "andi.com",
-    "codeium.com"
+    "codeium.com",
+    "kimi.com",
+    "kimi.moonshot.cn",
+    "chat.qwen.ai",
+    "chat.z.ai",
+    "chatglm.cn",
+    "yuanbao.tencent.com",
+    "genspark.ai",
+    "t3.chat"
   ];
   var AI_CHAT_DOMAINS = [
     ...Object.keys(AI_REFERRER_DOMAIN_TO_OPERATOR),
     ...AI_CHAT_ONLY_DOMAINS
   ];
+
+  // ../../../shared/src/permissions.ts
+  var read = (resource) => ({ resource, action: "read" });
+  var write = (resource) => ({ resource, action: "write" });
+  var PERMISSIONS = {
+    // Reading a site's analytics and the organization it belongs to.
+    "analytics:read": { minRole: "viewer", scope: read("analytics") },
+    "sessions:read": { minRole: "viewer", scope: read("sessions") },
+    "events:read": { minRole: "viewer", scope: read("events") },
+    "users:read": { minRole: "viewer", scope: read("users") },
+    "funnels:read": { minRole: "viewer", scope: read("funnels") },
+    "goals:read": { minRole: "viewer", scope: read("goals") },
+    "annotations:read": { minRole: "viewer", scope: read("annotations") },
+    "segments:read": { minRole: "viewer", scope: read("segments") },
+    "dashboards:read": { minRole: "viewer", scope: read("dashboards") },
+    "flags:read": { minRole: "viewer", scope: read("flags") },
+    "experiments:read": { minRole: "viewer", scope: read("experiments") },
+    "replay:read": { minRole: "viewer", scope: read("replay") },
+    "gsc:read": { minRole: "viewer", scope: read("gsc") },
+    "sites:read": { minRole: "viewer", scope: read("sites") },
+    "sql:read": { minRole: "viewer", scope: read("sql") },
+    "org:read": { minRole: "viewer", scope: read("org") },
+    // Building reports: shared analysis objects, and a member's own segments and
+    // annotations (rows another user created need the :manage permission).
+    "users:write": { minRole: "member", scope: write("users") },
+    "replay:export": { minRole: "member", scope: write("replay") },
+    "funnels:write": { minRole: "member", scope: write("funnels") },
+    "goals:write": { minRole: "member", scope: write("goals") },
+    "dashboards:write": { minRole: "member", scope: write("dashboards") },
+    "annotations:write": { minRole: "member", scope: write("annotations") },
+    "segments:write": { minRole: "member", scope: write("segments") },
+    // Configuring a site, and managing saved segments and annotations other people
+    // created (org-wide ones are checked against the organization role).
+    "annotations:manage": { minRole: "editor", scope: write("annotations") },
+    "segments:manage": { minRole: "editor", scope: write("segments") },
+    "users:delete": { minRole: "editor", scope: write("users") },
+    "replay:delete": { minRole: "editor", scope: write("replay") },
+    "flags:write": { minRole: "editor", scope: write("flags") },
+    "experiments:write": { minRole: "editor", scope: write("experiments") },
+    "gsc:write": { minRole: "editor", scope: write("gsc") },
+    "sites:configure": { minRole: "editor", scope: write("sites") },
+    "imports:read": { minRole: "editor", scope: read("sites") },
+    "imports:write": { minRole: "editor", scope: write("sites") },
+    // Administering the organization.
+    "sites:create": { minRole: "admin", scope: write("sites") },
+    "sites:delete": { minRole: "admin", scope: write("sites") },
+    "sites:transfer": { minRole: "admin", scope: write("sites") },
+    "members:manage": { minRole: "admin", scope: write("org") },
+    "teams:manage": { minRole: "admin", scope: write("org") },
+    "apikeys:manage": { minRole: "admin", scope: "deny-scoped" },
+    // Enforced by better-auth's organization access control (orgRoles in the
+    // server's auth.ts); listed here so the client can ask for it by name.
+    "org:rename": { minRole: "admin", scope: "deny-scoped" },
+    // Owning the organization.
+    "billing:manage": { minRole: "owner", scope: "deny-scoped" },
+    "org:delete": { minRole: "owner", scope: "deny-scoped" }
+  };
+  var ALL_PERMISSIONS = Object.keys(PERMISSIONS);
 
   // networkReplay/config.ts
   function normalizeNetworkReplayConfig(config) {
@@ -369,6 +440,17 @@
     }
   }
 
+  // url.ts
+  function getTrackedPathname(url, trackUrlFragments = false) {
+    if (url.hash.startsWith("#/")) {
+      return url.hash.substring(1);
+    }
+    if (url.hash.startsWith("#!/")) {
+      return url.hash.substring(2);
+    }
+    return url.pathname + (trackUrlFragments ? url.hash : "");
+  }
+
   // config.ts
   var FEATURE_FLAG_REQUEST_TIMEOUT_MS = 2e3;
   function createVisitorId() {
@@ -407,13 +489,7 @@
       return void 0;
     }
   }
-  function getEvaluationPathname(url) {
-    if (url.hash && url.hash.startsWith("#/")) {
-      return url.hash.substring(1);
-    }
-    return url.pathname;
-  }
-  async function fetchFeatureFlags(analyticsHost, siteId, namespace, visitorId) {
+  async function fetchFeatureFlags(analyticsHost, siteId, namespace, visitorId, trackUrlFragments) {
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), FEATURE_FLAG_REQUEST_TIMEOUT_MS);
     try {
@@ -429,7 +505,7 @@
           anonymousId: visitorId,
           identifiedUserId: getIdentifiedUserId(namespace),
           hostname: url.hostname,
-          pathname: getEvaluationPathname(url),
+          pathname: getTrackedPathname(url, trackUrlFragments),
           querystring: url.search,
           query: Object.fromEntries(url.searchParams.entries()),
           referrer: document.referrer,
@@ -477,7 +553,7 @@
       return null;
     }
     const namespace = scriptTag.getAttribute("data-namespace") || "rybbit";
-    const visitorId = getOrCreateVisitorId(namespace);
+    const visitorId = createVisitorId();
     const skipPatterns = parseJsonSafely(scriptTag.getAttribute("data-skip-patterns"), []);
     const maskPatterns = parseJsonSafely(scriptTag.getAttribute("data-mask-patterns"), []);
     const sessionReplayMaskTextSelectors = parseJsonSafely(
@@ -520,6 +596,7 @@
       autoTrackPageview: true,
       autoTrackSpa: true,
       trackQuerystring: true,
+      trackUrlFragments: false,
       trackOutbound: true,
       enableWebVitals: false,
       trackErrors: false,
@@ -560,6 +637,7 @@
           autoTrackPageview: apiConfig.trackInitialPageView ?? defaultConfig.autoTrackPageview,
           autoTrackSpa: apiConfig.trackSpaNavigation ?? defaultConfig.autoTrackSpa,
           trackQuerystring: apiConfig.trackUrlParams ?? defaultConfig.trackQuerystring,
+          trackUrlFragments: apiConfig.trackUrlFragments ?? defaultConfig.trackUrlFragments,
           trackOutbound: apiConfig.trackOutbound ?? defaultConfig.trackOutbound,
           enableWebVitals: apiConfig.webVitals ?? defaultConfig.enableWebVitals,
           trackErrors: apiConfig.trackErrors ?? defaultConfig.trackErrors,
@@ -582,7 +660,14 @@
       scriptTag.getAttribute("data-replay-network-mode")
     );
     if (resolvedConfig.featureFlagsEnabled) {
-      const result = await fetchFeatureFlags(analyticsHost, siteId, namespace, visitorId);
+      resolvedConfig.visitorId = getOrCreateVisitorId(namespace);
+      const result = await fetchFeatureFlags(
+        analyticsHost,
+        siteId,
+        namespace,
+        resolvedConfig.visitorId,
+        resolvedConfig.trackUrlFragments
+      );
       resolvedConfig.featureFlagsEnabled = result.enabled;
       resolvedConfig.featureFlags = result.flags;
     }
@@ -2522,6 +2607,7 @@
         `${config.analyticsHost}/session-replay/record/${config.siteId}`,
         config.replayTransport
       );
+      this.lastPageviewUrl = this.getPageviewUrl();
       this.loadUserId();
       if (config.enableSessionReplay) {
         this.initializeSessionReplay();
@@ -2546,7 +2632,7 @@
     }
     getCurrentUrlContext() {
       const url = new URL(window.location.href);
-      const pathname = url.hash && url.hash.startsWith("#/") ? url.hash.substring(1) : url.pathname;
+      const pathname = getTrackedPathname(url, this.config.trackUrlFragments);
       return {
         hostname: url.hostname,
         pathname,
@@ -2615,10 +2701,7 @@
     }
     createBasePayload() {
       const url = new URL(window.location.href);
-      let pathname = url.pathname;
-      if (url.hash && url.hash.startsWith("#/")) {
-        pathname = url.hash.substring(1);
-      }
+      let pathname = getTrackedPathname(url, this.config.trackUrlFragments);
       if (findMatchingPattern(pathname, this.config.skipPatterns)) {
         return null;
       }
@@ -2694,7 +2777,21 @@
       this.sendTrackingData(payload);
     }
     trackPageview() {
+      this.lastPageviewUrl = this.getPageviewUrl();
       this.track("pageview");
+    }
+    trackPageviewIfUrlChanged() {
+      if (this.getPageviewUrl() !== this.lastPageviewUrl) {
+        this.trackPageview();
+      }
+    }
+    getPageviewUrl() {
+      const url = new URL(window.location.href);
+      return JSON.stringify([
+        url.hostname,
+        getTrackedPathname(url, this.config.trackUrlFragments),
+        this.config.trackQuerystring ? url.search : ""
+      ]);
     }
     trackEvent(name, properties = {}) {
       this.track("custom_event", name, properties);
@@ -3416,6 +3513,7 @@
     }
     handleChange(event) {
       const target = event.target;
+      if (!(target instanceof Element)) return;
       const tagName = target.tagName.toUpperCase();
       if (!["INPUT", "SELECT", "TEXTAREA"].includes(tagName)) return;
       if (target.disabled) return;
@@ -3550,7 +3648,7 @@
         });
       });
     }
-    const trackPageview = () => tracker.trackPageview();
+    const trackPageview = () => tracker.trackPageviewIfUrlChanged();
     const debouncedTrackPageview = config.debounceDuration > 0 ? debounce(trackPageview, config.debounceDuration) : trackPageview;
     function setupEventListeners() {
       document.addEventListener("click", function(e2) {

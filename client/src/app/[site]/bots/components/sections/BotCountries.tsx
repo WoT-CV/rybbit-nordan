@@ -2,21 +2,12 @@
 
 import { ChevronRight } from "lucide-react";
 import { useExtracted } from "next-intl";
-import { useSubdivisions } from "../../../../../lib/geo";
+import { parseCityValue, useSubdivisions } from "../../../../../lib/geo";
 import { getCountryName } from "../../../../../lib/utils";
 import { CountryFlag } from "../../../components/shared/icons/CountryFlag";
 import { BotSectionTabs, type BotSectionTab } from "../BotSectionTabs";
 
 type Tab = "countries" | "regions" | "cities";
-
-function getCountryCity(value: string) {
-  if (value.split("-").length === 2) {
-    const [country, city] = value.split("-");
-    return { country, region: "", city };
-  }
-  const [country, region, city] = value.split("-");
-  return { country, region, city };
-}
 
 export function BotCountries() {
   const t = useExtracted();
@@ -75,7 +66,7 @@ export function BotCountries() {
         getKey: item => item.value || "unknown",
         getLabel: item => {
           if (!item.value || item.value === "-") return t("Unknown");
-          const { country, region, city } = getCountryCity(item.value);
+          const { country, region, city } = parseCityValue(item.value);
           const regionName = subdivisions?.features.find(
             feature => feature.properties.iso_3166_2 === `${country}-${region}`
           )?.properties.name;

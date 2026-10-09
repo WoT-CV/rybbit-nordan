@@ -4,6 +4,7 @@ import { z } from "zod";
 import { db } from "../../db/postgres/postgres.js";
 import { userProfiles } from "../../db/postgres/schema.js";
 import { siteConfig } from "../../lib/siteConfig.js";
+import { usageService } from "../usageService.js";
 import { userIdService } from "../userId/userIdService.js";
 import { resolveClientIp } from "./resolveClientIp.js";
 import { createServiceLogger } from "../../lib/logger/logger.js";
@@ -62,6 +63,11 @@ export async function handleIdentify(request: FastifyRequest, reply: FastifyRepl
 
     const requestIp = ip_address || resolveClientIp(request, { firstPartyProxy: siteConfiguration.firstPartyProxy });
     const requestUserAgent = user_agent || request.headers["user-agent"] || "";
+    // A site whose organization has no plan collects nothing, profiles and aliases included.
+    if (usageService.isSiteWithoutPlan(siteId)) {
+      return reply.status(200).send("Site has no plan, identify not stored");
+    }
+
     const anonymousId = anonymous_id
       ? await userIdService.generateUserIdFromClientId(anonymous_id, siteId)
       : await userIdService.generateUserId(requestIp, requestUserAgent, siteId);

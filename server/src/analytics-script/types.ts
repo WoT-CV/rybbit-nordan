@@ -10,6 +10,7 @@ export interface ScriptConfig {
   autoTrackPageview: boolean;
   autoTrackSpa: boolean;
   trackQuerystring: boolean;
+  trackUrlFragments: boolean;
   trackOutbound: boolean;
   enableWebVitals: boolean;
   trackErrors: boolean;

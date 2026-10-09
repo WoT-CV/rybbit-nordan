@@ -3,7 +3,7 @@ import { and, eq, gt, isNull, lt, sql } from "drizzle-orm";
 import { getSubscriptionInner } from "../../api/stripe/getSubscription.js";
 import { clickhouse } from "../../db/clickhouse/clickhouse.js";
 import { db } from "../../db/postgres/postgres.js";
-import { sites } from "../../db/postgres/schema.js";
+import { importStatus, sites } from "../../db/postgres/schema.js";
 import { IS_CLOUD } from "../../lib/const.js";
 import { runtimeCapabilities } from "../../lib/runtimeCapabilities.js";
 import { validateIPPattern } from "../../lib/ipUtils.js";
@@ -13,6 +13,7 @@ import {
   type NetworkReplayConfigUpdate,
 } from "../../lib/networkReplayConfig.js";
 import { detectPlatform } from "../lifecycleEmails/platformDetect.js";
+import { usageService } from "../usageService.js";
 import { siteConfig, type SiteConfigData } from "../../lib/siteConfig.js";
 import { REPLAY_METADATA_V1_TABLE, REPLAY_METADATA_V2_TABLE } from "../replay/replayMetadataMode.js";
 
@@ -39,6 +40,7 @@ export type CreateSiteInput = {
   trackErrors?: boolean;
   trackOutbound?: boolean;
   trackUrlParams?: boolean;
+  trackUrlFragments?: boolean;
   trackInitialPageView?: boolean;
   trackSpaNavigation?: boolean;
   trackIp?: boolean;
@@ -71,6 +73,7 @@ export type UpdateSiteConfigurationInput = {
   trackErrors?: boolean;
   trackOutbound?: boolean;
   trackUrlParams?: boolean;
+  trackUrlFragments?: boolean;
   trackInitialPageView?: boolean;
   trackSpaNavigation?: boolean;
   trackIp?: boolean;
@@ -140,6 +143,7 @@ const DIRECT_UPDATE_FIELDS = [
   "trackErrors",
   "trackOutbound",
   "trackUrlParams",
+  "trackUrlFragments",
   "trackInitialPageView",
   "trackSpaNavigation",
   "trackIp",
@@ -306,6 +310,7 @@ class SiteConfigurationLifecycle {
             ...(input.trackErrors !== undefined && { trackErrors: input.trackErrors }),
             ...(input.trackOutbound !== undefined && { trackOutbound: input.trackOutbound }),
             ...(input.trackUrlParams !== undefined && { trackUrlParams: input.trackUrlParams }),
+            ...(input.trackUrlFragments !== undefined && { trackUrlFragments: input.trackUrlFragments }),
             ...(input.trackInitialPageView !== undefined && { trackInitialPageView: input.trackInitialPageView }),
             ...(input.trackSpaNavigation !== undefined && { trackSpaNavigation: input.trackSpaNavigation }),
             ...(input.trackIp !== undefined && { trackIp: input.trackIp }),
@@ -329,6 +334,9 @@ class SiteConfigurationLifecycle {
       }
     });
     if (siteType === "web") this.detectSitePlatform(createdSite);
+    // A site added to an organization with no plan must stop collecting now, not at the next
+    // usage check.
+    usageService.requestOrganizationRefresh(createdSite.organizationId);
     return createdSite;
   }
 
@@ -445,6 +453,7 @@ class SiteConfigurationLifecycle {
 
     siteConfig.invalidate(claimedSite);
     this.detectSitePlatform(claimedSite);
+    usageService.requestOrganizationRefresh(claimedSite.organizationId);
     return claimedSite;
   }
 
@@ -576,8 +585,9 @@ class SiteConfigurationLifecycle {
         .for("update");
       if (!site) return false;
 
-      await this.deleteReplayData(siteId);
+      await tx.delete(importStatus).where(eq(importStatus.siteId, siteId));
       await tx.delete(sites).where(eq(sites.siteId, siteId));
+      await this.deleteReplayData(siteId);
       siteConfig.invalidate(site);
       return true;
     });
@@ -600,8 +610,15 @@ class SiteConfigurationLifecycle {
 
   async delete(siteId: number): Promise<void> {
     const site = await this.findSite(siteId);
-    await this.deleteReplayData(siteId);
-    await db.delete(sites).where(eq(sites.siteId, siteId));
+    // Delete the Postgres rows first so a constraint failure can't leave the
+    // Site in place with its replays already wiped. import_status is the one
+    // table whose foreign key to sites doesn't cascade. Replay cleanup runs
+    // inside the transaction, so a ClickHouse failure rolls the Site back.
+    await db.transaction(async tx => {
+      await tx.delete(importStatus).where(eq(importStatus.siteId, siteId));
+      await tx.delete(sites).where(eq(sites.siteId, siteId));
+      await this.deleteReplayData(siteId);
+    });
     siteConfig.invalidate(site);
   }
 }

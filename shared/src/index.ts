@@ -16,3 +16,4 @@ export * from "./replayActivity";
 export * from "./growthAccounting";
 export * from "./aiOperators";
 export * from "./annotations";
+export * from "./permissions";

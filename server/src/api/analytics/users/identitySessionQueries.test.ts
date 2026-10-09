@@ -12,7 +12,7 @@ describe("identity v2 with upstream session-scoped queries", () => {
     const sql = buildUsersQuery(
       { start_date: "", end_date: "", filters, time_zone: "UTC", identified_only: "true" },
       42,
-      ["account-42"],
+      { matchingUserIds: ["account-42"] },
       isCount
     );
 
@@ -23,11 +23,11 @@ describe("identity v2 with upstream session-scoped queries", () => {
     expect(sql).toContain("dictGetOrDefault('user_identity_dict'");
     expect(sql).toContain("toUInt64(events.site_id)");
     expect(sql).toContain("IN ({matchingUserIds:Array(String)})");
-    expect(sql).toContain("effective_user_id");
     if (isCount) {
-      expect(sql).toContain("count(DISTINCT effective_user_id)");
-      expect(sql).toContain("WHERE resolved_identified_user_id != ''");
+      expect(sql).toContain("SELECT DISTINCT");
+      expect(sql).toContain("AS resolved_identified_user_id");
     } else {
+      expect(sql).toContain("effective_user_id");
       expect(sql).toContain("AND identified_user_id != ''");
     }
   });

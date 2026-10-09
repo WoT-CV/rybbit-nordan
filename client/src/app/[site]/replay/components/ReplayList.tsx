@@ -40,6 +40,8 @@ export function ReplayList({ onSelect }: { onSelect?: () => void }) {
 
   const totalCount = data?.pages[0]?.totalCount;
 
+  // The selected session lives in a global store, so it can belong to another
+  // site or a replay this list doesn't contain; fall back to the first replay.
   useEffect(() => {
     if (flattenedData.length > 0 && !sessionId) {
       selectSession(flattenedData[0].session_id, false);

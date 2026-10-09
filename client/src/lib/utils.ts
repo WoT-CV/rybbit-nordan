@@ -3,6 +3,9 @@ import { Duration } from "luxon";
 import { twMerge } from "tailwind-merge";
 import { userLocale } from "./dateTimeUtils";
 
+// All surfaces share the same canonical identity and trait-name precedence.
+export { getUserDisplayName } from "./userIdentity";
+
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
@@ -118,4 +121,3 @@ export function isValidDomain(domain: string): boolean {
   const domainRegex = /^(?:https?:\/\/)?(?:[\p{L}\p{N}](?:[\p{L}\p{N}-]{0,61}[\p{L}\p{N}])?\.)+\p{L}{2,}\/?$/u;
   return domainRegex.test(domain);
 }
-

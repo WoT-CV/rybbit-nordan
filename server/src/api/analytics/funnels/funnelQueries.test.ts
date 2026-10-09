@@ -37,7 +37,9 @@ describe("funnel queries with global session filters", () => {
     const sessionActions = getSessionActions(sql);
 
     expect(sql).toContain("FilteredSessions AS");
-    expect(sql).toContain("argMinIf(url_parameters['utm_campaign'], timestamp, url_parameters['utm_campaign'] != '') AS utm_campaign");
+    expect(sql).toContain(
+      "argMinIf(url_parameters['utm_campaign'], timestamp, url_parameters['utm_campaign'] != '') AS utm_campaign"
+    );
     expect(sql).toContain("WHERE 1 = 1 AND utm_campaign = 'launch'");
     expect(sessionActions).toContain("INNER JOIN FilteredSessions USING (session_id)");
     expect(sessionActions).not.toContain("url_parameters['utm_campaign'] = 'launch'");
@@ -66,6 +68,42 @@ describe("funnel queries with global session filters", () => {
     expect(sql).toContain("FROM Step2");
   });
 
+  it("orders drilldown steps by the millisecond timestamp, like the analysis that counted them", () => {
+    const sql = buildFunnelStepSessionsQuery({ ...query, mode: "dropped", page: 1, limit: 25 }, 1, steps, 1);
+
+    expect(sql).toContain("min(timestamp_ms) as step_time");
+    expect(sql).toContain("sa.timestamp_ms > s1.step_time");
+    expect(sql).not.toContain("sa.timestamp > s1.step_time");
+  });
+
+  it("marks each drilldown session that has a replay and keeps the newest first", () => {
+    const sql = buildFunnelStepSessionsQuery({ ...query, mode: "reached", page: 1, limit: 25 }, 1, steps, 2);
+
+    expect(sql).toContain("FROM session_replay_metadata\n");
+    expect(sql).not.toContain("FROM session_replay_metadata_v2");
+    expect(sql).toContain("if(r.session_id != '', 1, 0) AS has_replay");
+    expect(sql).toContain("ORDER BY a.session_end DESC");
+    expect(sql).not.toContain("session_id IN (SELECT session_id FROM ReplaySessions)");
+  });
+
+  it("narrows the drilldown to sessions with a replay when asked", () => {
+    const reached = buildFunnelStepSessionsQuery(
+      { ...query, mode: "reached", page: 1, limit: 25, replays_only: "true" },
+      1,
+      steps,
+      2
+    );
+    const dropped = buildFunnelStepSessionsQuery(
+      { ...query, mode: "dropped", page: 1, limit: 25, replays_only: "true" },
+      1,
+      steps,
+      1
+    );
+
+    expect(reached).toMatch(/FROM Step2\s+WHERE session_id IN \(SELECT session_id FROM ReplaySessions\)/);
+    expect(dropped).toMatch(/FROM Step2\s+\)\s+AND session_id IN \(SELECT session_id FROM ReplaySessions\)/);
+  });
+
   it("returns the same canonical attribution fields used by session filtering", () => {
     const sql = buildFunnelStepSessionsQuery({ ...query, mode: "reached", page: 1, limit: 25 }, 1, steps, 2);
 
@@ -73,5 +111,13 @@ describe("funnel queries with global session filters", () => {
     expect(sql).toContain("channel NOT IN ('Direct', 'Internal', '')");
     expect(sql).not.toContain("argMin(e.referrer, e.timestamp) AS referrer");
     expect(sql).not.toContain("argMin(e.channel, e.timestamp) AS channel");
+    for (const [type, field] of [
+      ["button_click", "button_clicks"],
+      ["copy", "copies"],
+      ["form_submit", "form_submits"],
+      ["input_change", "input_changes"],
+    ]) {
+      expect(sql).toContain(`countIf(e.type = '${type}') AS ${field}`);
+    }
   });
 });

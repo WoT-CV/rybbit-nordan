@@ -826,7 +826,7 @@ export const endpointCategories: EndpointCategory[] = [
         path: "/sites/:site/retention",
         name: "Pobierz retencję",
         description: "Zwraca analizę retencji opartą o kohorty",
-        hasCommonParams: false,
+        hasCommonParams: true,
         specificParams: ["mode", "range"],
         parameterMetadata: {
           mode: { label: "Tryb", type: "select", options: ["day", "week"] },

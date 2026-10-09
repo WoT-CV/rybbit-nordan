@@ -42,7 +42,8 @@ async function queryEventCounts(query: string, queryParams: Record<string, strin
  * Reads both admin time ranges in one ClickHouse query. The raw-events fallback
  * keeps the admin API available if the rollup is removed or damaged at runtime.
  */
-export async function getSiteEventCounts(now: DateTime = DateTime.now()): Promise<SiteEventCountMaps> {
+export async function getSiteEventCounts(now: DateTime = DateTime.utc()): Promise<SiteEventCountMaps> {
+  now = now.toUTC();
   const queryParams = {
     from24h: now.minus({ hours: 24 }).toFormat("yyyy-MM-dd HH:mm:ss"),
     from30d: now.minus({ days: 30 }).toFormat("yyyy-MM-dd HH:mm:ss"),
@@ -54,11 +55,11 @@ export async function getSiteEventCounts(now: DateTime = DateTime.now()): Promis
       `
         SELECT
           site_id,
-          sumIf(event_count, event_hour >= toDateTime({from24h:String})) AS events_24h,
+          sumIf(event_count, event_hour >= toDateTime({from24h:String}, 'UTC')) AS events_24h,
           sum(event_count) AS events_30d
         FROM hourly_events_by_site_mv_target
-        WHERE event_hour >= toDateTime({from30d:String})
-          AND event_hour <= toDateTime({to:String})
+        WHERE event_hour >= toDateTime({from30d:String}, 'UTC')
+          AND event_hour <= toDateTime({to:String}, 'UTC')
         GROUP BY site_id
       `,
       queryParams
@@ -70,11 +71,11 @@ export async function getSiteEventCounts(now: DateTime = DateTime.now()): Promis
       `
         SELECT
           site_id,
-          countIf(timestamp >= toDateTime({from24h:String})) AS events_24h,
+          countIf(timestamp >= toDateTime({from24h:String}, 'UTC')) AS events_24h,
           count() AS events_30d
         FROM events
-        WHERE timestamp >= toDateTime({from30d:String})
-          AND timestamp <= toDateTime({to:String})
+        WHERE timestamp >= toDateTime({from30d:String}, 'UTC')
+          AND timestamp <= toDateTime({to:String}, 'UTC')
         GROUP BY site_id
       `,
       queryParams

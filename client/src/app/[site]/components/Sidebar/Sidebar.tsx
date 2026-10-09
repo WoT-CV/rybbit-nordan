@@ -23,6 +23,7 @@ import { useExtracted } from "next-intl";
 import { usePathname, useSearchParams } from "next/navigation";
 import { Suspense } from "react";
 import { useGetSite } from "../../../../api/admin/hooks/useSites";
+import { CommandPaletteTrigger } from "../../../../components/command-palette/CommandPaletteTrigger";
 import { Sidebar as SidebarComponents } from "../../../../components/sidebar/Sidebar";
 import { SiteSettings } from "../../../../components/SiteSettings/SiteSettings";
 import { ANALYTICS_CAPABILITIES } from "../../../../lib/capabilities";
@@ -36,6 +37,7 @@ function SidebarContent() {
   const t = useExtracted();
   const { data: subscription, isLoading: isSubscriptionLoading } = useStripeSubscription();
   const pathname = usePathname();
+  const { privateKey } = getSiteRouteContext(pathname);
   const searchParams = useSearchParams();
   const { embed, hideSidebar } = useEmbedPageOptions();
   const appEnv = useAppEnv();
@@ -69,6 +71,8 @@ function SidebarContent() {
     <div className="w-56 bg-neutral-50 border-r border-neutral-150 dark:bg-neutral-900 dark:border-neutral-850 flex flex-col h-dvh">
       <div className="flex flex-col p-3 border-b border-neutral-200 dark:border-neutral-800">
         <SiteSelector />
+        {/* Keyboard-first, so desktop only (this sidebar also renders in the mobile sheet). */}
+        {!embed && <CommandPaletteTrigger className="mt-2 hidden md:flex" />}
       </div>
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-3 pt-1">
         <div className="mt-2">
@@ -190,24 +194,28 @@ function SidebarContent() {
             icon={<Gauge className="w-4 h-4" />}
           />
         )}
-        <div
-          className={
-            ANALYTICS_CAPABILITIES.customQueries || ANALYTICS_CAPABILITIES.customDashboards
-              ? undefined
-              : "hidden md:block"
-          }
-        >
-          <SidebarComponents.SectionHeader>{t("Explore")}</SidebarComponents.SectionHeader>
-        </div>
-        <div className="hidden md:block">
-          <SidebarComponents.Item
-            label={t("API Playground")}
-            active={isActiveTab("api-playground")}
-            href={getTabPath("api-playground")}
-            icon={<Code className="w-4 h-4" />}
-          />
-        </div>
-        {(ANALYTICS_CAPABILITIES.customQueries || ANALYTICS_CAPABILITIES.customDashboards) && (
+        {!privateKey && (
+          <div
+            className={
+              ANALYTICS_CAPABILITIES.customQueries || ANALYTICS_CAPABILITIES.customDashboards
+                ? undefined
+                : "hidden md:block"
+            }
+          >
+            <SidebarComponents.SectionHeader>{t("Explore")}</SidebarComponents.SectionHeader>
+          </div>
+        )}
+        {!privateKey && (
+          <div className="hidden md:block">
+            <SidebarComponents.Item
+              label={t("API Playground")}
+              active={isActiveTab("api-playground")}
+              href={getTabPath("api-playground")}
+              icon={<Code className="w-4 h-4" />}
+            />
+          </div>
+        )}
+        {!privateKey && (ANALYTICS_CAPABILITIES.customQueries || ANALYTICS_CAPABILITIES.customDashboards) && (
           <>
             {ANALYTICS_CAPABILITIES.customQueries && (
               <SidebarComponents.Item
@@ -233,7 +241,7 @@ function SidebarContent() {
           href={getTabPath("reports")}
           icon={<ChartBarDecreasing className="w-4 h-4" />}
           /> */}
-        {!embed && (
+        {!embed && !privateKey && (
           <>
             <SidebarComponents.SectionHeader>{t("Settings")}</SidebarComponents.SectionHeader>
             <SiteSettings

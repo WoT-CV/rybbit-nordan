@@ -37,6 +37,7 @@ import { useShallow } from "zustand/react/shallow";
 import { useGetSessionReplayEvents } from "@/api/analytics/hooks/sessionReplay/useGetSessionReplayEvents";
 import { Avatar } from "@/components/Avatar";
 import { IdentifiedBadge } from "@/components/IdentifiedBadge";
+import { SegmentedControl } from "@/components/interior/segmented-control";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ThreeDotLoader } from "@/components/Loaders";
@@ -395,51 +396,18 @@ export function ReplayBreadcrumbs() {
                   ? t("{count} network requests", { count: String(networkRequests.length) })
                   : t("{count} key events", { count: String(meaningful.length) })}
           </div>
-          <div
-            className="flex items-center rounded-md border border-neutral-150 dark:border-neutral-800 p-0.5 text-xs shrink-0"
-            role="tablist"
+          <SegmentedControl
             aria-label={t("Event detail level")}
-          >
-            <button
-              role="tab"
-              aria-selected={timelineView === "network"}
-              onClick={() => handleTimelineViewChange("network")}
-              className={cn(
-                "rounded px-2 py-0.5 transition-colors",
-                timelineView === "network"
-                  ? "bg-neutral-100 dark:bg-neutral-800 text-neutral-900 dark:text-neutral-100"
-                  : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200"
-              )}
-            >
-              {t("Network")}
-            </button>
-            <button
-              role="tab"
-              aria-selected={timelineView === "key"}
-              onClick={() => handleTimelineViewChange("key")}
-              className={cn(
-                "rounded px-2 py-0.5 transition-colors",
-                timelineView === "key"
-                  ? "bg-neutral-100 dark:bg-neutral-800 text-neutral-900 dark:text-neutral-100"
-                  : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200"
-              )}
-            >
-              {t("Key")}
-            </button>
-            <button
-              role="tab"
-              aria-selected={timelineView === "all"}
-              onClick={() => handleTimelineViewChange("all")}
-              className={cn(
-                "rounded px-2 py-0.5 transition-colors",
-                timelineView === "all"
-                  ? "bg-neutral-100 dark:bg-neutral-800 text-neutral-900 dark:text-neutral-100"
-                  : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200"
-              )}
-            >
-              {t("All")}
-            </button>
-          </div>
+            size="sm"
+            className="shrink-0"
+            options={[
+              { value: "network", label: t("Network") },
+              { value: "key", label: t("Key") },
+              { value: "all", label: t("All") },
+            ]}
+            value={timelineView}
+            onValueChange={handleTimelineViewChange}
+          />
         </div>
 
         {isLoading || !data ? (

@@ -11,6 +11,11 @@ const mocks = vi.hoisted(() => ({
   generateUserId: vi.fn(),
   claimTrackerAlias: vi.fn(),
   claimLegacyClientAlias: vi.fn(),
+  isSiteWithoutPlan: vi.fn(),
+}));
+
+vi.mock("../usageService.js", () => ({
+  usageService: { isSiteWithoutPlan: mocks.isSiteWithoutPlan },
 }));
 
 vi.mock("../../db/postgres/postgres.js", () => ({
@@ -62,6 +67,7 @@ function createRequest(userId = "account-13") {
 describe("handleIdentify identity correlation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.isSiteWithoutPlan.mockReturnValue(false);
     mocks.getConfig.mockResolvedValue({ siteId: 42 });
     mocks.generateUserIdFromClientId.mockResolvedValue("hashed-browser-id");
     mocks.generateLegacyUserIdFromClientId.mockResolvedValue("legacy-client-id");
@@ -121,5 +127,20 @@ describe("handleIdentify identity correlation", () => {
     expect(mocks.claimTrackerAlias).not.toHaveBeenCalled();
     expect(mocks.generateUserId).toHaveBeenCalled();
     expect(traitValues).toHaveBeenCalled();
+  });
+
+  it("does not store profiles or claim aliases for a site with no plan", async () => {
+    mocks.isSiteWithoutPlan.mockReturnValue(true);
+    const reply = createReply();
+
+    await handleIdentify(createRequest(), reply);
+
+    expect(mocks.isSiteWithoutPlan).toHaveBeenCalledWith(42);
+    expect(mocks.generateUserIdFromClientId).not.toHaveBeenCalled();
+    expect(mocks.claimTrackerAlias).not.toHaveBeenCalled();
+    expect(mocks.claimLegacyClientAlias).not.toHaveBeenCalled();
+    expect(mocks.insert).not.toHaveBeenCalled();
+    expect(reply.status).toHaveBeenCalledWith(200);
+    expect(reply.send).toHaveBeenCalledWith("Site has no plan, identify not stored");
   });
 });

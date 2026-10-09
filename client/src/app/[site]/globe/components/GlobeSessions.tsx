@@ -9,7 +9,7 @@ import { useGetSessionsInfinite } from "../../../../api/analytics/hooks/useGetUs
 import { GetSessionsResponse } from "../../../../api/analytics/endpoints";
 import { Avatar } from "../../../../components/Avatar";
 import { Channel } from "../../../../components/Channel";
-import { EventIcon, PageviewIcon } from "../../../../components/EventIcons";
+import { EventTypeIcon } from "../../../../components/EventIcons";
 import { SessionCard as FullSessionCard } from "../../../../components/Sessions/SessionCard";
 import {
   BrowserTooltipIcon,
@@ -114,7 +114,7 @@ function SessionCard({ session, onClick }: { session: GetSessionsResponse[number
         <Tooltip>
           <TooltipTrigger asChild>
             <Badge className="flex items-center gap-1 bg-neutral-800 text-neutral-300">
-              <PageviewIcon />
+              <EventTypeIcon type="pageview" />
               <span>{formatter(session.pageviews)}</span>
             </Badge>
           </TooltipTrigger>
@@ -123,7 +123,7 @@ function SessionCard({ session, onClick }: { session: GetSessionsResponse[number
         <Tooltip>
           <TooltipTrigger asChild>
             <Badge className="flex items-center gap-1 bg-neutral-800 text-neutral-300">
-              <EventIcon />
+              <EventTypeIcon type="custom_event" />
               <span>{formatter(session.events)}</span>
             </Badge>
           </TooltipTrigger>

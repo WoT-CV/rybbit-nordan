@@ -10,6 +10,7 @@ import type { ReplayPlayerAdapter } from "./ReplayPlayerAdapter";
 import { ReplayPlayerControls } from "./ReplayPlayerControls";
 
 const mocks = vi.hoisted(() => ({
+  canExport: true,
   timeline: vi.fn((props: ComponentProps<typeof ActivitySlider>) => (
     <div data-testid="timeline" data-time={props.currentTime} data-position={props.value?.[0]} />
   )),
@@ -17,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   exportRange: vi.fn(() => null),
 }));
 vi.mock("next-intl", () => ({ useExtracted: () => (message: string) => message }));
+vi.mock("@/hooks/usePermissions", () => ({ useCanOnSite: () => mocks.canExport }));
 vi.mock("@/components/ui/activity-slider", () => ({ ActivitySlider: mocks.timeline }));
 vi.mock("../export/ReplayExportButton", () => ({ ReplayExportButton: mocks.exportButton }));
 vi.mock("../export/ReplayExportRangeSlider", async importOriginal => ({
@@ -36,6 +38,7 @@ function props(): ComponentProps<typeof ReplayPlayerControls> {
 }
 
 beforeEach(() => {
+  mocks.canExport = true;
   vi.clearAllMocks();
   useReplayStore.setState({
     ...useReplayStore.getInitialState(),
@@ -49,6 +52,15 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ReplayPlayerControls clock isolation", () => {
+  it("does not offer export or initialize its range for read-only viewers", () => {
+    mocks.canExport = false;
+    useReplayStore.setState({ exportRange: null });
+    render(<ReplayPlayerControls {...props()} />);
+    expect(mocks.exportButton).not.toHaveBeenCalled();
+    expect(mocks.exportRange).not.toHaveBeenCalled();
+    expect(useReplayStore.getState().exportRange).toBeNull();
+    expect(mocks.timeline.mock.lastCall![0].exportRange).toBeNull();
+  });
   it("keeps the precise slider and displayed time live without re-rendering the toolbar", () => {
     const controls = props();
     const view = render(<ReplayPlayerControls {...controls} />);

@@ -3,6 +3,7 @@ import { useExtracted } from "next-intl";
 import { memo, useCallback, useEffect, useMemo, type ComponentProps } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { getReplayActivityDuration } from "@rybbit/shared";
+import { useCanOnSite } from "@/hooks/usePermissions";
 
 import { ActivitySlider } from "@/components/ui/activity-slider";
 import { Button } from "@/components/ui/button";
@@ -65,6 +66,7 @@ export const ReplayPlayerControls = memo(function ReplayPlayerControls({
   isDrawer,
 }: ReplayPlayerControlsProps) {
   const t = useExtracted();
+  const canExport = useCanOnSite("replay:export");
   const {
     activityPeriods,
     duration,
@@ -100,9 +102,9 @@ export const ReplayPlayerControls = memo(function ReplayPlayerControls({
   const { seekTo } = useReplaySeek();
 
   useEffect(() => {
-    if (duration <= 0 || exportRange || replaySegments.length === 0) return;
+    if (!canExport || duration <= 0 || exportRange || replaySegments.length === 0) return;
     setExportRange(createInitialExportRange(useReplayStore.getState().currentTime, duration, activityPeriods));
-  }, [activityPeriods, duration, exportRange, replaySegments.length, setExportRange]);
+  }, [activityPeriods, canExport, duration, exportRange, replaySegments.length, setExportRange]);
 
   const exportDuration = exportRange ? getReplayActivityDuration(activityPeriods, exportRange[0], exportRange[1]) : 0;
 
@@ -140,11 +142,11 @@ export const ReplayPlayerControls = memo(function ReplayPlayerControls({
           duration={duration}
           events={events}
           networkRequests={networkRequests}
-          exportRange={exportRange}
+          exportRange={canExport ? exportRange : null}
           onNetworkSeek={handleNetworkSeek}
           className="w-full"
         />
-        {exportRange && (
+        {canExport && exportRange && (
           <ReplayExportRangeSlider
             duration={duration}
             range={exportRange}
@@ -170,11 +172,13 @@ export const ReplayPlayerControls = memo(function ReplayPlayerControls({
         </Button>
         <ReplayTime duration={duration} />
         <div className="flex min-w-0 items-center gap-1.5">
-          <ReplayExportButton
-            disabled={!player || duration <= 0 || exportDuration <= 0}
-            range={exportRange}
-            sessionId={sessionId}
-          />
+          {canExport && (
+            <ReplayExportButton
+              disabled={!player || duration <= 0 || exportDuration <= 0}
+              range={exportRange}
+              sessionId={sessionId}
+            />
+          )}
           <Button
             type="button"
             variant={skipInactivityEnabled ? "secondary" : "outline"}

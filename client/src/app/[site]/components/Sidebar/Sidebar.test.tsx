@@ -67,6 +67,11 @@ describe("WoT-CV sidebar after upstream regrouping", () => {
     expect(screen.getByRole("link", { name: "Retention" }).getAttribute("href")).toBe(
       "/7/aaaaaaaaaaaa/retention?timeMode=week&segment=3"
     );
+    for (const label of ["API Playground", "Query", "Dashboards"]) {
+      expect(screen.queryByRole("link", { name: label })).toBeNull();
+    }
+    expect(screen.queryByText("Explore")).toBeNull();
+    expect(screen.queryByText("Site Settings")).toBeNull();
   });
 
   it("retains mobile-site exclusions and embed sidebar visibility", () => {

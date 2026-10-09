@@ -69,4 +69,22 @@ describe("getSiteEventCounts", () => {
 
     await expect(getSiteEventCounts(now)).rejects.toThrow("CLICKHOUSE_DOWN");
   });
+
+  it("uses UTC instants across DST in both the rollup and fallback, regardless of the caller zone", async () => {
+    const localNow = DateTime.fromISO("2026-10-25T12:00:00", { zone: "Europe/Warsaw" });
+    mocks.query.mockRejectedValueOnce(new Error("UNKNOWN_TABLE")).mockResolvedValueOnce(queryResult([]));
+
+    await getSiteEventCounts(localNow);
+
+    for (const [query] of mocks.query.mock.calls) {
+      expect(query.query_params).toEqual({
+        from24h: "2026-10-24 11:00:00",
+        from30d: "2026-09-25 11:00:00",
+        to: "2026-10-25 11:00:00",
+      });
+      for (const parameter of ["from24h", "from30d", "to"]) {
+        expect(query.query).toContain(`toDateTime({${parameter}:String}, 'UTC')`);
+      }
+    }
+  });
 });

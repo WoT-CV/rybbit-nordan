@@ -9,6 +9,7 @@ import { EVENT_TIERS, findPriceForTier, formatEventTier } from "@/lib/subscripti
 import { usePreviewSubscriptionUpdate, useUpdateSubscription } from "@/lib/subscription/useSubscriptionMutations";
 import { cn } from "@/lib/utils";
 import { ArrowRight } from "lucide-react";
+import { useExtracted } from "next-intl";
 import { useMemo, useState } from "react";
 import { CheckoutModal } from "./CheckoutModal";
 import { PlanChangePreviewDialog } from "./PlanChangePreviewDialog";
@@ -25,7 +26,7 @@ function parseCurrentPlan(currentPlanName?: string) {
   if (!currentPlanName) return { tierIndex: 0, planType: "standard" as const, isAnnual: false };
 
   const isAnnual = currentPlanName.includes("-annual");
-  const planType = currentPlanName.includes("pro") ? "pro" as const : "standard" as const;
+  const planType = currentPlanName.includes("pro") ? ("pro" as const) : ("standard" as const);
 
   // Find current tier index by matching event count
   const currentTierIndex = STRIPE_TIERS.findIndex(tier => {
@@ -42,12 +43,11 @@ function parseCurrentPlan(currentPlanName?: string) {
 }
 
 export function PlanDialog({ open, onOpenChange, currentPlanName, hasActiveSubscription }: PlanDialogProps) {
+  const t = useExtracted();
   const defaults = useMemo(() => parseCurrentPlan(currentPlanName), [currentPlanName]);
 
   // Default to next tier up for existing subscribers
-  const defaultTierIndex = hasActiveSubscription
-    ? Math.min(defaults.tierIndex + 1, STRIPE_TIERS.length - 1)
-    : 0;
+  const defaultTierIndex = hasActiveSubscription ? Math.min(defaults.tierIndex + 1, STRIPE_TIERS.length - 1) : 0;
 
   const [eventLimitIndex, setEventLimitIndex] = useState(defaultTierIndex);
   const [isAnnual, setIsAnnual] = useState(defaults.isAnnual);
@@ -139,11 +139,17 @@ export function PlanDialog({ open, onOpenChange, currentPlanName, hasActiveSubsc
     if (!activeOrg || !pendingPriceId) return;
 
     try {
+      // Resolves after the plan queries have refetched (see useUpdateSubscription),
+      // so the billing page already shows the new plan when this closes. No reload:
+      // it would wipe the success toast.
       await updateMutation.mutateAsync({
         organizationId: activeOrg.id,
         newPriceId: pendingPriceId,
       });
-      window.location.reload();
+      previewMutation.reset();
+      setPendingPriceId(null);
+      setPendingPlanName(null);
+      onOpenChange(false);
     } catch (error) {
       // Error is already handled by the mutation
     }
@@ -214,13 +220,9 @@ export function PlanDialog({ open, onOpenChange, currentPlanName, hasActiveSubsc
             {/* Event slider */}
             <div className="space-y-3">
               <div className="flex items-center justify-between">
-                <span className="text-sm text-neutral-500 dark:text-neutral-400">
-                  Zdarzenia miesięcznie
-                </span>
+                <span className="text-sm text-neutral-500 dark:text-neutral-400">Zdarzenia miesięcznie</span>
                 <span className="text-sm font-medium">
-                  {eventLimit === "Custom"
-                    ? "Własny"
-                    : `${formatEventTier(eventLimit)} zdarzeń`}
+                  {eventLimit === "Custom" ? "Własny" : `${formatEventTier(eventLimit)} zdarzeń`}
                 </span>
               </div>
               <Slider
@@ -273,7 +275,8 @@ export function PlanDialog({ open, onOpenChange, currentPlanName, hasActiveSubsc
             ) : (
               <div className="p-4 rounded-lg border border-neutral-200 dark:border-neutral-800 text-center">
                 <p className="text-sm text-neutral-500 dark:text-neutral-400">
-                  Potrzebujesz więcej niż {formatEventTier(STRIPE_TIERS[STRIPE_TIERS.length - 1].events)} zdarzeń? Skontaktuj się z nami po plan indywidualny.
+                  Potrzebujesz więcej niż {formatEventTier(STRIPE_TIERS[STRIPE_TIERS.length - 1].events)} zdarzeń?
+                  Skontaktuj się z nami po plan indywidualny.
                 </p>
                 <a
                   href="mailto:hello@rybbit.com"
@@ -290,18 +293,12 @@ export function PlanDialog({ open, onOpenChange, currentPlanName, hasActiveSubsc
                 className="w-full h-11"
                 variant="success"
                 onClick={handleSelectPlan}
-                disabled={isLoading || previewMutation.isPending || isCurrentSelection}
+                // Covers the preview request and, after confirming, the update itself
+                loading={isLoading || previewMutation.isPending || updateMutation.isPending}
+                disabled={isCurrentSelection}
               >
-                {isLoading || previewMutation.isPending
-                  ? "Ładowanie..."
-                  : isCurrentSelection
-                    ? "Obecny plan"
-                    : hasActiveSubscription
-                      ? "Zmień plan"
-                      : "Subskrybuj"}
-                {!isLoading && !previewMutation.isPending && !isCurrentSelection && (
-                  <ArrowRight className="ml-2 h-4 w-4" />
-                )}
+                {isCurrentSelection ? t("Current Plan") : hasActiveSubscription ? t("Change Plan") : t("Subscribe")}
+                {!isCurrentSelection && <ArrowRight className="ml-2 h-4 w-4" />}
               </Button>
             )}
 
@@ -331,7 +328,9 @@ export function PlanDialog({ open, onOpenChange, currentPlanName, hasActiveSubsc
       <CheckoutModal
         clientSecret={checkoutClientSecret}
         open={!!checkoutClientSecret}
-        onOpenChange={(open) => { if (!open) setCheckoutClientSecret(null); }}
+        onOpenChange={open => {
+          if (!open) setCheckoutClientSecret(null);
+        }}
       />
     </>
   );

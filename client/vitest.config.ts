@@ -31,6 +31,7 @@ export default defineConfig({
           name: "dom",
           include: ["src/**/*.test.tsx"],
           environment: "jsdom",
+          setupFiles: ["./test/setupLocale.ts"],
         },
       },
     ],

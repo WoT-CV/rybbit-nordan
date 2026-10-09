@@ -32,6 +32,7 @@ export interface SiteConfigData {
   trackErrors: boolean;
   trackOutbound: boolean;
   trackUrlParams: boolean;
+  trackUrlFragments: boolean;
   trackInitialPageView: boolean;
   trackSpaNavigation: boolean;
   trackIp: boolean;
@@ -130,6 +131,7 @@ class SiteConfig {
       trackErrors: site.trackErrors || false,
       trackOutbound: site.trackOutbound ?? true,
       trackUrlParams: site.trackUrlParams ?? true,
+      trackUrlFragments: site.trackUrlFragments ?? false,
       trackInitialPageView: site.trackInitialPageView ?? true,
       trackSpaNavigation: site.trackSpaNavigation ?? true,
       trackIp: site.trackIp || false,

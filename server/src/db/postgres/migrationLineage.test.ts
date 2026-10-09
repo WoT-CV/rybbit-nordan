@@ -16,7 +16,7 @@ const snapshot = (index: number): Snapshot =>
 
 describe("WoT-CV migration lineage (no database connection)", () => {
   it("continues the fork snapshot rather than upstream's divergent 0014", () => {
-    for (const index of [15, 16, 17, 18, 19, 20]) {
+    for (const index of [15, 16, 17, 18, 19, 20, 21, 22, 23, 24]) {
       expect(snapshot(index).prevId).toBe(snapshot(index - 1).id);
     }
     expect(snapshot(15).prevId).toBe("e38adbc1-bf05-486f-9a30-25d6043da90c");
@@ -38,7 +38,7 @@ describe("WoT-CV migration lineage (no database connection)", () => {
   });
 
   it("matches runtime table and column names, including Uptime, Network Replay and identity", () => {
-    const latest = snapshot(20);
+    const latest = snapshot(24);
     const tables = Object.values(schema)
       .filter(value => is(value, PgTable))
       .map(table => getTableConfig(table));
@@ -83,6 +83,10 @@ describe("WoT-CV migration lineage (no database connection)", () => {
       "0018_better_auth_173",
       "0019_invitation_created_at",
       "0020_unclaimed_sites",
+      "0021_site_grant_roles",
+      "0022_site_transfers",
+      "0023_track_url_fragments",
+      "0024_sites_id_index",
     ]);
     for (const entry of journal.entries.slice(15, 18)) {
       const sql = readFileSync(new URL(`../../../drizzle/${entry.tag}.sql`, import.meta.url), "utf8");
@@ -94,6 +98,28 @@ describe("WoT-CV migration lineage (no database connection)", () => {
       const sql = readFileSync(new URL(`../../../drizzle/${entry.tag}.sql`, import.meta.url), "utf8");
       expect(sql).not.toMatch(/^\s*(?:DROP|TRUNCATE|DELETE)\b/im);
       expect(sql).not.toMatch(/ALTER TABLE[^;]*\bDROP\b/i);
+    }
+  });
+
+  it("preserves the fork tables while applying only the four reviewed upstream schema changes", () => {
+    const original = snapshot(20);
+    for (const index of [21, 22, 23, 24]) {
+      const current = snapshot(index);
+      for (const [name, table] of Object.entries(original.tables)) {
+        const actual = structuredClone(current.tables[name]);
+        if (name === "public.member_site_access" || name === "public.team_site_access") {
+          expect(actual.columns.role).toBeDefined();
+          delete actual.columns.role;
+        }
+        if (name === "public.invitation") {
+          expect(actual.columns.site_role).toBeDefined();
+          delete actual.columns.site_role;
+        }
+        if (index >= 23 && name === "public.sites") delete actual.columns.trackUrlFragments;
+        if (index >= 24 && name === "public.sites") delete (actual.indexes as Record<string, unknown>).sites_id_idx;
+        expect(actual, `${index}: ${name}`).toEqual(table);
+      }
+      expect(Object.keys(current.tables)).toHaveLength(index === 21 ? 46 : 47);
     }
   });
 });

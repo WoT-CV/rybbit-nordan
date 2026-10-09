@@ -19,6 +19,7 @@ import {
 } from "../../../components/ui/alert-dialog";
 import { Card } from "../../../components/ui/card";
 import { Skeleton } from "../../../components/ui/skeleton";
+import { useCanOnSite } from "../../../hooks/usePermissions";
 import { useSetPageTitle } from "../../../hooks/useSetPageTitle";
 
 function relativeUpdated(updatedAt: string | null | undefined): string | null {
@@ -38,6 +39,7 @@ export default function DashboardsListPage() {
   const { data: dashboards, isLoading } = useGetDashboards(siteId);
   const createDashboard = useCreateDashboard();
   const deleteDashboard = useDeleteDashboard();
+  const canWrite = useCanOnSite("dashboards:write", siteId);
   const [pendingDelete, setPendingDelete] = useState<number | null>(null);
 
   const handleCreate = async () => {
@@ -54,10 +56,12 @@ export default function DashboardsListPage() {
             {t("Build views from custom SQL queries, scoped to the site time range.")}
           </p>
         </div>
-        <Button onClick={handleCreate} disabled={createDashboard.isPending}>
-          {createDashboard.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-          {t("New dashboard")}
-        </Button>
+        {canWrite && (
+          <Button onClick={handleCreate} disabled={createDashboard.isPending}>
+            {createDashboard.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+            {t("New dashboard")}
+          </Button>
+        )}
       </div>
 
       {isLoading ? (
@@ -85,10 +89,12 @@ export default function DashboardsListPage() {
               )}
             </p>
           </div>
-          <Button variant="outline" onClick={handleCreate} disabled={createDashboard.isPending}>
-            <Plus className="h-4 w-4" />
-            {t("Create your first dashboard")}
-          </Button>
+          {canWrite && (
+            <Button variant="outline" onClick={handleCreate} disabled={createDashboard.isPending}>
+              <Plus className="h-4 w-4" />
+              {t("Create your first dashboard")}
+            </Button>
+          )}
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -113,18 +119,20 @@ export default function DashboardsListPage() {
                     {updated && ` · ${t("updated {time}", { time: updated })}`}
                   </div>
                 </div>
-                <Button
-                  size="smIcon"
-                  variant="ghost"
-                  className="opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-100"
-                  onClick={event => {
-                    event.stopPropagation();
-                    setPendingDelete(dashboard.dashboardId);
-                  }}
-                  aria-label={t("Delete {name}", { name: dashboard.name })}
-                >
-                  <Trash2 className="h-4 w-4 text-red-500" />
-                </Button>
+                {canWrite && (
+                  <Button
+                    size="smIcon"
+                    variant="ghost"
+                    className="opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-100"
+                    onClick={event => {
+                      event.stopPropagation();
+                      setPendingDelete(dashboard.dashboardId);
+                    }}
+                    aria-label={t("Delete {name}", { name: dashboard.name })}
+                  >
+                    <Trash2 className="h-4 w-4 text-red-500" />
+                  </Button>
+                )}
               </Card>
             );
           })}
