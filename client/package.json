@@ -7,18 +7,12 @@
     "build": "next build",
     "start": "next start -p 3002",
     "extract": "node scripts/extract-messages.mjs",
-    "audit:polish": "node scripts/audit-polish-coverage.mjs",
     "lint": "eslint .",
-    "lint:wotcv": "eslint scripts/audit-polish-coverage.mjs src/lib/capabilities.ts src/lib/userIdentity.ts src/components/replay \"src/app/*/retention/GrowthAccountingChart.tsx\"",
     "test": "vitest run",
     "test:run": "vitest run",
     "test:watch": "vitest --watch",
-    "test:indexing-http": "node scripts/test-indexing-http.mjs",
     "typecheck": "tsc --noEmit",
-    "knip": "knip --config knip.wotcv.json",
     "format": "prettier --write \"src/**/*.{js,jsx,ts,tsx,json,css,scss,md}\"",
-    "format:check": "prettier --check \"src/**/*.{js,jsx,ts,tsx,json,css,scss,md}\"",
-    "format:check:wotcv": "prettier --check scripts/audit-polish-coverage.mjs src/lib/capabilities.ts src/lib/userIdentity.ts src/components/replay \"src/app/*/retention/GrowthAccountingChart.tsx\""
   },
   "dependencies": {
     "@better-auth/api-key": "1.7.3",
