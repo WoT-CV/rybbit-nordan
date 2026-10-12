@@ -1,3 +1,4 @@
+import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import { getLocale, getMessages } from "next-intl/server";
 import { NextIntlClientProvider } from "next-intl";
@@ -6,6 +7,15 @@ import "./globals.css";
 import { Providers } from "./Providers";
 
 const inter = Inter({ subsets: ["latin"] });
+
+export const metadata: Metadata = {
+  robots: {
+    index: false,
+    follow: false,
+    nosnippet: true,
+    noimageindex: true,
+  },
+};
 
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
   const locale = await getLocale();

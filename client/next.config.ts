@@ -37,6 +37,14 @@ const nextConfig: NextConfig = {
     NEXT_PUBLIC_APP_VERSION: process.env.npm_package_version,
     NEXT_PUBLIC_WOTCV_GIT_SHA: process.env.NEXT_PUBLIC_WOTCV_GIT_SHA,
   },
+  async headers() {
+    return [
+      {
+        source: "/:path*",
+        headers: [{ key: "X-Robots-Tag", value: "noindex, nofollow, nosnippet, noimageindex" }],
+      },
+    ];
+  },
 };
 
 export default withNextIntl(nextConfig);

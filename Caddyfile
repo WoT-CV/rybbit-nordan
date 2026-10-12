@@ -17,6 +17,14 @@
     # Enable compression
     encode zstd gzip
 
+    # The analytics application and its API are not a public search surface.
+    # Set immediately for proxy errors, then overwrite upstream headers on send.
+    header X-Robots-Tag "noindex, nofollow, nosnippet, noimageindex"
+    header {
+        X-Robots-Tag "noindex, nofollow, nosnippet, noimageindex"
+        defer
+    }
+
     # Match Fastify's largest route limit (event imports). Fastify still
     # enforces the smaller limits configured for other routes.
     request_body {

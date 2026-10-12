@@ -17,6 +17,7 @@ import { auth } from "./lib/auth.js";
 import { oauthWellKnownRoutes } from "./mcp/wellKnown.js";
 import { createCorsOptionsDelegate, createRejectUntrustedOriginHook } from "./lib/cors.js";
 import { IS_CLOUD } from "./lib/const.js";
+import { registerIndexingProtection } from "./lib/indexingProtection.js";
 import { logger } from "./lib/logger/logger.js";
 import { registerRequestLogging } from "./lib/logger/requestLogging.js";
 import { botEventQueue, botObservationQueue } from "./services/tracker/botBlocking/botEventQueue.js";
@@ -44,6 +45,7 @@ const server = Fastify({
   bodyLimit: 10 * 1024 * 1024, // 10MB limit for session replay data
 });
 
+registerIndexingProtection(server);
 registerRequestLogging(server);
 registerApiErrorResponses(server);
 

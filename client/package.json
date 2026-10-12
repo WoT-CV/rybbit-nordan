@@ -13,6 +13,7 @@
     "test": "vitest run",
     "test:run": "vitest run",
     "test:watch": "vitest --watch",
+    "test:indexing-http": "node scripts/test-indexing-http.mjs",
     "typecheck": "tsc --noEmit",
     "knip": "knip --config knip.wotcv.json",
     "format": "prettier --write \"src/**/*.{js,jsx,ts,tsx,json,css,scss,md}\"",
