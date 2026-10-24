@@ -218,10 +218,14 @@ def replace_file(path: Path, data: bytes) -> None:
             os.unlink(name)
 
 
-def reconcile(repo: Path, backup_root: Path, target: str | None, apply: bool, backup_only: bool) -> Path:
-    repo = repo.resolve(strict=True)
+def require_owner_platform() -> None:
     if os.name != "posix" or os.getuid() == 0:
         raise Refused("Run on Linux as the repository owner, without sudo")
+
+
+def reconcile(repo: Path, backup_root: Path, target: str | None, apply: bool, backup_only: bool) -> Path:
+    repo = repo.resolve(strict=True)
+    require_owner_platform()
     if Path(git(repo, "rev-parse", "--show-toplevel").decode().strip()).resolve() != repo:
         raise Refused("Expected the exact repository root")
     if not backup_only and (target is None or not re.fullmatch(r"[0-9a-f]{40}", target)):

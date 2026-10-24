@@ -60,7 +60,7 @@ jobs:
         env:
           NEXT_PUBLIC_BACKEND_URL: http://localhost:3001
         run: pnpm test:run --maxWorkers=4 && pnpm lint:wotcv && pnpm knip && pnpm audit:polish && pnpm format:check:wotcv && pnpm typecheck && pnpm build
-      - name: Verify merged Compose configuration
+      - name: Verify both WoT-CV Compose configurations
         env:
           BASE_URL: https://tracking.example.com
           BETTER_AUTH_SECRET: compose-validation-only
@@ -73,20 +73,22 @@ jobs:
           WOTCV_BUILD_TIME: "1970-01-01T00:00:00Z"
           WOTCV_GIT_SHA: ${{ github.sha }}
         run: |
-          docker compose \
-            -f docker-compose.yml \
-            -f docker-compose.wotcv.yml \
-            -f docker-compose.wotcv.branch-build.yml \
-            config --format json > "${RUNNER_TEMP}/wotcv-compose.json"
           source scripts/lib/wotcv-common.sh
-          wotcv_validate_compose_ports "${RUNNER_TEMP}/wotcv-compose.json"
-          wotcv_validate_compose_logging "${RUNNER_TEMP}/wotcv-compose.json"
-          python3 scripts/lib/wotcv_persistence.py validate-config \
-            --config "${RUNNER_TEMP}/wotcv-compose.json" \
-            --expected-project rybbit \
-            --clickhouse-volume rybbit_clickhouse-data \
-            --postgres-volume rybbit_postgres-data \
-            --redis-volume rybbit_redis-data
+          for mode in image branch-build; do
+            compose=(docker compose -f docker-compose.yml -f docker-compose.wotcv.yml)
+            if [[ "$mode" == branch-build ]]; then
+              compose+=(-f docker-compose.wotcv.branch-build.yml)
+            fi
+            "${compose[@]}" config --format json > "${RUNNER_TEMP}/wotcv-compose.json"
+            wotcv_validate_compose_ports "${RUNNER_TEMP}/wotcv-compose.json"
+            wotcv_validate_compose_logging "${RUNNER_TEMP}/wotcv-compose.json"
+            python3 scripts/lib/wotcv_persistence.py validate-config \
+              --config "${RUNNER_TEMP}/wotcv-compose.json" \
+              --expected-project rybbit \
+              --clickhouse-volume rybbit_clickhouse-data \
+              --postgres-volume rybbit_postgres-data \
+              --redis-volume rybbit_redis-data
+          done
 
   backend:
     if: github.event_name != 'pull_request'
