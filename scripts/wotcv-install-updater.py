@@ -2,9 +2,10 @@
 """Check or repair only the root-owned retained Rybbit updater, never run it.
 
 Default --check is read-only and may run as wotcv. --apply requires root and
-replaces one retained utility using the clean, committed origin/feat/wotcv
-source. The existing operations-release manifest is neither changed nor
-re-attested; a separate protected audit records this narrow repair.
+replaces only the inspected legacy utility (or accepts an identical candidate)
+using the clean, committed origin/feat/wotcv source. This is a retained-utility
+hotfix: payload-manifest.json stays the original release baseline, not a new
+full-release attestation. A separate protected audit records old/new hashes.
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ from typing import NamedTuple
 SOURCE_NAME = "scripts/update_rybbit_wotcv.sh"
 RETAINED_NAME = "update_rybbit_wotcv.sh"
 DEPLOY_USER = "wotcv"
+LEGACY_SHA256 = "20a255b4be3301e7d0a761de5de884576bdf6e8d179347637b386438b70a2c85"
+MANIFEST_ENTRY = "retained/update_rybbit_wotcv.sh"
 
 
 class Paths(NamedTuple):
@@ -46,6 +49,8 @@ class Plan(NamedTuple):
     target: Path
     original: bytes
     original_mode: int
+    baseline_manifest: bytes
+    baseline_entry: str
 
 
 class Refused(RuntimeError):
@@ -129,6 +134,22 @@ def installed_target(paths: Paths) -> tuple[Path, Path, bytes, int]:
     return release, target, regular_bytes(target), stat.S_IMODE(info.st_mode)
 
 
+def manifest_snapshot(release: Path) -> tuple[bytes, str]:
+    path = release / "payload-manifest.json"
+    require_metadata(path.lstat(), directory=False)
+    baseline = regular_bytes(path)
+    value = json.loads(baseline)
+    entry = value.get(MANIFEST_ENTRY) if isinstance(value, dict) else None
+    if entry != LEGACY_SHA256:
+        raise Refused("Release manifest must retain the inspected legacy updater baseline")
+    return baseline, entry
+
+
+def require_known_target(original: bytes, source: bytes) -> None:
+    if digest(original) != LEGACY_SHA256 and original != source:
+        raise Refused("Retained updater is neither the inspected legacy file nor the exact candidate")
+
+
 def source_snapshot(repo: Path) -> tuple[str, bytes]:
     if git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all"):
         raise Refused("Source repository must be clean")
@@ -157,7 +178,9 @@ def source_snapshot(repo: Path) -> tuple[str, bytes]:
 def plan_install(paths: Paths) -> Plan:
     head, source = source_snapshot(paths.repo)
     release, target, original, mode = installed_target(paths)
-    return Plan(head, source, release, target, original, mode)
+    require_known_target(original, source)
+    baseline, entry = manifest_snapshot(release)
+    return Plan(head, source, release, target, original, mode, baseline, entry)
 
 
 def require_platform(*, apply: bool) -> None:
@@ -167,12 +190,20 @@ def require_platform(*, apply: bool) -> None:
         raise Refused("--apply requires root; use sudo for this installer only")
 
 
+def require_lock_metadata(info) -> None:
+    # The existing operations CLI deliberately creates root:root 0660 locks.
+    # Group root is trusted here; never relax the stricter payload/path policy.
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
+            or info.st_mode & 0o002):
+        raise Refused("Operations lock must be a root:root regular file without world write access")
+
+
 @contextmanager
 def lock_file(path: Path):
     import fcntl
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
-        require_metadata(os.fstat(descriptor), directory=False)
+        require_lock_metadata(os.fstat(descriptor))
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
@@ -216,7 +247,11 @@ def archive(paths: Paths, plan: Plan) -> Path:
         "release": str(plan.release), "target": str(plan.target),
         "beforeSha256": digest(plan.original), "afterSha256": digest(plan.source),
         "beforeMode": f"{plan.original_mode:04o}", "afterMode": "0755",
+        "payloadManifest": str(plan.release / "payload-manifest.json"),
+        "payloadManifestSha256": digest(plan.baseline_manifest),
+        "payloadManifestEntry": {MANIFEST_ENTRY: plan.baseline_entry},
     }
+    protected_file(audit / "payload-manifest.baseline.json", plan.baseline_manifest)
     protected_file(audit / "manifest.json", json.dumps(manifest, indent=2).encode())
     sync_directory(audit)
     sync_directory(paths.backups)
@@ -269,6 +304,8 @@ def install(paths: Paths = Paths(), *, apply: bool = False) -> Path | None:
             if ((release, target, installed, mode)
                     != (planned.release, planned.target, planned.source, 0o755)):
                 raise Refused("Installed updater verification failed")
+            if manifest_snapshot(release) != (planned.baseline_manifest, planned.baseline_entry):
+                raise Refused("Original release manifest changed during the retained-utility hotfix")
             protected_file(audit / "success.json", json.dumps({
                 "target": str(target), "sha256": digest(installed),
                 "scope": "retained-updater-only", "updaterExecuted": False,
@@ -276,6 +313,7 @@ def install(paths: Paths = Paths(), *, apply: bool = False) -> Path | None:
             sync_directory(audit)
         except Exception:
             # Never overwrite another actor's intervening edit during recovery.
+            trusted_directory(planned.target.parent)
             require_metadata(planned.target.lstat(), directory=False)
             if regular_bytes(planned.target) == planned.source:
                 atomic_replace(planned.target, planned.original, planned.original_mode)
