@@ -103,6 +103,11 @@ export async function getAppSumoSubscription(
   organizationId: string,
   { throwOnError = false }: LookupOptions = {}
 ): Promise<AppSumoSubscriptionInfo | null> {
+  // AppSumo licenses live in a cloud-only schema; self-hosted plan overrides are separate.
+  if (!IS_CLOUD) {
+    return null;
+  }
+
   try {
     const appsumoLicense = await db.execute(
       sql`SELECT tier, status FROM appsumo.licenses WHERE organization_id = ${organizationId} AND status = 'active' LIMIT 1`
@@ -578,7 +583,10 @@ export async function getCustomPlanSubscription(
 export async function getBestSubscription(
   organizationId: string,
   stripeCustomerId: string | null,
-  { throwOnStripeError = false, throwOnLookupError = false }: { throwOnStripeError?: boolean; throwOnLookupError?: boolean } = {}
+  {
+    throwOnStripeError = false,
+    throwOnLookupError = false,
+  }: { throwOnStripeError?: boolean; throwOnLookupError?: boolean } = {}
 ): Promise<SubscriptionInfo> {
   const lookup = { throwOnError: throwOnLookupError };
 

@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { test } from "node:test";
 import {
   auditReplayRuntime,
   boundedText,
   classifyReplayRuntime,
   hasMetadataTrackerTag,
+  inspectBeArtifact,
 } from "../audit-replay-runtime.mjs";
 
 const sha = "a".repeat(40),
@@ -34,7 +36,12 @@ const observation = (gzip = true) => {
       headers: "Content-Type, Content-Encoding",
       methods: "GET, POST, OPTIONS",
     },
-    beArtifact: { runtimeSha: "c".repeat(7), checkoutSha: "c".repeat(40) },
+    beArtifact: {
+      runtimeSha: "c".repeat(7),
+      checkoutSha: "c".repeat(40),
+      runtimeSourceSha: "c".repeat(40),
+      runtimeSourceClean: true,
+    },
     containers: ["backend", "client", "clickhouse", "postgres", "redis"].map(name => ({
       name,
       status: "running",
@@ -104,6 +111,208 @@ test("runtime JAR is not silently substituted by server checkout and output is a
   assert.equal(report.applicationVersion, null);
   assert.ok(!JSON.stringify(report).includes("private"));
   assert.equal(classifyReplayRuntime({}).ok, false);
+});
+
+test("verified runtime worktree does not disguise an older canonical checkout", () => {
+  const o = observation();
+  o.beArtifact.checkoutSha = "d".repeat(40);
+  const report = classifyReplayRuntime(o);
+  assert.equal(report.beArtifact.provenance, "mismatch");
+  assert.equal(report.beArtifact.runtimeSourceSha, "c".repeat(40));
+  assert.equal(report.beArtifact.runtimeSourceClean, true);
+  assert.equal(report.beArtifact.runtimeSourceVerified, true);
+  assert.ok(report.warnings.includes("be_checkout_differs_runtime_source_verified"));
+  assert.ok(!report.warnings.includes("be_checkout_runtime_mismatch"));
+});
+
+test("runtime source verification requires a full matching SHA and a strict clean boolean", () => {
+  for (const changes of [
+    { runtimeSourceClean: false },
+    { runtimeSourceClean: null },
+    { runtimeSourceClean: "true" },
+    { runtimeSourceClean: 1 },
+    { runtimeSourceSha: "c".repeat(7) },
+    { runtimeSourceSha: "d".repeat(40) },
+    { runtimeSourceSha: "C".repeat(40) },
+    { runtimeSha: "c".repeat(6) },
+    { runtimeSha: "d".repeat(40) },
+    { runtimeSourceSha: null },
+  ]) {
+    const o = observation();
+    Object.assign(o.beArtifact, changes, { checkoutSha: "e".repeat(40) });
+    const report = classifyReplayRuntime(o);
+    assert.equal(report.beArtifact.runtimeSourceVerified, false, JSON.stringify(changes));
+    assert.notEqual(report.beArtifact.provenance, "matches");
+    assert.ok(!report.warnings.includes("be_checkout_differs_runtime_source_verified"));
+    assert.ok(report.warnings.some(w => ["be_runtime_source_unavailable", "be_runtime_source_unverified"].includes(w)));
+  }
+});
+
+test("matching full runtime SHA is verified without changing canonical provenance semantics", () => {
+  const o = observation();
+  o.beArtifact.runtimeSha = "c".repeat(40);
+  const report = classifyReplayRuntime(o);
+  assert.equal(report.beArtifact.provenance, "matches");
+  assert.equal(report.beArtifact.runtimeSourceVerified, true);
+  assert.deepEqual(report.warnings, []);
+});
+
+test("malicious artifact/source fields are dropped from inspector and classifier output", () => {
+  const artifact = inspectBeArtifact(() =>
+    JSON.stringify({
+      runtimeSha: "private-runtime",
+      checkoutSha: "private-checkout",
+      runtimeSourceSha: "/private/source/path",
+      runtimeSourceClean: "private-state",
+      runtimeSourcePath: "/private/credentials",
+      applicationYaml: "private-token",
+    })
+  );
+  assert.deepEqual(artifact, {
+    runtimeSha: null,
+    checkoutSha: null,
+    runtimeSourceSha: null,
+    runtimeSourceClean: null,
+  });
+  const o = observation();
+  o.beArtifact = { ...artifact, privateEnvironment: "private-value", runtimeSourceVerified: true };
+  const report = classifyReplayRuntime(o);
+  assert.equal(report.beArtifact.runtimeSourceVerified, false);
+  assert.ok(!JSON.stringify(report).includes("private"));
+});
+
+function inspectArtifactFixture(changes = {}) {
+  let script;
+  inspectBeArtifact((command, args) => {
+    assert.equal(command, "python3");
+    assert.equal(args[0], "-c");
+    script = args[1];
+    return "{}";
+  });
+  const fixture = {
+    runtime: "c".repeat(7),
+    checkout: "d".repeat(40),
+    source: "c".repeat(40),
+    exists: true,
+    ...changes,
+  };
+  // Execute the real embedded inspector against fake Python filesystem/process
+  // APIs. No fixture git index, real JAR, command, repository or file is touched.
+  const harness = `
+import json,os,pathlib,subprocess,zipfile
+from unittest.mock import patch
+from types import SimpleNamespace
+case=json.loads(${JSON.stringify(JSON.stringify(fixture))})
+repo='/home/wotcv/prod/wot-cv-be'
+root='/home/wotcv/runtime-sources/wot-cv-be'
+worktree=root+'/'+case['source']
+calls=[]
+class FakePath:
+ def __init__(self,value): self.value=str(value)
+ def __str__(self): return self.value
+ def __fspath__(self): return self.value
+ def __truediv__(self,value): return FakePath(self.value+'/'+str(value))
+ def __eq__(self,other): return self.value==str(other)
+ def resolve(self,strict=False):
+  if self.value==worktree and case.get('symlink'): return FakePath('/private/forbidden')
+  return self
+ def is_relative_to(self,parent): return self.value.startswith(str(parent)+'/')
+ def read_bytes(self):
+  assert self.value=='/proc/4242/cmdline'
+  return b'java\\0-jar\\0/home/wotcv/prod/wot-cv-be/application/target/application.jar\\0'
+ def iterdir(self):
+  assert self.value=='/proc/4242/fd'
+  return iter([FakePath('/proc/4242/fd/3')])
+ def exists(self):
+  assert self.value==worktree
+  return case['exists']
+ def is_symlink(self): return bool(case.get('symlink'))
+ def is_dir(self): return not case.get('not_directory',False)
+class FakeZip:
+ def __init__(self,path): assert str(path)=='/proc/4242/fd/3'
+ def __enter__(self): return self
+ def __exit__(self,*args): pass
+ def getinfo(self,name):
+  assert name=='BOOT-INF/classes/git.properties'
+  return SimpleNamespace(file_size=100)
+ def read(self,info): return ('git.commit.id='+case['runtime']+'\\n').encode()
+def command(args,**options):
+ calls.append(args)
+ if args[0]=='systemctl': return '4242\\n'
+ assert args[:8]==['git','--no-optional-locks','--no-replace-objects','-c','core.fsmonitor=false','-c','core.hooksPath=/dev/null','-C']
+ assert options['env']['GIT_OPTIONAL_LOCKS']=='0'
+ assert options['env']['GIT_NO_LAZY_FETCH']=='1'
+ assert options['env']['GIT_TERMINAL_PROMPT']=='0'
+ directory=args[8]
+ operation=args[9:]
+ assert directory in (repo,worktree), 'forbidden path'
+ if operation==['rev-parse','--verify',case['runtime']+'^{commit}']:
+  if case.get('missing_object'): raise subprocess.CalledProcessError(1,args)
+  return case['source']+'\\n'
+ if operation==['rev-parse','HEAD']:
+  return (case['checkout'] if directory==repo else case.get('head',case['source']))+'\\n'
+ if operation==['rev-parse','--show-toplevel']: return case.get('top',worktree)+'\\n'
+ if operation==['rev-parse','--path-format=absolute','--git-common-dir']:
+  return (case.get('common',repo+'/.git') if directory==worktree else repo+'/.git')+'\\n'
+ if operation==['status','--porcelain=v1','--untracked-files=all','--ignore-submodules=none']:
+  if case.get('status_error'): raise subprocess.CalledProcessError(1,args)
+  return case.get('status','')
+ raise AssertionError('Unexpected command')
+with patch.object(pathlib,'Path',FakePath),patch.object(subprocess,'check_output',command),patch.object(zipfile,'ZipFile',FakeZip),patch.object(os,'readlink',return_value='/home/wotcv/prod/wot-cv-be/application/target/application.jar'):
+ exec(${JSON.stringify(script)},{})
+assert all(args[0] in ('git','systemctl') for args in calls)
+`;
+  const output = execFileSync(process.platform === "win32" ? "python" : "python3", ["-c", harness], {
+    encoding: "utf8",
+    timeout: 5000,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  return JSON.parse(output);
+}
+
+test("real artifact inspector resolves existing runtime object and verifies only its exact clean worktree", () => {
+  const artifact = inspectArtifactFixture();
+  assert.deepEqual(artifact, {
+    runtimeSha: "c".repeat(7),
+    checkoutSha: "d".repeat(40),
+    runtimeSourceSha: "c".repeat(40),
+    runtimeSourceClean: true,
+  });
+  const o = observation();
+  o.beArtifact = artifact;
+  const report = classifyReplayRuntime(o);
+  assert.equal(report.beArtifact.provenance, "mismatch");
+  assert.equal(report.beArtifact.runtimeSourceVerified, true);
+});
+
+test("real artifact inspector rejects dirty, wrong and aliased runtime source without leaking paths", () => {
+  for (const changes of [
+    { status: " M application/unsafe.java\n" },
+    { status: "?? private-credentials\n" },
+    { head: "e".repeat(40) },
+    { common: "/private/unrelated/.git" },
+    { top: "/private/unrelated" },
+    { symlink: true },
+    { not_directory: true },
+  ]) {
+    const artifact = inspectArtifactFixture(changes);
+    assert.equal(artifact.runtimeSourceClean, false, JSON.stringify(changes));
+    assert.equal(artifact.runtimeSourceSha, "c".repeat(40));
+    assert.ok(!JSON.stringify(artifact).includes("private"));
+  }
+});
+
+test("real artifact inspector distinguishes missing source/worktree and failed inspection", () => {
+  for (const changes of [{ missing_object: true }, { exists: false }, { status_error: true }]) {
+    const artifact = inspectArtifactFixture(changes);
+    assert.equal(artifact.runtimeSourceClean, null);
+    assert.equal(artifact.runtimeSourceSha, changes.missing_object ? null : "c".repeat(40));
+    assert.equal(artifact.runtimeSha, "c".repeat(7));
+    assert.equal(artifact.checkoutSha, "d".repeat(40));
+  }
+  const wrongObject = inspectArtifactFixture({ source: "e".repeat(40) });
+  assert.equal(wrongObject.runtimeSourceSha, null);
+  assert.equal(wrongObject.runtimeSourceClean, null);
 });
 
 test("metadata tag must be on the actual published tracker, not a comment or other script", () => {

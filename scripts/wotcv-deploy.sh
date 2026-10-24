@@ -5,6 +5,7 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${ROOT_DIR}/scripts/lib/wotcv-common.sh"
 source "${ROOT_DIR}/scripts/lib/wotcv-auth-cutover.sh"
+source "${ROOT_DIR}/scripts/lib/wotcv-deployment-availability.sh"
 STATE_FILE="${ROOT_DIR}/.wotcv-deployment.env"
 HEALTHCHECK_URL="${WOTCV_HEALTHCHECK_URL:-http://127.0.0.1:3001/api/health}"
 TARGET_TAG="${1:-${IMAGE_TAG:-}}"
@@ -26,6 +27,9 @@ cleanup() {
   local code=$?
   if [[ "${code}" != 0 && "${WOTCV_AUTH_CUTOVER_STARTED}" == 1 ]]; then
     echo "Auth cutover did not complete. Do not restart a 1.6 image blindly; see docs/WOTCV_AUTH_CUTOVER.md." >&2
+  fi
+  if [[ "${code}" != 0 ]]; then
+    wotcv_maintenance_failure_notice
   fi
   [[ -z "${COMPOSE_CONFIG_FILE}" ]] || rm -f "${COMPOSE_CONFIG_FILE}"
 }
@@ -49,6 +53,7 @@ wotcv_require_non_root
 wotcv_require_expected_compose_project "${COMPOSE_PROJECT_NAME}" "${EXPECTED_COMPOSE_PROJECT_NAME}"
 wotcv_require_commands git docker curl python3
 wotcv_require_clean_worktree
+wotcv_require_maintenance_gate
 
 image_digest() {
   local image="$1"
@@ -131,6 +136,7 @@ rollback() {
   local previous_client_digest="$3"
   local rollback_deployed_at
   local rollback_response
+  local rollback_git_sha
 
   if [[ -z "${previous_tag}" ]]; then
     echo "No previous deployment tag recorded; rollback must be performed manually." >&2
@@ -145,6 +151,12 @@ rollback() {
   WOTCV_DEPLOYED_AT="${rollback_deployed_at}" \
     "${COMPOSE[@]}" pull backend client || return 1
   wotcv_auth_assert_rollback_safe "${BACKEND_IMAGE}:${previous_tag}" "$("${COMPOSE[@]}" ps -q postgres)" || return 1
+  rollback_git_sha="$(docker image inspect "${BACKEND_IMAGE}:${previous_tag}" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" || return 1
+  [[ "${rollback_git_sha}" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "Previous backend image has no verified revision; refusing to reopen traffic." >&2
+    return 1
+  }
+  wotcv_drain_backend || return 1
   IMAGE_TAG="${previous_tag}" \
   BACKEND_IMAGE_DIGEST="${previous_backend_digest:-unknown}" \
   CLIENT_IMAGE_DIGEST="${previous_client_digest:-unknown}" \
@@ -155,7 +167,7 @@ rollback() {
   validate_clickhouse_event_baseline || return 1
   validate_postgres_data_baseline || return 1
 
-  if ! rollback_response="$(wotcv_wait_for_health "${HEALTHCHECK_URL}" "" "${previous_tag}")"; then
+  if ! rollback_response="$(wotcv_wait_for_health "${HEALTHCHECK_URL}" "${rollback_git_sha}" "${previous_tag}")"; then
     echo "Rollback health check failed; manual intervention is required." >&2
     return 1
   fi
@@ -164,6 +176,16 @@ rollback() {
     echo "Rollback returned an unexpected image tag: ${rollback_response}" >&2
     return 1
   fi
+
+  if [[ "${rollback_response}" != *"\"gitSha\":\"${rollback_git_sha}\""* ]]; then
+    echo "Rollback returned an unexpected git SHA: ${rollback_response}" >&2
+    return 1
+  fi
+
+  wotcv_wait_for_client || return 1
+  IMAGE_TAG="${previous_tag}" WOTCV_GIT_SHA="${rollback_git_sha}" \
+    bash "${ROOT_DIR}/scripts/wotcv-identity-v2-preflight.sh" || return 1
+  wotcv_leave_maintenance || return 1
 
   echo "Rollback completed: ${previous_tag}" >&2
 }
@@ -189,6 +211,10 @@ wotcv_validate_compose_persistence \
   "${REDIS_VOLUME_NAME}"
 require_persistent_volumes
 validate_persistent_storage
+wotcv_validate_runtime_logging "${EXPECTED_COMPOSE_PROJECT_NAME}" \
+  clickhouse "$("${COMPOSE[@]}" ps -q clickhouse)" \
+  postgres "$("${COMPOSE[@]}" ps -q postgres)" \
+  redis "$("${COMPOSE[@]}" ps -q redis)"
 capture_clickhouse_event_baseline
 capture_postgres_data_baseline
 
@@ -211,32 +237,61 @@ if [[ "$(wotcv_auth_image_version "${BACKEND_IMAGE}:${TARGET_TAG}")" != 1.7.3 ]]
   echo "This deployment script supports the reviewed Better Auth 1.7.3 images only." >&2
   exit 1
 fi
+
+BACKEND_IMAGE_DIGEST="$(image_digest "${BACKEND_IMAGE}")"
+CLIENT_IMAGE_DIGEST="$(image_digest "${CLIENT_IMAGE}")"
+export BACKEND_IMAGE_DIGEST CLIENT_IMAGE_DIGEST
+
+wotcv_plan_shared_infrastructure "${COMPOSE_CONFIG_FILE}"
+wotcv_enter_maintenance
 wotcv_auth_prepare_cutover "$("${COMPOSE[@]}" ps -q postgres)"
+wotcv_drain_backend
 echo "Applying PostgreSQL migrations with old auth workers drained when required..."
 "${COMPOSE[@]}" run --rm --no-deps --entrypoint sh backend -lc 'npm run db:migrate'
 [[ "$(wotcv_auth_schema_state "$("${COMPOSE[@]}" ps -q postgres)")" == current ]]
 validate_persistent_storage
 validate_postgres_data_baseline
 
-BACKEND_IMAGE_DIGEST="$(image_digest "${BACKEND_IMAGE}")"
-CLIENT_IMAGE_DIGEST="$(image_digest "${CLIENT_IMAGE}")"
-export BACKEND_IMAGE_DIGEST CLIENT_IMAGE_DIGEST
-
-echo "Starting backend and client..."
-"${COMPOSE[@]}" up -d --no-deps --force-recreate backend client
+wotcv_apply_infrastructure_change redis "${WOTCV_REDIS_RECREATE}"
+validate_persistent_storage
+validate_clickhouse_event_baseline
+validate_postgres_data_baseline
+wotcv_apply_infrastructure_change clickhouse "${WOTCV_CLICKHOUSE_RECREATE}"
 validate_persistent_storage
 validate_clickhouse_event_baseline
 validate_postgres_data_baseline
 
-if ! HEALTH_RESPONSE="$(wotcv_wait_for_health "${HEALTHCHECK_URL}" "" "${IMAGE_TAG}")"; then
+echo "Starting backend and client..."
+if ! "${COMPOSE[@]}" up -d --no-deps --force-recreate backend client; then
+  echo "Compose startup failed. Attempting rollback..." >&2
+  rollback "${PREVIOUS_TAG}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" || true
+  exit 1
+fi
+validate_persistent_storage
+validate_clickhouse_event_baseline
+validate_postgres_data_baseline
+
+if ! HEALTH_RESPONSE="$(wotcv_wait_for_health "${HEALTHCHECK_URL}" "${TARGET_REVISION}" "${IMAGE_TAG}")"; then
   echo "Health check failed. Recent logs:" >&2
   "${COMPOSE[@]}" logs --since=10m backend client >&2 || true
   rollback "${PREVIOUS_TAG}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" || true
   exit 1
 fi
 
+if [[ "${HEALTH_RESPONSE}" != *"\"gitSha\":\"${TARGET_REVISION}\""* ]]; then
+  echo "Health endpoint returned an unexpected git SHA: ${HEALTH_RESPONSE}" >&2
+  rollback "${PREVIOUS_TAG}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" || true
+  exit 1
+fi
+
 if [[ "${HEALTH_RESPONSE}" != *"\"imageTag\":\"${IMAGE_TAG}\""* ]]; then
   echo "Health endpoint returned an unexpected image tag: ${HEALTH_RESPONSE}" >&2
+  rollback "${PREVIOUS_TAG}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" || true
+  exit 1
+fi
+
+if ! wotcv_wait_for_client; then
+  echo "Client readiness check failed. Attempting application rollback..." >&2
   rollback "${PREVIOUS_TAG}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" || true
   exit 1
 fi
@@ -250,11 +305,13 @@ fi
 
 cat >"${STATE_FILE}.tmp" <<EOF
 LAST_IMAGE_TAG=${IMAGE_TAG}
+LAST_GIT_SHA=${TARGET_REVISION}
 BACKEND_IMAGE_DIGEST=${BACKEND_IMAGE_DIGEST}
 CLIENT_IMAGE_DIGEST=${CLIENT_IMAGE_DIGEST}
 DEPLOYED_AT=${WOTCV_DEPLOYED_AT}
 EOF
 mv "${STATE_FILE}.tmp" "${STATE_FILE}"
+wotcv_leave_maintenance
 
 echo "Deployment completed."
 echo "Tag: ${IMAGE_TAG}"

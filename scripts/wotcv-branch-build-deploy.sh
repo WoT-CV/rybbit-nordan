@@ -5,6 +5,7 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${ROOT_DIR}/scripts/lib/wotcv-common.sh"
 source "${ROOT_DIR}/scripts/lib/wotcv-auth-cutover.sh"
+source "${ROOT_DIR}/scripts/lib/wotcv-deployment-availability.sh"
 STATE_FILE="${ROOT_DIR}/.wotcv-deployment.env"
 DEPLOY_BRANCH="${WOTCV_BRANCH:-feat/wotcv}"
 DEPLOY_REMOTE="${WOTCV_REMOTE:-origin}"
@@ -29,6 +30,9 @@ cleanup() {
   if [[ "${code}" != 0 && "${WOTCV_AUTH_CUTOVER_STARTED}" == 1 ]]; then
     echo "Auth cutover did not complete. Old workers were stopped; do not restart a 1.6 image blindly. See docs/WOTCV_AUTH_CUTOVER.md." >&2
   fi
+  if [[ "${code}" != 0 ]]; then
+    wotcv_maintenance_failure_notice
+  fi
   [[ -z "${COMPOSE_CONFIG_FILE}" ]] || rm -f "${COMPOSE_CONFIG_FILE}"
 }
 
@@ -41,6 +45,7 @@ wotcv_require_non_root
 wotcv_require_expected_compose_project "${COMPOSE_PROJECT_NAME}" "${EXPECTED_COMPOSE_PROJECT_NAME}"
 wotcv_require_commands git docker curl python3
 wotcv_require_clean_worktree
+wotcv_require_maintenance_gate
 
 image_id() {
   local image="$1"
@@ -176,68 +181,22 @@ PY
   done
 }
 
-wait_for_service_health() {
-  local service="$1"
-  local container_id
-  local state
-  local health
-
-  for _ in {1..60}; do
-    container_id="$("${COMPOSE[@]}" ps -q "${service}")"
-    if [[ -n "${container_id}" ]]; then
-      state="$(docker inspect "${container_id}" --format '{{.State.Status}}')"
-      health="$(docker inspect "${container_id}" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}')"
-      if [[ "${state}" == "running" && ("${health}" == "healthy" || "${health}" == "none") ]]; then
-        return 0
-      fi
-    fi
-    sleep 2
-  done
-
-  echo "Service ${service} did not become healthy in time." >&2
-  return 1
-}
-
-ensure_redis_internal_only() {
-  local container_id
-  local port_bindings
-
-  container_id="$("${COMPOSE[@]}" ps -q redis)"
-  if [[ -n "${container_id}" ]]; then
-    port_bindings="$(docker inspect "${container_id}" --format '{{json .HostConfig.PortBindings}}')"
-    if python3 - "${port_bindings}" <<'PY'
-import json
-import sys
-
-raise SystemExit(0 if not (json.loads(sys.argv[1]) or {}) else 1)
-PY
-    then
-      wait_for_service_health redis
-      return 0
-    fi
-
-    echo "Redis still publishes a host port; recreating it on the internal Compose network..."
-  else
-    echo "Redis is not created; starting it on the internal Compose network..."
-  fi
-
-  # Recreating the container preserves the named redis-data volume while
-  # applying the effective Compose configuration without a host port binding.
-  "${COMPOSE[@]}" up -d --no-deps --force-recreate redis
-  wait_for_service_health redis
-}
-
 prepare_identity_infrastructure() {
   wotcv_auth_prepare_cutover "$("${COMPOSE[@]}" ps -q postgres)"
+  wotcv_drain_backend
   echo "Applying PostgreSQL migrations before loading the identity dictionary..."
   "${COMPOSE[@]}" run --rm --no-deps --entrypoint sh backend -lc 'npm run db:migrate'
   [[ "$(wotcv_auth_schema_state "$("${COMPOSE[@]}" ps -q postgres)")" == current ]]
   validate_persistent_storage
   validate_postgres_data_baseline
 
-  echo "Recreating ClickHouse with the PostgreSQL-backed identity dictionary..."
-  "${COMPOSE[@]}" up -d --no-deps --force-recreate clickhouse
-  wait_for_service_health clickhouse
+  # Unchanged ClickHouse and Redis containers must keep serving their existing
+  # data. Only an attested image/config change warrants a shared-infra restart.
+  wotcv_apply_infrastructure_change redis "${WOTCV_REDIS_RECREATE}"
+  validate_persistent_storage
+  validate_clickhouse_event_baseline
+  validate_postgres_data_baseline
+  wotcv_apply_infrastructure_change clickhouse "${WOTCV_CLICKHOUSE_RECREATE}"
   validate_persistent_storage
   validate_clickhouse_event_baseline
   validate_postgres_data_baseline
@@ -299,6 +258,7 @@ rollback() {
 
   echo "Rolling back to ${previous_tag}..." >&2
   wotcv_auth_assert_rollback_safe "${BACKEND_IMAGE}:${previous_tag}" "$("${COMPOSE[@]}" ps -q postgres)" || return 1
+  wotcv_drain_backend || return 1
   rollback_deployed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   IMAGE_TAG="${previous_tag}" \
@@ -322,6 +282,11 @@ rollback() {
     echo "Rollback returned an unexpected git SHA: ${rollback_response}" >&2
     return 1
   fi
+
+  wotcv_wait_for_client || return 1
+  IMAGE_TAG="${previous_tag}" WOTCV_GIT_SHA="${previous_git_sha}" \
+    bash "${ROOT_DIR}/scripts/wotcv-identity-v2-preflight.sh" || return 1
+  wotcv_leave_maintenance || return 1
 
   echo "Rollback completed: ${previous_tag}" >&2
 }
@@ -366,10 +331,12 @@ wotcv_validate_compose_persistence \
   "${REDIS_VOLUME_NAME}"
 require_persistent_volumes
 validate_persistent_storage
+wotcv_validate_runtime_logging "${EXPECTED_COMPOSE_PROJECT_NAME}" \
+  clickhouse "$("${COMPOSE[@]}" ps -q clickhouse)" \
+  postgres "$("${COMPOSE[@]}" ps -q postgres)" \
+  redis "$("${COMPOSE[@]}" ps -q redis)"
 capture_clickhouse_event_baseline
 capture_postgres_data_baseline
-ensure_redis_internal_only
-validate_infrastructure
 validate_persistent_storage
 validate_clickhouse_event_baseline
 validate_postgres_data_baseline
@@ -385,15 +352,19 @@ echo "Building backend and client locally from ${DEPLOY_BRANCH}..."
 echo "Validating runtime contents of backend and client images..."
 validate_runtime_images
 
+wotcv_plan_shared_infrastructure "${COMPOSE_CONFIG_FILE}"
+
+BACKEND_IMAGE_DIGEST="$(image_id "${BACKEND_IMAGE}" "${IMAGE_TAG}")"
+CLIENT_IMAGE_DIGEST="$(image_id "${CLIENT_IMAGE}" "${IMAGE_TAG}")"
+export BACKEND_IMAGE_DIGEST CLIENT_IMAGE_DIGEST
+
+wotcv_enter_maintenance
+
 prepare_identity_infrastructure
 validate_infrastructure
 validate_persistent_storage
 validate_clickhouse_event_baseline
 validate_postgres_data_baseline
-
-BACKEND_IMAGE_DIGEST="$(image_id "${BACKEND_IMAGE}" "${IMAGE_TAG}")"
-CLIENT_IMAGE_DIGEST="$(image_id "${CLIENT_IMAGE}" "${IMAGE_TAG}")"
-export BACKEND_IMAGE_DIGEST CLIENT_IMAGE_DIGEST
 
 echo "Starting backend and client..."
 if ! "${COMPOSE[@]}" up -d --no-deps --force-recreate backend client; then
@@ -425,6 +396,12 @@ if [[ "${HEALTH_RESPONSE}" != *"\"imageTag\":\"${IMAGE_TAG}\""* ]]; then
   exit 1
 fi
 
+if ! wotcv_wait_for_client; then
+  echo "Client readiness check failed. Attempting application rollback..." >&2
+  rollback "${PREVIOUS_TAG}" "${PREVIOUS_GIT_SHA}" "${PREVIOUS_BUILD_TIME}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" || true
+  exit 1
+fi
+
 echo "Running Identity Resolution v2 post-deployment preflight..."
 if ! bash scripts/wotcv-identity-v2-preflight.sh; then
   echo "Identity preflight failed. Attempting application rollback..." >&2
@@ -442,6 +419,7 @@ BUILD_TIME=${WOTCV_BUILD_TIME}
 DEPLOYED_AT=${WOTCV_DEPLOYED_AT}
 EOF
 mv "${STATE_FILE}.tmp" "${STATE_FILE}"
+wotcv_leave_maintenance
 
 echo "Branch build deployment completed."
 echo "Branch: ${DEPLOY_BRANCH}"

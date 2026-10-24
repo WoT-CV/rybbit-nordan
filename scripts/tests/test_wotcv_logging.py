@@ -178,7 +178,7 @@ class ComposeLoggingEntrypointTests(unittest.TestCase):
         for mutation in ('\n"${COMPOSE[@]}" pull backend client',
                          '\nwotcv_auth_prepare_cutover "$(',
                          '\n"${COMPOSE[@]}" run --rm',
-                         '\n"${COMPOSE[@]}" up -d'):
+                         '\nif ! "${COMPOSE[@]}" up -d'):
             self.assertLess(guard, source.index(mutation))
 
     def test_branch_deploy_checks_logging_before_infrastructure_or_build(self):
@@ -186,7 +186,7 @@ class ComposeLoggingEntrypointTests(unittest.TestCase):
         function = source.split("validate_compose_config() {", 1)[1].split("\n}", 1)[0]
         self.assertIn('wotcv_validate_compose_logging "${COMPOSE_CONFIG_FILE}"', function)
         validation = source.index("\nvalidate_compose_config\n")
-        for mutation in ("\nensure_redis_internal_only\n",
+        for mutation in ("\nwotcv_enter_maintenance\n",
                          '\n"${COMPOSE[@]}" "${BUILD_COMMAND[@]}" backend client',
                          "\nprepare_identity_infrastructure\n",
                          '\nif ! "${COMPOSE[@]}" up -d'):

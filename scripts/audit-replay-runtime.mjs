@@ -139,7 +139,17 @@ export function classifyReplayRuntime(observation) {
       : runtimeSha.startsWith(checkoutSha) || checkoutSha.startsWith(runtimeSha)
         ? "matches"
         : "mismatch";
-  if (provenance !== "matches") warnings.push(`be_checkout_runtime_${provenance}`);
+  const runtimeSourceSha = validSha(beArtifact?.runtimeSourceSha) ? beArtifact.runtimeSourceSha : null;
+  const runtimeSourceClean = typeof beArtifact?.runtimeSourceClean === "boolean" ? beArtifact.runtimeSourceClean : null;
+  const runtimeSourceVerified =
+    runtimeSha !== null &&
+    runtimeSourceSha !== null &&
+    runtimeSourceSha.startsWith(runtimeSha) &&
+    runtimeSourceClean === true;
+  if (provenance === "mismatch" && runtimeSourceVerified) warnings.push("be_checkout_differs_runtime_source_verified");
+  else if (provenance !== "matches") warnings.push(`be_checkout_runtime_${provenance}`);
+  if (!runtimeSourceVerified)
+    warnings.push(runtimeSourceSha ? "be_runtime_source_unverified" : "be_runtime_source_unavailable");
   return {
     ok: problems.length === 0,
     gzip,
@@ -148,7 +158,7 @@ export function classifyReplayRuntime(observation) {
     containers: states,
     cors: corsOk,
     frontendMetadataTagObserved: frontendMetadataTag === true,
-    beArtifact: { runtimeSha, checkoutSha, provenance },
+    beArtifact: { runtimeSha, checkoutSha, provenance, runtimeSourceSha, runtimeSourceClean, runtimeSourceVerified },
     problems,
     warnings,
     actualCompressedTrafficMeasured: false,
@@ -210,10 +220,15 @@ function inspectContainers() {
   });
 }
 
-function inspectBeArtifact() {
+export function inspectBeArtifact(execute = run) {
   // Only read the running JAR's small git.properties entry, never the environment
   // or application.yml. Source checkout is reported separately, never substituted.
   const script = `import json,os,pathlib,re,subprocess,zipfile
+repo=pathlib.Path('/home/wotcv/prod/wot-cv-be')
+source_root=pathlib.Path('/home/wotcv/runtime-sources/wot-cv-be')
+git_env={'PATH':os.defpath,'LANG':'C','LC_ALL':'C','GIT_OPTIONAL_LOCKS':'0','GIT_NO_LAZY_FETCH':'1','GIT_TERMINAL_PROMPT':'0','GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'/dev/null'}
+def git(path,*args):
+ return subprocess.check_output(['git','--no-optional-locks','--no-replace-objects','-c','core.fsmonitor=false','-c','core.hooksPath=/dev/null','-C',str(path),*args],timeout=5,text=True,env=git_env).strip()
 pid=subprocess.check_output(['systemctl','show','wotcv-be-prod.service','--property=MainPID','--value'],timeout=5,text=True).strip()
 assert re.fullmatch(r'[1-9][0-9]*',pid)
 args=pathlib.Path('/proc/'+pid+'/cmdline').read_bytes().split(b'\\0')
@@ -227,10 +242,39 @@ with zipfile.ZipFile(opened) as z:
  properties=z.read(info).decode()
 values=dict(line.split('=',1) for line in properties.splitlines() if '=' in line and not line.startswith('#'))
 runtime=values.get('git.commit.id.full') or values.get('git.commit.id') or values.get('git.commit.id.abbrev')
-checkout=subprocess.check_output(['git','-C','/home/wotcv/prod/wot-cv-be','rev-parse','HEAD'],timeout=5,text=True).strip()
+checkout=git(repo,'rev-parse','HEAD')
 assert re.fullmatch(r'[a-f0-9]{7,40}',runtime or '') and re.fullmatch(r'[a-f0-9]{40}',checkout)
-print(json.dumps({'runtimeSha':runtime,'checkoutSha':checkout}))`;
-  return JSON.parse(run("python3", ["-c", script]));
+source_sha=None
+source_clean=None
+try:
+ resolved=git(repo,'rev-parse','--verify',runtime+'^{commit}')
+ if re.fullmatch(r'[a-f0-9]{40}',resolved) and resolved.startswith(runtime):
+  source_sha=resolved
+except (OSError,subprocess.SubprocessError):
+ pass
+if source_sha:
+ worktree=source_root/source_sha
+ if worktree.exists() or worktree.is_symlink():
+  source_clean=False
+  try:
+   # Never inspect arbitrary paths or a symlink alias, even under the fixed root.
+   if worktree.resolve(strict=True)==worktree and worktree.is_dir():
+    top=git(worktree,'rev-parse','--show-toplevel')
+    common=git(repo,'rev-parse','--path-format=absolute','--git-common-dir')
+    worktree_common=git(worktree,'rev-parse','--path-format=absolute','--git-common-dir')
+    head=git(worktree,'rev-parse','HEAD')
+    if top==str(worktree) and common==str(repo/'.git') and common==worktree_common and head==source_sha:
+     source_clean=not git(worktree,'status','--porcelain=v1','--untracked-files=all','--ignore-submodules=none')
+  except (OSError,RuntimeError,subprocess.SubprocessError):
+   source_clean=None
+print(json.dumps({'runtimeSha':runtime,'checkoutSha':checkout,'runtimeSourceSha':source_sha,'runtimeSourceClean':source_clean}))`;
+  const record = JSON.parse(execute("python3", ["-c", script]));
+  return {
+    runtimeSha: safeSha(record?.runtimeSha),
+    checkoutSha: validSha(record?.checkoutSha) ? record.checkoutSha : null,
+    runtimeSourceSha: validSha(record?.runtimeSourceSha) ? record.runtimeSourceSha : null,
+    runtimeSourceClean: typeof record?.runtimeSourceClean === "boolean" ? record.runtimeSourceClean : null,
+  };
 }
 
 export async function auditReplayRuntime(

@@ -76,6 +76,36 @@ wotcv_validate_compose_logging() {
   python3 "${WOTCV_COMMON_DIR}/wotcv_logging.py" "${config_file}"
 }
 
+wotcv_validate_runtime_logging() {
+  local expected_project="$1"
+  shift
+  local -a services=() ids=()
+  local temporary
+  local result=0
+
+  if (( $# == 0 || $# % 2 != 0 )); then
+    echo "Runtime logging validation requires service/container pairs." >&2
+    return 1
+  fi
+  while (( $# )); do
+    [[ -n "$1" && -n "$2" ]] || return 1
+    services+=("$1")
+    ids+=("$2")
+    shift 2
+  done
+  temporary="$(mktemp "${TMPDIR:-/tmp}/rybbit-runtime-logging.${UID}.XXXXXX.json")" || return 1
+  chmod 600 "${temporary}" || { rm -f "${temporary}"; return 1; }
+  if docker inspect "${ids[@]}" >"${temporary}"; then
+    python3 "${WOTCV_COMMON_DIR}/wotcv_logging.py" \
+      --runtime-json "${temporary}" --expected-project "${expected_project}" \
+      --services "${services[@]}" || result=$?
+  else
+    result=1
+  fi
+  rm -f "${temporary}"
+  return "${result}"
+}
+
 wotcv_validate_compose_persistence() {
   local config_file="$1"
   local expected_project="$2"

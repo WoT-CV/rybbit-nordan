@@ -75,6 +75,12 @@ echo "[2/7] Verifying running containers, storage, and Redis isolation..."
 for service in postgres clickhouse redis backend client; do
   wait_for_container_ready "${service}"
 done
+wotcv_validate_runtime_logging "${EXPECTED_COMPOSE_PROJECT_NAME}" \
+  clickhouse "$("${COMPOSE[@]}" ps -q clickhouse)" \
+  postgres "$("${COMPOSE[@]}" ps -q postgres)" \
+  redis "$("${COMPOSE[@]}" ps -q redis)" \
+  backend "$("${COMPOSE[@]}" ps -q backend)" \
+  client "$("${COMPOSE[@]}" ps -q client)"
 
 wotcv_validate_container_persistence \
   "$("${COMPOSE[@]}" ps -q clickhouse)" \

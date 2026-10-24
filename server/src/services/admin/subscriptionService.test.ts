@@ -1,6 +1,6 @@
 import { DateTime } from "luxon";
 import type Stripe from "stripe";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * The admin org list resolves every organization's plan from one cached account-wide
@@ -14,11 +14,22 @@ const state = vi.hoisted(() => ({
   /** Number of licence queries issued — the loop batches at 1000 org ids. */
   licenseQueries: 0,
   stripeEnabled: true,
+  isCloud: true,
 }));
 
 const mocks = vi.hoisted(() => ({
   getAllStripeSubscriptionsByCustomer: vi.fn(),
 }));
+
+vi.mock("../../lib/const.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../lib/const.js")>();
+  return {
+    ...actual,
+    get IS_CLOUD() {
+      return state.isCloud;
+    },
+  };
+});
 
 vi.mock("../../db/postgres/postgres.js", () => ({
   db: {
@@ -108,9 +119,14 @@ beforeEach(() => {
   state.licenseQueryError = null;
   state.licenseQueries = 0;
   state.stripeEnabled = true;
+  state.isCloud = true;
   mocks.getAllStripeSubscriptionsByCustomer.mockReset();
   mocks.getAllStripeSubscriptionsByCustomer.mockResolvedValue(new Map());
   vi.spyOn(console, "error").mockImplementation(() => {});
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 describe("getOrganizationSubscriptions — free fallback", () => {
@@ -234,6 +250,7 @@ describe("getOrganizationSubscriptions — AppSumo licenses", () => {
       cancelAtPeriodEnd: false,
       interval: "lifetime",
     });
+    expect(state.licenseQueries).toBe(1);
   });
 
   it("omits the lifetime detail fields in summary mode", async () => {
@@ -268,6 +285,8 @@ describe("getOrganizationSubscriptions — AppSumo licenses", () => {
     const result = await getOrganizationSubscriptions([{ id: "org_1", stripeCustomerId: null }]);
 
     expect(result.get("org_1")?.planName).toBe("free");
+    expect(state.licenseQueries).toBe(1);
+    expect(console.error).toHaveBeenCalledWith("Error fetching AppSumo licenses:", state.licenseQueryError);
   });
 
   it("batches the license lookup at 1000 organization ids", async () => {
@@ -408,5 +427,66 @@ describe("getOrganizationSubscriptions — admin overrides", () => {
     ]);
 
     expect(result.get("org_1")).toMatchObject({ source: "stripe", planName: "standard250k" });
+  });
+});
+
+describe("getOrganizationSubscriptions — self-hosted", () => {
+  beforeEach(() => {
+    state.isCloud = false;
+    state.licenseQueryError = new Error("appsumo schema missing");
+  });
+
+  it.each([false, true])("skips the license query with includeFullDetails=%s", async includeFullDetails => {
+    const result = await getOrganizationSubscriptions([{ id: "org_1" }], includeFullDetails);
+
+    expect(result.get("org_1")).toMatchObject({ source: "free", eventLimit: DEFAULT_EVENT_LIMIT });
+    expect(state.licenseQueries).toBe(0);
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it("preserves custom > override > Stripe > free resolution without a license table", async () => {
+    snapshot({ cus_1: stripeSub() });
+
+    const result = await getOrganizationSubscriptions(
+      [
+        {
+          id: "org_custom",
+          stripeCustomerId: "cus_1",
+          planOverride: "appsumo-7",
+          customPlan: { events: 12_000_000, members: 40, websites: null },
+        },
+        { id: "org_appsumo_override", stripeCustomerId: "cus_1", planOverride: "appsumo-3" },
+        { id: "org_stripe_override", stripeCustomerId: "cus_1", planOverride: "standard250k" },
+        { id: "org_stripe", stripeCustomerId: "cus_1" },
+        { id: "org_invalid_override", stripeCustomerId: "cus_1", planOverride: "not-a-plan" },
+        { id: "org_free" },
+      ],
+      true
+    );
+
+    expect(result.get("org_custom")).toMatchObject({
+      source: "custom",
+      eventLimit: 12_000_000,
+      memberLimit: 40,
+      siteLimit: null,
+    });
+    expect(result.get("org_appsumo_override")).toMatchObject({
+      source: "override",
+      planName: "appsumo-3",
+      eventLimit: APPSUMO_TIER_LIMITS["3"],
+      interval: "lifetime",
+    });
+    expect(result.get("org_stripe_override")).toMatchObject({
+      source: "override",
+      planName: "standard250k",
+      eventLimit: planByName("standard250k").limits.events,
+    });
+    for (const id of ["org_stripe", "org_invalid_override"]) {
+      expect(result.get(id)).toMatchObject({ source: "stripe", planName: "pro500k" });
+    }
+    expect(result.get("org_free")).toMatchObject({ source: "free", eventLimit: DEFAULT_EVENT_LIMIT });
+    expect(state.licenseQueries).toBe(0);
+    expect(mocks.getAllStripeSubscriptionsByCustomer).toHaveBeenCalledTimes(1);
+    expect(console.error).not.toHaveBeenCalled();
   });
 });

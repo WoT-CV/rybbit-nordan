@@ -2,7 +2,7 @@ import { sql } from "drizzle-orm";
 import { DateTime } from "luxon";
 import Stripe from "stripe";
 import { db } from "../../db/postgres/postgres.js";
-import { APPSUMO_TIER_LIMITS, DEFAULT_EVENT_LIMIT, getStripePrices } from "../../lib/const.js";
+import { APPSUMO_TIER_LIMITS, DEFAULT_EVENT_LIMIT, getStripePrices, IS_CLOUD } from "../../lib/const.js";
 import { stripe } from "../../lib/stripe.js";
 import { getAllStripeSubscriptionsByCustomer } from "../../lib/subscriptionUtils.js";
 
@@ -125,7 +125,8 @@ async function fetchAppSumoLicensesForOrganizations(
 ): Promise<Map<string, AppSumoLicenseData>> {
   const licenseMap = new Map<string, AppSumoLicenseData>();
 
-  if (organizationIds.size === 0) {
+  // AppSumo licenses live in a cloud-only schema; self-hosted plan overrides are separate.
+  if (!IS_CLOUD || organizationIds.size === 0) {
     return licenseMap;
   }
 

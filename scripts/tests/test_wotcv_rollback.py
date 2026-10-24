@@ -27,19 +27,35 @@ COMPOSE=(mock_compose)
 BACKEND_IMAGE=fixture-backend
 CLIENT_IMAGE=fixture-client
 HEALTHCHECK_URL=http://fixture.invalid
-docker() { return 0; }
+ROOT_DIR=/fixture-never-executed
+FIXTURE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+docker() {
+  [[ "$CASE" != image_inspect_error ]] || return 11
+  if [[ "$CASE" == image_label ]]; then printf '%s\n' unknown;
+  else printf '%s\n' "$FIXTURE_SHA"; fi
+}
 mock_compose() {
   if [[ "$1" == ps ]]; then printf '%s\n' fixture-container; return 0; fi
   if [[ "$CASE" == "$1" ]]; then return 21; fi
 }
 wotcv_auth_assert_rollback_safe() { [[ "$CASE" != auth ]]; }
+wotcv_drain_backend() { [[ "$CASE" != drain ]]; }
+wotcv_wait_for_client() { [[ "$CASE" != client ]]; }
+wotcv_leave_maintenance() {
+  [[ "$CASE" != maintenance ]] || return 1
+  printf '%s\n' maintenance-released
+}
+bash() {
+  [[ "$CASE" != preflight ]] || return 1
+  [[ "$IMAGE_TAG" == sha-prev && "$WOTCV_GIT_SHA" == "$FIXTURE_SHA" ]]
+}
 validate_persistent_storage() { [[ "$CASE" != persistence ]]; }
 validate_clickhouse_event_baseline() { [[ "$CASE" != clickhouse ]]; }
 validate_postgres_data_baseline() { [[ "$CASE" != postgres ]]; }
 wotcv_wait_for_health() {
   [[ "$CASE" != health ]] || return 1
   if [[ "$CASE" == wrong_revision ]]; then printf '%s\n' '{}';
-  else printf '%s\n' '{"imageTag":"sha-prev","gitSha":"fixture-sha"}'; fi
+  else printf '{"imageTag":"sha-prev","gitSha":"%s"}\n' "$FIXTURE_SHA"; fi
 }
 '''
 
@@ -49,7 +65,7 @@ class RollbackTests(unittest.TestCase):
     def run_rollback(self, script, case):
         # Invoke in an if: errexit is deliberately disabled inside rollback.
         harness = FAKES + "\n" + function(script, "rollback") + r'''
-if rollback sha-prev fixture-sha fixture-time fixture-backend fixture-client; then
+if rollback sha-prev "$FIXTURE_SHA" fixture-time fixture-backend fixture-client; then
   printf '%s\n' rollback-success
 else
   printf '%s\n' rollback-failed >&2
@@ -63,21 +79,24 @@ fi
 
     def test_all_rollback_failures_propagate_in_conditional_context(self):
         for script in ("wotcv-deploy.sh", "wotcv-branch-build-deploy.sh"):
-            cases = ["auth", "up", "persistence", "clickhouse", "postgres", "health", "wrong_revision"]
+            cases = ["auth", "up", "persistence", "clickhouse", "postgres", "health", "wrong_revision",
+                     "drain", "client", "preflight", "maintenance", "image_inspect_error"]
             if script == "wotcv-deploy.sh":
-                cases.append("pull")
+                cases.extend(["pull", "image_label"])
             for case in cases:
                 with self.subTest(script=script, case=case):
                     result = self.run_rollback(script, case)
                     self.assertEqual(result.returncode, 42, result.stderr)
                     self.assertNotIn("Rollback completed", result.stderr)
                     self.assertNotIn("rollback-success", result.stdout)
+                    self.assertNotIn("maintenance-released", result.stdout)
 
     def test_success_is_reported_only_after_all_checks(self):
         for script in ("wotcv-deploy.sh", "wotcv-branch-build-deploy.sh"):
             result = self.run_rollback(script, "success")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("Rollback completed", result.stderr)
+            self.assertIn("maintenance-released", result.stdout)
 
     def test_storage_validator_cannot_hide_first_or_second_mount_failure(self):
         for script in ("wotcv-deploy.sh", "wotcv-branch-build-deploy.sh"):

@@ -13,6 +13,7 @@ const state = vi.hoisted(() => ({
   appsumoLicenses: [] as Array<{ tier: string; status: string }>,
   orgSelectError: null as Error | null,
   appsumoError: null as Error | null,
+  appsumoQueries: 0,
 }));
 
 const mocks = vi.hoisted(() => ({
@@ -56,6 +57,7 @@ vi.mock("../db/postgres/postgres.js", () => {
           "customPlan" in fields ? [{ customPlan: state.customPlan }] : [{ planOverride: state.planOverride }]
         ),
       execute: async () => {
+        state.appsumoQueries += 1;
         if (state.appsumoError) {
           throw state.appsumoError;
         }
@@ -270,6 +272,7 @@ beforeEach(() => {
   state.appsumoLicenses = [];
   state.orgSelectError = null;
   state.appsumoError = null;
+  state.appsumoQueries = 0;
   mocks.stripeEnabled = true;
   mocks.isCloud = true;
   mocks.list.mockReset();
@@ -760,6 +763,16 @@ describe("getCustomPlanSubscription", () => {
 });
 
 describe("getAppSumoSubscription", () => {
+  it.each([false, true])("skips the cloud-only lookup on self-hosted with throwOnError=%s", async throwOnError => {
+    mocks.isCloud = false;
+    state.appsumoError = new Error("appsumo schema missing");
+
+    await expect(getAppSumoSubscription("org_1", { throwOnError })).resolves.toBeNull();
+
+    expect(state.appsumoQueries).toBe(0);
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
   it("maps an active license to its tier limits", async () => {
     state.appsumoLicenses = [{ tier: "6", status: "active" }];
 
@@ -770,6 +783,7 @@ describe("getAppSumoSubscription", () => {
       eventLimit: APPSUMO_TIER_LIMITS["6"],
       replayLimit: APPSUMO_REPLAY_LIMITS["6"],
     });
+    expect(state.appsumoQueries).toBe(1);
   });
 
   it("falls back to tier 1 limits (and no replay) for an unrecognized tier", async () => {
@@ -790,6 +804,13 @@ describe("getAppSumoSubscription", () => {
     state.appsumoError = new Error("appsumo schema missing");
 
     await expect(getAppSumoSubscription("org_1")).resolves.toBeNull();
+  });
+
+  it("propagates a cloud lookup failure when the caller opts in", async () => {
+    state.appsumoError = new Error("pg down");
+
+    await expect(getAppSumoSubscription("org_1", { throwOnError: true })).rejects.toBe(state.appsumoError);
+    expect(state.appsumoQueries).toBe(1);
   });
 });
 
@@ -857,6 +878,14 @@ describe("getBestSubscription priority", () => {
     );
     await expect(getBestSubscription("org_1", nextCustomer())).resolves.toMatchObject({ source: "free" });
   });
+
+  it("propagates a cloud AppSumo failure with throwOnLookupError even when Stripe has a plan", async () => {
+    state.appsumoError = new Error("pg down");
+    const customer = nextCustomer();
+    listReturns([stripeSub({ customer })]);
+
+    await expect(getBestSubscription("org_1", customer, { throwOnLookupError: true })).rejects.toBe(state.appsumoError);
+  });
 });
 
 describe("getBestSubscriptionFromStripeSub", () => {
@@ -881,6 +910,85 @@ describe("getBestSubscriptionFromStripeSub", () => {
 
     expect(mocks.list).not.toHaveBeenCalled();
   });
+
+  it("propagates a cloud AppSumo lookup failure instead of falling back to free", async () => {
+    state.appsumoError = new Error("pg down");
+
+    await expect(getBestSubscriptionFromStripeSub("org_1", null, { throwOnError: true })).rejects.toBe(
+      state.appsumoError
+    );
+  });
+});
+
+describe.each([
+  {
+    name: "per-customer lookup",
+    resolve: () => getBestSubscription("org_1", null, { throwOnLookupError: true }),
+  },
+  {
+    name: "Stripe snapshot",
+    resolve: () => getBestSubscriptionFromStripeSub("org_1", null, { throwOnError: true }),
+  },
+])("self-hosted plan resolution — $name", ({ resolve }) => {
+  beforeEach(() => {
+    mocks.isCloud = false;
+    state.appsumoError = new Error("appsumo schema missing");
+  });
+
+  it("falls back to free without querying or logging a missing AppSumo schema", async () => {
+    await expect(resolve()).resolves.toMatchObject({ source: "free", eventLimit: DEFAULT_EVENT_LIMIT });
+
+    expect(state.appsumoQueries).toBe(0);
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it.each(["appsumo-5", "standard250k"])("preserves the %s preset override", async planOverride => {
+    state.planOverride = planOverride;
+
+    await expect(resolve()).resolves.toMatchObject({
+      source: "override",
+      planName: planOverride,
+      eventLimit: planOverride === "appsumo-5" ? APPSUMO_TIER_LIMITS["5"] : planByName(planOverride).limits.events,
+    });
+    expect(state.appsumoQueries).toBe(0);
+  });
+
+  it("preserves a custom plan ahead of a preset override", async () => {
+    state.customPlan = { events: 9_000_000, members: 7, websites: 12 };
+    state.planOverride = "appsumo-7";
+
+    await expect(resolve()).resolves.toMatchObject({
+      source: "custom",
+      eventLimit: 9_000_000,
+      memberLimit: 7,
+      siteLimit: 12,
+    });
+    expect(state.appsumoQueries).toBe(0);
+  });
+
+  it("still propagates an organization lookup failure in strict mode", async () => {
+    state.orgSelectError = new Error("pg down");
+
+    await expect(resolve()).rejects.toBe(state.orgSelectError);
+  });
+});
+
+it("preserves Stripe subscriptions in both self-hosted resolvers without AppSumo lookups", async () => {
+  mocks.isCloud = false;
+  state.appsumoError = new Error("appsumo schema missing");
+  const customer = nextCustomer();
+  listReturns([stripeSub({ customer })]);
+
+  await expect(getBestSubscription("org_1", customer, { throwOnLookupError: true })).resolves.toMatchObject({
+    source: "stripe",
+    planName: "pro500k",
+  });
+  await expect(getBestSubscriptionFromStripeSub("org_1", stripeInfo(), { throwOnError: true })).resolves.toMatchObject({
+    source: "stripe",
+    planName: "pro500k",
+  });
+  expect(state.appsumoQueries).toBe(0);
+  expect(console.error).not.toHaveBeenCalled();
 });
 
 describe("siteRequiresPlan", () => {
@@ -928,10 +1036,13 @@ describe("hasHadStripeSubscription", () => {
     await expect(hasHadStripeSubscription("cus_history")).resolves.toBe(false);
   });
 
-  it.each(["canceled", "past_due", "trialing", "active", "unpaid"])("is true once a %s subscription exists", async status => {
-    listReturns([stripeSub({ customer: "cus_history", status })]);
-    await expect(hasHadStripeSubscription("cus_history")).resolves.toBe(true);
-  });
+  it.each(["canceled", "past_due", "trialing", "active", "unpaid"])(
+    "is true once a %s subscription exists",
+    async status => {
+      listReturns([stripeSub({ customer: "cus_history", status })]);
+      await expect(hasHadStripeSubscription("cus_history")).resolves.toBe(true);
+    }
+  );
 
   it("caches per customer until the subscription cache is invalidated", async () => {
     listReturns([stripeSub({ customer: "cus_history", status: "canceled" })]);
