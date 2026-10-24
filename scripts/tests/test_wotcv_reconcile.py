@@ -125,6 +125,32 @@ class KnownDriftTests(unittest.TestCase):
                 RECONCILE.command(ROOT, ["docker", "compose"])
         self.assertNotIn("sentinel", str(error.exception))
 
+    def test_target_must_not_track_environment_or_deployment_state(self):
+        for name in (".env", ".env.production", "client/.env.local", ".wotcv-deployment.env"):
+            with self.subTest(name=name), patch.object(RECONCILE, "git", side_effect=[name.encode() + b"\0", b""]):
+                with self.assertRaisesRegex(RECONCILE.Refused, "protected environment/state"):
+                    RECONCILE.require_safe_target_files(ROOT, "a" * 40)
+
+    def test_target_must_not_overwrite_an_existing_ignored_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "ignored.txt").write_text("keep me")
+            with patch.object(RECONCILE, "git", side_effect=[b"ignored.txt\0", b""]):
+                with self.assertRaisesRegex(RECONCILE.Refused, "existing untracked/ignored"):
+                    RECONCILE.require_safe_target_files(repo, "a" * 40)
+            self.assertEqual((repo / "ignored.txt").read_text(), "keep me")
+
+    def test_target_compose_paths_must_not_be_symlinks(self):
+        names = b"\0".join(name.encode() for name in RECONCILE.FILES) + b"\0"
+        for bad in RECONCILE.FILES:
+            entries = b"\0".join(
+                (b"120000" if name == bad else b"100644") + b" blob " + b"a" * 40 + b"\t" + name.encode()
+                for name in RECONCILE.FILES
+            ) + b"\0"
+            with self.subTest(file=bad), patch.object(RECONCILE, "git", side_effect=[names, names, entries]):
+                with self.assertRaisesRegex(RECONCILE.Refused, "regular tracked files"):
+                    RECONCILE.require_safe_target_files(ROOT, "a" * 40)
+
 
 @unittest.skipUnless(os.name == "posix", "Linux required for real Git/atomic-file reconciliation fixtures")
 class ReconcileIntegrationTests(unittest.TestCase):
@@ -167,7 +193,8 @@ class ReconcileIntegrationTests(unittest.TestCase):
         patch.object(RECONCILE, "health", return_value={"status": "ok", "gitSha": "unchanged"}).start()
 
     def git(self, *args):
-        return subprocess.run(["git", *args], cwd=self.repo, check=True, capture_output=True, text=True).stdout
+        return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", *args],
+                              cwd=self.repo, check=True, capture_output=True, text=True).stdout
 
     def test_check_retains_all_dirty_files_and_protects_backup(self):
         audit = RECONCILE.reconcile(self.repo, self.backups, self.target, False, False)
@@ -220,6 +247,44 @@ class ReconcileIntegrationTests(unittest.TestCase):
                 RECONCILE.reconcile(self.repo, self.backups, self.target, True, False)
         for name, data in self.originals.items():
             self.assertEqual((self.repo / name).read_bytes(), data)
+
+    def test_backup_only_never_calls_docker_or_health(self):
+        with patch.object(RECONCILE, "render", side_effect=AssertionError("must not render")), \
+             patch.object(RECONCILE, "runtime", side_effect=AssertionError("must not inspect")), \
+             patch.object(RECONCILE, "health", side_effect=AssertionError("must not probe")):
+            audit = RECONCILE.reconcile(self.repo, self.backups, None, False, True)
+        self.assertTrue((audit / "manifest.json").exists())
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.head)
+        for name, data in self.originals.items():
+            self.assertEqual((self.repo / name).read_bytes(), data)
+
+    def test_partial_restore_failure_recovers_all_three_originals(self):
+        original_replace = RECONCILE.replace_file
+        calls = 0
+        def fail_once(path, data):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("Synthetic write failure")
+            return original_replace(path, data)
+        with patch.object(RECONCILE, "replace_file", side_effect=fail_once):
+            with self.assertRaisesRegex(OSError, "Synthetic write failure"):
+                RECONCILE.reconcile(self.repo, self.backups, self.target, True, False)
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.head)
+        for name, data in self.originals.items():
+            self.assertEqual((self.repo / name).read_bytes(), data)
+
+    def test_real_git_target_cannot_force_track_ignored_environment(self):
+        self.git("read-tree", self.target)
+        self.git("add", "-f", ".env")
+        tree = self.git("write-tree").strip()
+        unsafe = self.git("commit-tree", tree, "-p", self.target, "-m", "isolated unsafe target").strip()
+        self.git("read-tree", "HEAD")
+        self.git("update-ref", "refs/remotes/origin/feat/wotcv", unsafe)
+        with self.assertRaisesRegex(RECONCILE.Refused, "protected environment/state"):
+            RECONCILE.reconcile(self.repo, self.backups, unsafe, True, False)
+        self.assertEqual((self.repo / ".env").read_text(), "FAKE_SECRET=never-print\n")
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.head)
 
 
 if __name__ == "__main__":

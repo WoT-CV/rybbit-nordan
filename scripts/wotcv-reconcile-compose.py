@@ -82,6 +82,35 @@ def require_known_status(value: bytes) -> None:
         raise Refused("Expected only the three unstaged Compose changes; staged, extra or untracked files refused")
 
 
+def require_safe_target_files(repo: Path, target: str) -> None:
+    target_paths = set(git(repo, "ls-tree", "-r", "--name-only", "-z", target).split(b"\0")) - {b""}
+    head_paths = set(git(repo, "ls-tree", "-r", "--name-only", "-z", "HEAD").split(b"\0")) - {b""}
+    for raw in target_paths:
+        relative = Path(raw.decode("utf-8"))
+        # A later upstream commit must not turn ignored production secrets or
+        # deployment state into tracked files, even if Git would overwrite them.
+        if any((part == ".env" or part.startswith(".env.") and part != ".env.example"
+                or part == ".wotcv-deployment.env") for part in relative.parts):
+            raise Refused("Target tracks a protected environment/state path; nothing restored")
+        location = repo / relative
+        if raw not in head_paths:
+            if location.exists() or location.is_symlink():
+                raise Refused("Target would overwrite an existing untracked/ignored path; nothing restored")
+            for parent in location.parents:
+                if parent == repo:
+                    break
+                if parent.is_symlink():
+                    raise Refused("Target would write through an existing symlink; nothing restored")
+    compose_entries = git(repo, "ls-tree", "-z", target, "--", *FILES).split(b"\0")
+    modes = {}
+    for entry in compose_entries:
+        if entry:
+            metadata, name = entry.split(b"\t", 1)
+            modes[name.decode()] = metadata.split(b" ", 1)[0]
+    if set(modes) != set(FILES) or any(mode not in (b"100644", b"100755") for mode in modes.values()):
+        raise Refused("Target Compose paths must all be regular tracked files, not symlinks")
+
+
 def regular_bytes(path: Path) -> bytes:
     if not stat.S_ISREG(path.lstat().st_mode):
         raise Refused(f"Not a regular file: {path.name}")
@@ -256,6 +285,7 @@ def reconcile(repo: Path, backup_root: Path, target: str | None, apply: bool, ba
         if git(repo, "rev-parse", "refs/remotes/origin/feat/wotcv").decode().strip() != target:
             raise Refused("Fetch origin first; --target must equal origin/feat/wotcv")
         command(repo, ["git", "merge-base", "--is-ancestor", head, target])
+        require_safe_target_files(repo, target)
         candidate = audit / "target"
         candidate.mkdir(mode=0o700)
         for name in FILES:
@@ -279,6 +309,7 @@ def reconcile(repo: Path, backup_root: Path, target: str | None, apply: bool, ba
                 or any(regular_bytes(repo / name) != originals[name] for name in FILES)
                 or git(repo, "rev-parse", "refs/remotes/origin/feat/wotcv").decode().strip() != target):
             raise Refused("Repository/environment changed during preflight")
+        require_safe_target_files(repo, target)
         try:
             for name in FILES:
                 replace_file(repo / name, baseline[name])
