@@ -2,6 +2,7 @@ import { useEffect, useMemo } from "react";
 import { useIntersectionObserver } from "@uidotdev/usehooks";
 import { Loader2, Video } from "lucide-react";
 import { useExtracted } from "next-intl";
+import { useParams } from "next/navigation";
 import { NothingFound } from "../../../../components/NothingFound";
 import { ReplayCard, ReplayCardSkeleton } from "./ReplayCard";
 import { useGetSessionReplays } from "../../../../api/analytics/hooks/sessionReplay/useGetSessionReplays";
@@ -11,9 +12,13 @@ import { useReplayStore } from "@/components/replay/replayStore";
 import { ScrollArea } from "../../../../components/ui/scroll-area";
 import { Input } from "../../../../components/ui/input";
 import { cn, formatter } from "../../../../lib/utils";
+import { useStore } from "@/lib/store";
 
 export function ReplayList({ onSelect }: { onSelect?: () => void }) {
   const t = useExtracted();
+  const params = useParams();
+  const site = useStore(state => state.site);
+  const isRouteReady = params.site === site;
   const { sessionId, selectSession, minDuration, setMinDuration } = useReplayStore(
     useShallow(s => ({
       sessionId: s.sessionId,
@@ -23,7 +28,7 @@ export function ReplayList({ onSelect }: { onSelect?: () => void }) {
     }))
   );
 
-  const { data, isLoading, error, fetchNextPage, hasNextPage, isFetchingNextPage } = useGetSessionReplays({
+  const { data, isLoading, isFetching, error, fetchNextPage, hasNextPage, isFetchingNextPage } = useGetSessionReplays({
     minDuration,
   });
 
@@ -43,10 +48,12 @@ export function ReplayList({ onSelect }: { onSelect?: () => void }) {
   // The selected session lives in a global store, so it can belong to another
   // site or a replay this list doesn't contain; fall back to the first replay.
   useEffect(() => {
-    if (flattenedData.length > 0 && !sessionId) {
-      selectSession(flattenedData[0].session_id, false);
+    if (!isRouteReady || !data || isLoading || isFetching || error) return;
+    if (!flattenedData.some(replay => replay.session_id === sessionId)) {
+      const fallback = flattenedData[0]?.session_id ?? "";
+      if (sessionId !== fallback) selectSession(fallback, false);
     }
-  }, [flattenedData, selectSession, sessionId]);
+  }, [data, error, flattenedData, isFetching, isLoading, isRouteReady, selectSession, sessionId]);
 
   useEffect(() => {
     if (entry?.isIntersecting && hasNextPage && !isFetchingNextPage && !isLoading) {

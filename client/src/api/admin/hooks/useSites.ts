@@ -2,6 +2,7 @@ import { Query, useQuery } from "@tanstack/react-query";
 import { usePathname } from "next/navigation";
 import { authClient } from "../../../lib/auth";
 import { useStore } from "../../../lib/store";
+import { getRequestCacheScope, getRequestPrivateKey } from "../../requestContext";
 import {
   fetchSite,
   fetchSiteHasData,
@@ -31,13 +32,15 @@ export function useGetSitesFromOrg(
 }
 
 export function useSiteHasData(siteId: string) {
+  useStore(state => state.privateKey);
+  const privateKey = getRequestPrivateKey();
   return useQuery({
-    queryKey: ["site-has-data", siteId],
+    queryKey: ["site-has-data", siteId, getRequestCacheScope(privateKey)],
     queryFn: () => {
       if (!siteId) {
         return Promise.resolve(false);
       }
-      return fetchSiteHasData(siteId).then(data => data.hasData);
+      return fetchSiteHasData(siteId, privateKey).then(data => data.hasData);
     },
     // Poll only until the site reports data. Once it flips true it can never
     // flip back, so continuing to poll re-asks a settled question every 5 s for
@@ -61,17 +64,18 @@ export function useGetSite(
   }
 ) {
   const { site: storeSelectedSite } = useStore();
+  const privateKey = getRequestPrivateKey();
 
   const siteIdToUse = siteId ?? storeSelectedSite;
 
   return useQuery({
-    queryKey: ["get-site", siteIdToUse],
+    queryKey: ["get-site", siteIdToUse, getRequestCacheScope(privateKey)],
     queryFn: async () => {
       if (!siteIdToUse) {
         return null;
       }
 
-      const data = await fetchSite(siteIdToUse);
+      const data = await fetchSite(siteIdToUse, privateKey);
       return data;
     },
     staleTime: 60000,

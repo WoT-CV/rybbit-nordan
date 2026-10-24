@@ -2,8 +2,12 @@
 
 import { FilterParameter } from "@rybbit/shared";
 import { useQueries } from "@tanstack/react-query";
-import { createContext, useContext, useMemo } from "react";
-import { buildAnalyticsRequest, fetchAnalytics } from "../../../../../api/analytics/analyticsRequest";
+import { createContext, useContext } from "react";
+import {
+  buildAnalyticsQueryKey,
+  buildAnalyticsRequest,
+  fetchAnalytics,
+} from "../../../../../api/analytics/analyticsRequest";
 import { MetricResponse } from "../../../../../api/analytics/endpoints";
 import { useMetric } from "../../../../../api/analytics/hooks/useGetMetric";
 import { useAnalyticsContext } from "../../../../../api/analytics/useAnalyticsQuery";
@@ -34,34 +38,27 @@ export function useFilterValueOptions(parameter: FilterParameter): {
   });
 
   const { context } = useAnalyticsContext({ useFilters: false });
-  const request = buildAnalyticsRequest(
-    { path: "metric", params: { parameter, limit: SUGGESTION_LIMIT } },
-    context
-  );
-  const queries = useQueries({
+  const request = buildAnalyticsRequest({ path: "metric", params: { parameter, limit: SUGGESTION_LIMIT } }, context);
+  const combined = useQueries({
     queries: (siteIds ?? []).map(siteId => ({
-      queryKey: ["filter-value-options", siteId, request.path, request.params],
+      queryKey: buildAnalyticsQueryKey("filter-value-options", siteId, request),
       queryFn: () => fetchAnalytics<ValueOptions>(siteId, request),
       staleTime: 60_000,
     })),
+    combine: queries => {
+      const counts = new Map<string, MetricResponse>();
+      for (const q of queries) {
+        for (const row of q.data?.data ?? []) {
+          const existing = counts.get(row.value);
+          if (existing) existing.count += row.count;
+          else counts.set(row.value, { ...row });
+        }
+      }
+      const data = Array.from(counts.values()).sort((a, b) => b.count - a.count);
+      return { data: { data, totalCount: data.length }, isFetching: queries.some(q => q.isFetching) };
+    },
   });
 
-  // Site ids too: a new set of not-yet-loaded sites has the same all-zero
-  // timestamps as the last one and must not reuse its merged values.
-  const signature = `${parameter}|${(siteIds ?? []).join(",")}|${queries.map(q => q.dataUpdatedAt).join(",")}`;
-  const merged = useMemo(() => {
-    const counts = new Map<string, MetricResponse>();
-    for (const q of queries) {
-      for (const row of q.data?.data ?? []) {
-        const existing = counts.get(row.value);
-        if (existing) existing.count += row.count;
-        else counts.set(row.value, { ...row });
-      }
-    }
-    const data = Array.from(counts.values()).sort((a, b) => b.count - a.count);
-    return { data, totalCount: data.length };
-  }, [signature]);
-
   if (siteIds === null) return { data: single.data, isFetching: single.isFetching };
-  return { data: merged, isFetching: queries.some(q => q.isFetching) };
+  return combined;
 }

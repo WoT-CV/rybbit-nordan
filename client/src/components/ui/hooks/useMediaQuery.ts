@@ -1,22 +1,27 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useSyncExternalStore } from "react";
+
+const getServerSnapshot = () => null;
 
 const useMediaQuery = (query: string) => {
-  const [matches, setMatches] = useState<boolean | null>(null);
+  const subscribe = useCallback(
+    (onChange: () => void) => {
+      const media = window.matchMedia(query);
+      media.addEventListener("change", onChange);
+      window.addEventListener("resize", onChange);
+      return () => {
+        media.removeEventListener("change", onChange);
+        window.removeEventListener("resize", onChange);
+      };
+    },
+    [query]
+  );
+  const getSnapshot = useCallback(() => window.matchMedia(query).matches, [query]);
 
-  useEffect(() => {
-    const media = window.matchMedia(query);
-
-    if (media.matches !== matches) setMatches(media.matches);
-
-    const listener = () => setMatches(media.matches);
-
-    window.addEventListener("resize", listener);
-    return () => window.removeEventListener("resize", listener);
-  }, [query, matches]);
-
-  return matches;
+  // SSR/hydration stay unknown; browser renders read the current media state.
+  // Listen to media changes too: they need not coincide with window.resize.
+  return useSyncExternalStore<boolean | null>(subscribe, getSnapshot, getServerSnapshot);
 };
 
 export default useMediaQuery;

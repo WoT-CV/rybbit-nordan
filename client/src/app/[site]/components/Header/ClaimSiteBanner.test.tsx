@@ -2,6 +2,7 @@ import React from "react";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getRequestCacheScope, setPrivateKeyResolver } from "../../../../api/requestContext";
 
 const state = vi.hoisted(() => ({
   cloud: true,
@@ -52,7 +53,11 @@ vi.mock("@/lib/store", () => ({
   useStore: () => ({ site: "7", privateKey: state.path.includes("aaaaaaaaaaaa") ? "aaaaaaaaaaaa" : null }),
 }));
 vi.mock("@/api/admin/hooks/useSites", () => ({
-  useGetSite: (siteId: string) => useQuery({ queryKey: ["get-site", siteId], queryFn: async () => state.site }),
+  useGetSite: (siteId: string) =>
+    useQuery({
+      queryKey: ["get-site", siteId, getRequestCacheScope(state.path.includes("aaaaaaaaaaaa") ? "aaaaaaaaaaaa" : null)],
+      queryFn: async () => state.site,
+    }),
 }));
 vi.mock("@/api/admin/hooks/useOrganizations", () => ({
   USER_ORGANIZATIONS_QUERY_KEY: "organizations",
@@ -95,6 +100,7 @@ import { Header } from "./Header";
 
 let client: QueryClient;
 beforeEach(() => {
+  setPrivateKeyResolver(() => (state.path.includes("aaaaaaaaaaaa") ? "aaaaaaaaaaaa" : null));
   vi.clearAllMocks();
   state.cloud = true;
   state.disableSignup = false;
@@ -132,6 +138,7 @@ afterEach(() => {
   cleanup();
   client.clear();
   vi.unstubAllGlobals();
+  setPrivateKeyResolver(() => null);
 });
 function show() {
   return render(
@@ -211,11 +218,24 @@ describe("claim flow", () => {
   });
   it("lets an existing admin claim into their organization", async () => {
     state.organizations = [{ id: "org_1", name: "Existing", role: "admin", permissions: ["sites:create"] }];
+    const activeScope = getRequestCacheScope("aaaaaaaaaaaa");
+    const otherScope = getRequestCacheScope("bbbbbbbbbbbb");
+    for (const id of [7, "7"]) {
+      client.setQueryData(["get-site", id, activeScope], state.site);
+      client.setQueryData(["get-site", id, otherScope], state.site);
+    }
     show();
     await openClaim();
     fireEvent.click(await screen.findByRole("button", { name: "Claim site" }));
     await waitFor(() => expect(state.replace).toHaveBeenCalledWith("/7"));
     expect(state.createOrg).not.toHaveBeenCalled();
+    for (const id of [7, "7"]) {
+      expect(client.getQueryData(["get-site", id, activeScope])).toMatchObject({
+        organizationId: "org_1",
+        isOwner: true,
+      });
+      expect(client.getQueryData(["get-site", id, otherScope])).toMatchObject({ organizationId: null });
+    }
   });
   it("finishes self-hosted signup without checkout", async () => {
     state.cloud = false;

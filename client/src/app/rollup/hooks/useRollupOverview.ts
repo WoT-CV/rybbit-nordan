@@ -1,8 +1,7 @@
 import { useQueries } from "@tanstack/react-query";
-import { useMemo } from "react";
-import { buildAnalyticsRequest, fetchAnalytics } from "@/api/analytics/analyticsRequest";
+import { buildAnalyticsQueryKey, buildAnalyticsRequest, fetchAnalytics } from "@/api/analytics/analyticsRequest";
 import { GetOverviewResponse } from "@/api/analytics/endpoints";
-import { querySignature, useRollupQueryContext, useSettledSnapshot } from "./useRollupQueryContext";
+import { useRollupQueryContext, useSettledSnapshot } from "./useRollupQueryContext";
 
 export type RollupOverview = {
   siteId: number;
@@ -36,28 +35,25 @@ export function useRollupOverview({
   const context = useRollupQueryContext(lite);
   const request = buildAnalyticsRequest({ path: lite ? "overview-lite" : "overview" }, context);
 
-  const queries = useQueries({
-    queries: siteIds.map((siteId) => ({
-      queryKey: ["rollup-overview", siteId, request.path, request.params],
+  const { queries, overviews } = useQueries({
+    queries: siteIds.map(siteId => ({
+      queryKey: buildAnalyticsQueryKey("rollup-overview", siteId, request),
       queryFn: () => fetchAnalytics<GetOverviewResponse>(siteId, request),
       staleTime: 60_000,
     })),
-  });
-
-  const signature = querySignature(siteIds, queries);
-  const overviews = useMemo(
-    () =>
-      queries
+    combine: queries => ({
+      queries,
+      overviews: queries
         .map((q, i) => ({ siteId: siteIds[i], data: q.data }))
         .filter((o): o is RollupOverview => !!o.data),
-    [signature]
-  );
-  const settled = useSettledSnapshot(overviews, queries);
+    }),
+  });
+  const settled = useSettledSnapshot(overviews, queries, request.accessScope);
 
   return {
     overviews: settled.data ?? [],
     isLoading: settled.isLoading,
-    isFetching: queries.some((q) => q.isFetching),
-    error: (queries.find((q) => q.error)?.error as Error) ?? null,
+    isFetching: queries.some(q => q.isFetching),
+    error: (queries.find(q => q.error)?.error as Error) ?? null,
   };
 }

@@ -1,7 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
 import { DateTime } from "luxon";
 import { useEffect, useMemo } from "react";
-import { buildAnalyticsRequest, fetchAnalytics } from "../../../../../../api/analytics/analyticsRequest";
+import {
+  buildAnalyticsQueryKey,
+  buildAnalyticsRequest,
+  fetchAnalytics,
+} from "../../../../../../api/analytics/analyticsRequest";
 import { GetSessionsResponse } from "../../../../../../api/analytics/endpoints";
 import { useAnalyticsContext } from "../../../../../../api/analytics/useAnalyticsQuery";
 import { getFilteredFilters } from "../../../../../../lib/store";
@@ -32,7 +36,7 @@ export function useTimelineSessions() {
 
   // Fetch all sessions with pagination (up to 5 pages, 50k sessions total)
   const { data, isLoading, isError } = useQuery({
-    queryKey: ["timeline-sessions", site, request.path, request.params],
+    queryKey: buildAnalyticsQueryKey("timeline-sessions", site, request),
     queryFn: async () => {
       const allSessions: GetSessionsResponse = [];
       let reachedMaxPages = false;
@@ -74,9 +78,7 @@ export function useTimelineSessions() {
 
   // Update store with allSessions
   useEffect(() => {
-    if (allSessions.length > 0) {
-      setAllSessions(allSessions, data?.hasMoreData || false);
-    }
+    setAllSessions(allSessions, data?.hasMoreData || false);
   }, [allSessions, data?.hasMoreData, setAllSessions]);
 
   // Calculate time range from fetched sessions and initialize timeline

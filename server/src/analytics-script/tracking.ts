@@ -4,6 +4,7 @@ import {
   TrackingPayload,
   WebVitalsData,
   SessionReplayBatch,
+  SessionReplayBatchResult,
   ButtonClickProperties,
   CopyProperties,
   FormSubmitProperties,
@@ -24,8 +25,9 @@ const FEATURE_FLAG_REQUEST_TIMEOUT_MS = 2000;
 
 export class Tracker {
   private config: ScriptConfig;
-  private sendReplay: (batch: SessionReplayBatch) => Promise<void>;
+  private sendReplay: (batch: SessionReplayBatch) => Promise<SessionReplayBatchResult | void>;
   private customUserId: string | null = null;
+  private identityVersion = 0;
   private sessionReplayRecorder?: SessionReplayRecorder;
   private errorDedupeCache: Map<string, number> = new Map();
   private errorDedupeLastCleanup = 0;
@@ -141,8 +143,8 @@ export class Tracker {
     }
   }
 
-  private async sendSessionReplayBatch(batch: SessionReplayBatch): Promise<void> {
-    await this.sendReplay(batch);
+  private async sendSessionReplayBatch(batch: SessionReplayBatch): Promise<SessionReplayBatchResult | void> {
+    return this.sendReplay(batch);
   }
 
   createBasePayload(): BasePayload | null {
@@ -453,6 +455,7 @@ export class Tracker {
 
     const nextUserId = userId.trim();
     const isAccountSwitch = Boolean(this.customUserId && this.customUserId !== nextUserId);
+    if (this.customUserId !== nextUserId) this.identityVersion++;
 
     if (isAccountSwitch) {
       // Treat a direct account switch like logout + login even when the host
@@ -498,8 +501,16 @@ export class Tracker {
     isNewIdentify: boolean = true
   ): Promise<void> {
     let conflictRotationUsed = false;
+    let anonymousId = this.config.visitorId;
+    const identityVersion = this.identityVersion;
+    const isCurrentIdentity = () =>
+      this.identityVersion === identityVersion && this.customUserId === userId && this.config.visitorId === anonymousId;
 
     for (let attempt = 1; attempt <= IDENTIFY_MAX_ATTEMPTS; attempt += 1) {
+      // Logout/account changes invalidate outstanding retries. An old user's
+      // response must never link or rotate the new account's anonymous ID.
+      if (!isCurrentIdentity()) return;
+
       try {
         const response = await fetch(`${this.config.analyticsHost}/identify`, {
           method: "POST",
@@ -508,7 +519,7 @@ export class Tracker {
           },
           body: JSON.stringify({
             site_id: this.config.siteId,
-            anonymous_id: this.config.visitorId,
+            anonymous_id: anonymousId,
             user_id: userId,
             traits: traits,
             is_new_identify: isNewIdentify,
@@ -517,15 +528,22 @@ export class Tracker {
           keepalive: true,
         });
 
+        if (!isCurrentIdentity()) return;
+
         if (response.ok) {
           return;
         }
 
         if (response.status === 409 && isNewIdentify && !conflictRotationUsed) {
           const body = await response.json().catch(() => null);
+          if (!isCurrentIdentity()) return;
           if (body?.code === "ANONYMOUS_ID_ALREADY_LINKED" && body?.rotateAnonymousId === true) {
             conflictRotationUsed = true;
-            this.config.visitorId = rotateVisitorId(this.config.namespace);
+            // Preserve the capture-time identity on buffered replay events,
+            // just as the direct account-switch and logout paths do.
+            this.sessionReplayRecorder?.onPageChange();
+            anonymousId = rotateVisitorId(this.config.namespace);
+            this.config.visitorId = anonymousId;
             continue;
           }
         }
@@ -535,6 +553,7 @@ export class Tracker {
           return;
         }
       } catch (error) {
+        if (!isCurrentIdentity()) return;
         if (attempt === IDENTIFY_MAX_ATTEMPTS) {
           console.error("Failed to send identify event:", error);
           return;
@@ -555,6 +574,7 @@ export class Tracker {
   }
 
   clearUserId(): void {
+    this.identityVersion++;
     this.customUserId = null;
     try {
       localStorage.removeItem(`${this.config.namespace}-user-id`);

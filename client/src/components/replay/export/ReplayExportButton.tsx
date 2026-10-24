@@ -20,33 +20,45 @@ interface ReplayExportButtonProps {
   sessionId: string;
 }
 
+interface ActiveReplayExport {
+  siteId: number;
+  sessionId: string;
+  exportId: string;
+}
+
 export function ReplayExportButton({ disabled, range, sessionId }: ReplayExportButtonProps) {
   const t = useExtracted();
   const params = useParams();
   const siteId = Number(params.site);
-  const [exportId, setExportId] = useState<string | null>(null);
+  const [activeExport, setActiveExport] = useState<ActiveReplayExport | null>(null);
+  const exportId = activeExport?.exportId ?? null;
   const handledExportIdRef = useRef<string | null>(null);
   const createExport = useCreateReplayExport();
   const downloadExport = useDownloadReplayExport();
-  const { data: exportStatus } = useReplayExportStatus(siteId, sessionId, exportId);
+  const { data: exportStatus } = useReplayExportStatus(
+    activeExport?.siteId ?? siteId,
+    activeExport?.sessionId ?? sessionId,
+    exportId
+  );
   const isExporting = Boolean(exportId && !["ready", "failed", "cancelled"].includes(exportStatus?.state ?? "queued"));
 
   useEffect(() => {
-    if (!exportId || !exportStatus || handledExportIdRef.current === exportId) return;
+    if (!activeExport || !exportStatus || handledExportIdRef.current === activeExport.exportId) return;
+    const { exportId } = activeExport;
 
     if (exportStatus.state === "ready") {
       handledExportIdRef.current = exportId;
       downloadExport
-        .mutateAsync({ siteId, sessionId, exportId })
+        .mutateAsync(activeExport)
         .then(blob => {
-          downloadBlob(exportStatus.filename ?? `rybbit-export-${sessionId}.zip`, blob);
+          downloadBlob(exportStatus.filename ?? `rybbit-export-${activeExport.sessionId}.zip`, blob);
           toast.success(t("Replay export downloaded"));
-          setExportId(null);
+          setActiveExport(null);
         })
         .catch(error => {
           handledExportIdRef.current = null;
           toast.error(error instanceof Error ? error.message : t("Replay export download failed"));
-          setExportId(null);
+          setActiveExport(null);
         });
       return;
     }
@@ -54,9 +66,9 @@ export function ReplayExportButton({ disabled, range, sessionId }: ReplayExportB
     if (exportStatus.state === "failed" || exportStatus.state === "cancelled") {
       handledExportIdRef.current = exportId;
       toast.error(exportStatus.error || t("Replay export failed"));
-      queueMicrotask(() => setExportId(null));
+      queueMicrotask(() => setActiveExport(null));
     }
-  }, [downloadExport, exportId, exportStatus, sessionId, siteId, t]);
+  }, [activeExport, downloadExport, exportStatus, t]);
 
   const handleExport = async () => {
     if (!range) return;
@@ -71,7 +83,7 @@ export function ReplayExportButton({ disabled, range, sessionId }: ReplayExportB
           endMs: range[1],
         },
       });
-      setExportId(result.exportId);
+      setActiveExport({ siteId, sessionId, exportId: result.exportId });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : t("Could not start replay export"));
     }

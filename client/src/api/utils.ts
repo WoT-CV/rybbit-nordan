@@ -96,8 +96,9 @@ export function buildApiParams(time: Time, options: { timeZone: string; filters?
 export async function authedFetch<T>(
   url: string,
   params?: Record<string, any>,
-  config: AxiosRequestConfig = {}
+  config: AxiosRequestConfig & { requestPrivateKey?: string | null } = {}
 ): Promise<T> {
+  const { requestPrivateKey = getRequestPrivateKey(), ...axiosConfig } = config;
   const fullUrl = url.startsWith("http") ? url : `${BACKEND_URL}${url}`;
 
   // Process params to handle arrays correctly for backend JSON parsing
@@ -112,10 +113,9 @@ export async function authedFetch<T>(
     });
   }
 
-  const privateKey = getRequestPrivateKey();
   const headers = {
-    ...config.headers,
-    ...(privateKey ? { "x-private-key": privateKey } : {}),
+    ...axiosConfig.headers,
+    ...(requestPrivateKey ? { "x-private-key": requestPrivateKey } : {}),
   };
 
   try {
@@ -123,7 +123,7 @@ export async function authedFetch<T>(
       url: fullUrl,
       params: processedParams,
       withCredentials: true,
-      ...config,
+      ...axiosConfig,
       headers,
     });
 

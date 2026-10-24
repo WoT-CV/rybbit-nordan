@@ -71,6 +71,11 @@ async function loadStorage(
   return r2Storage;
 }
 
+// What ingestion hands storeBatch: each event's data serialized on its own.
+function serialize(values: unknown[]): string[] {
+  return values.map(value => JSON.stringify(value));
+}
+
 function sentInput(call = 0): Record<string, any> {
   return mocks.send.mock.calls[call][0].input;
 }
@@ -105,7 +110,7 @@ describe("r2Storage initialization", () => {
     const storage = await loadStorage({ cloud: false, accountId: "" });
 
     expect(storage.isEnabled()).toBe(false);
-    await expect(storage.storeBatch(1, "session", [{ type: "pageview" }])).resolves.toBeNull();
+    await expect(storage.storeBatch(1, "session", [JSON.stringify({ type: "pageview" })])).resolves.toBeNull();
     await expect(storage.getBatch("1/session/batch.json.zst")).rejects.toThrow("R2 storage is not enabled");
     await expect(storage.deleteBatch("1/session/batch.json.zst")).resolves.toBeUndefined();
     expect(mocks.clientConfigs).toHaveLength(0);
@@ -163,7 +168,7 @@ describe("r2Storage initialization", () => {
 });
 
 describe("r2Storage.storeBatch", () => {
-  it("compresses JSON and stores it with a deterministic key and retrieval metadata", async () => {
+  it("compresses JSON and stores it with a unique key and retrieval metadata", async () => {
     vi.spyOn(Date, "now").mockReturnValue(1_725_000_123_456);
     mocks.send.mockResolvedValue({});
     const storage = await loadStorage();
@@ -172,16 +177,15 @@ describe("r2Storage.storeBatch", () => {
       { type: "custom_event", name: "signup" },
     ];
 
-    await expect(storage.storeBatch(42, "session/with spaces", events)).resolves.toBe(
-      "42/session/with spaces/1725000123456.json.zst"
-    );
+    const key = await storage.storeBatch(42, "session/with spaces", serialize(events));
+    expect(key).toMatch(/^42\/session\/with spaces\/1725000123456-[0-9a-f-]{36}\.json\.zst$/);
 
     expect(mocks.compress).toHaveBeenCalledOnce();
     expect(mocks.compress.mock.calls[0][0].toString()).toBe(JSON.stringify(events));
     expect(mocks.compress.mock.calls[0][1]).toBe(3);
     expect(sentInput()).toMatchObject({
       Bucket: "test-bucket",
-      Key: "42/session/with spaces/1725000123456.json.zst",
+      Key: key,
       ContentType: "application/octet-stream",
       Metadata: {
         siteId: "42",
@@ -193,13 +197,39 @@ describe("r2Storage.storeBatch", () => {
     expect(sentInput().Body).toEqual(Buffer.from(`zstd:${JSON.stringify(events)}`));
   });
 
+  it("writes the same bytes as serializing the whole data array", async () => {
+    mocks.send.mockResolvedValue({});
+    const storage = await loadStorage();
+    // Shapes rrweb and the JSON body parser can produce, including the
+    // characters JSON.stringify escapes and non-ASCII text.
+    const data: unknown[] = [
+      { type: 2, data: { node: { childNodes: [{ textContent: 'quote " backslash \\ newline \n tab \t' }] } } },
+      { source: 3, positions: [{ x: 1.5, y: -2, timeOffset: 0 }] },
+      null,
+      0,
+      -12.75,
+      true,
+      "plain string",
+      "é ünïcödé 日本語 🐸 \u2028\u2029",
+      [],
+      {},
+      [[1, [2, [3]]], { nested: { deeper: [null, false, ""] } }],
+      { "key with spaces": 1, "": "empty key", "__proto__-ish": "x" },
+    ];
+
+    await storage.storeBatch(7, "session", serialize(data));
+
+    expect(mocks.compress.mock.calls[0][0]).toEqual(Buffer.from(JSON.stringify(data)));
+  });
+
   it("supports empty batches and records a zero event count", async () => {
     vi.spyOn(Date, "now").mockReturnValue(100);
     mocks.send.mockResolvedValue({});
     const storage = await loadStorage();
 
-    await expect(storage.storeBatch(0, "empty", [])).resolves.toBe("0/empty/100.json.zst");
+    await expect(storage.storeBatch(0, "empty", [])).resolves.toMatch(/^0\/empty\/100-[0-9a-f-]{36}\.json\.zst$/);
     expect(sentInput().Metadata.eventCount).toBe("0");
+    expect(mocks.compress.mock.calls[0][0].toString()).toBe(JSON.stringify([]));
   });
 
   it("propagates compression failures without issuing a put", async () => {
@@ -207,7 +237,7 @@ describe("r2Storage.storeBatch", () => {
     mocks.compress.mockRejectedValue(compressionError);
     const storage = await loadStorage();
 
-    await expect(storage.storeBatch(1, "session", [{}])).rejects.toBe(compressionError);
+    await expect(storage.storeBatch(1, "session", ["{}"])).rejects.toBe(compressionError);
     expect(mocks.send).not.toHaveBeenCalled();
     expect(console.error).toHaveBeenCalledWith("[R2Storage] Failed to store batch:", compressionError);
   });
@@ -217,7 +247,7 @@ describe("r2Storage.storeBatch", () => {
     mocks.send.mockRejectedValue(putError);
     const storage = await loadStorage();
 
-    await expect(storage.storeBatch(1, "session", [{}])).rejects.toBe(putError);
+    await expect(storage.storeBatch(1, "session", ["{}"])).rejects.toBe(putError);
     expect(mocks.compress).toHaveBeenCalledOnce();
     expect(console.error).toHaveBeenCalledWith("[R2Storage] Failed to store batch:", putError);
   });
@@ -232,16 +262,36 @@ describe("r2Storage.storeBatch", () => {
     mocks.send.mockResolvedValue({});
     const storage = await loadStorage();
 
-    const first = storage.storeBatch(1, "first", [{ sequence: 1 }]);
-    const second = storage.storeBatch(2, "second", [{ sequence: 2 }]);
+    const first = storage.storeBatch(1, "first", [JSON.stringify({ sequence: 1 })]);
+    const second = storage.storeBatch(2, "second", [JSON.stringify({ sequence: 2 })]);
 
-    await expect(second).resolves.toBe("2/second/500.json.zst");
+    const secondKey = await second;
+    expect(secondKey).toMatch(/^2\/second\/500-[0-9a-f-]{36}\.json\.zst$/);
     expect(mocks.send).toHaveBeenCalledOnce();
-    expect(sentInput().Key).toBe("2/second/500.json.zst");
+    expect(sentInput().Key).toBe(secondKey);
 
     releaseFirst(Buffer.from("first"));
-    await expect(first).resolves.toBe("1/first/500.json.zst");
+    await expect(first).resolves.toMatch(/^1\/first\/500-[0-9a-f-]{36}\.json\.zst$/);
     expect(mocks.send).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not overwrite concurrent batches for one session in the same millisecond", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(500);
+    mocks.send.mockResolvedValue({});
+    const storage = await loadStorage();
+
+    const keys = await Promise.all([
+      storage.storeBatch(42, "shared-session", serialize([{ sequence: 1 }])),
+      storage.storeBatch(42, "shared-session", serialize([{ sequence: 2 }])),
+    ]);
+
+    expect(new Set(keys).size).toBe(2);
+    expect(mocks.send).toHaveBeenCalledTimes(2);
+    expect(mocks.send.mock.calls.map(([command]) => command.input.Key)).toEqual(keys);
+    expect(mocks.send.mock.calls.map(([command]) => command.input.Body.toString())).toEqual([
+      'zstd:[{"sequence":1}]',
+      'zstd:[{"sequence":2}]',
+    ]);
   });
 });
 

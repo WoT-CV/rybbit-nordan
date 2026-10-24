@@ -201,8 +201,8 @@ export function updateSiteConfig(
   });
 }
 
-export function fetchSite(siteId: string | number) {
-  return authedFetch<SiteResponse>(`/sites/${siteId}`);
+export function fetchSite(siteId: string | number, privateKey?: string | null) {
+  return authedFetch<SiteResponse>(`/sites/${siteId}`, undefined, { requestPrivateKey: privateKey });
 }
 
 export type SiteUsageResponse = {
@@ -222,8 +222,8 @@ export function fetchSiteUsage(siteId: number) {
   return authedFetch<SiteUsageResponse>(`/sites/${siteId}/usage`);
 }
 
-export function fetchSiteHasData(siteId: string) {
-  return authedFetch<{ hasData: boolean }>(`/sites/${siteId}/has-data`);
+export function fetchSiteHasData(siteId: string, privateKey?: string | null) {
+  return authedFetch<{ hasData: boolean }>(`/sites/${siteId}/has-data`, undefined, { requestPrivateKey: privateKey });
 }
 
 export function fetchSiteIsPublic(siteId: string | number) {

@@ -87,18 +87,45 @@ describe("ReplayPlayerControls clock isolation", () => {
     expect(screen.getByText("0:00 / 2:00")).toBeTruthy();
   });
 
-  it("forwards preview, commit and cancellation handlers without wrapping or dropping them", () => {
+  it("previews only active pointer gestures and preserves commit/cancel handlers", () => {
     const controls = props();
     render(<ReplayPlayerControls {...controls} />);
     const timeline = mocks.timeline.mock.lastCall![0];
-    expect(timeline.onValueChange).toBe(controls.onSliderChange);
     expect(timeline.onValueCommit).toBe(controls.onSliderCommit);
     expect(timeline.onPointerCancel).toBe(controls.onSliderCancel);
     expect(timeline.onLostPointerCapture).toBe(controls.onSliderCancel);
+    expect(timeline.className).toContain("[&>*]:pointer-events-none");
+    const down = { pointerId: 7, isPrimary: true, button: 0 } as Parameters<
+      NonNullable<typeof timeline.onPointerDownCapture>
+    >[0];
+    timeline.onValueChange?.([20]);
+    expect(controls.onSliderChange).not.toHaveBeenCalled();
+    timeline.onPointerDownCapture?.(down);
+    timeline.onValueChange?.([20]);
+    expect(controls.onSliderChange).toHaveBeenCalledExactlyOnceWith([20]);
+    timeline.onPointerUpCapture?.(down);
+    timeline.onValueChange?.([30]);
+    expect(controls.onSliderChange).toHaveBeenCalledOnce();
+    timeline.onValueCommit?.([30]);
+    expect(controls.onSliderCommit).toHaveBeenCalledExactlyOnceWith([30]);
     act(() => timeline.onNetworkSeek?.(25_123));
     expect(useReplayStore.getState().player?.seek).toHaveBeenCalledExactlyOnceWith(25_123);
     expect(useReplayStore.getState().currentTime).toBe(25_123);
   });
+
+  it.each(["onPointerCancelCapture", "onLostPointerCaptureCapture", "onKeyDownCapture"] as const)(
+    "clears pointer preview on %s before later value changes",
+    eventName => {
+      const controls = props();
+      render(<ReplayPlayerControls {...controls} />);
+      const timeline = mocks.timeline.mock.lastCall![0];
+      const event = { pointerId: 7, isPrimary: true, button: 0 } as never;
+      timeline.onPointerDownCapture?.(event);
+      timeline[eventName]?.(event);
+      timeline.onValueChange?.([50]);
+      expect(controls.onSliderChange).not.toHaveBeenCalled();
+    }
+  );
 
   it("initializes the export range from the current position once the recording is ready", () => {
     useReplayStore.setState({ exportRange: null, replaySegments: [] });

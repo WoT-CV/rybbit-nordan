@@ -48,6 +48,28 @@ wotcv_require_expected_compose_project() {
   fi
 }
 
+wotcv_validate_compose_ports() {
+  local config_file="$1"
+
+  python3 - "${config_file}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    services = json.load(stream)["services"]
+
+if services["redis"].get("ports"):
+    raise SystemExit("Redis must not publish a host port")
+
+for name in ("clickhouse", "postgres", "backend", "client"):
+    for port in services[name].get("ports") or []:
+        if port.get("host_ip") not in ("127.0.0.1", "::1"):
+            raise SystemExit(f"{name} publishes outside loopback: {port}")
+
+print("Compose port validation passed.")
+PY
+}
+
 wotcv_validate_compose_persistence() {
   local config_file="$1"
   local expected_project="$2"
@@ -87,8 +109,8 @@ wotcv_validate_container_persistence() {
   fi
 
   actual_project="$(docker inspect "${container_id}" \
-    --format '{{index .Config.Labels "com.docker.compose.project"}}')"
-  mounts_json="$(docker inspect "${container_id}" --format '{{json .Mounts}}')"
+    --format '{{index .Config.Labels "com.docker.compose.project"}}')" || return 1
+  mounts_json="$(docker inspect "${container_id}" --format '{{json .Mounts}}')" || return 1
 
   python3 "${WOTCV_PERSISTENCE_HELPER}" validate-container \
     --service "${service_name}" \

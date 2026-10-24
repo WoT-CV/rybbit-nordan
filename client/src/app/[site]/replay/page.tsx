@@ -1,6 +1,6 @@
 "use client";
 
-import { useMeasure, useMediaQuery } from "@uidotdev/usehooks";
+import { useMeasure } from "@uidotdev/usehooks";
 import { Video } from "lucide-react";
 import { useExtracted } from "next-intl";
 import { useState } from "react";
@@ -9,6 +9,7 @@ import { useGetSessionReplays } from "../../../api/analytics/hooks/sessionReplay
 import { DisabledOverlay } from "../../../components/DisabledOverlay";
 import { NothingFound } from "../../../components/NothingFound";
 import { ReplayBreadcrumbs } from "@/components/replay/ReplayBreadcrumbs";
+import useMediaQuery from "@/components/ui/hooks/useMediaQuery";
 import { ReplayPlayer } from "@/components/replay/player/ReplayPlayer";
 import { ReplayDrawer } from "@/components/Sessions/ReplayDrawer";
 import { useReplayStore } from "@/components/replay/replayStore";
@@ -41,6 +42,7 @@ function SessionReplayContent() {
   // On narrow screens the player can't sit beside the list, so selecting a
   // replay opens the fullscreen drawer (player + timeline) instead.
   const isCompact = useMediaQuery("(max-width: 767px)");
+  const showTimeline = useMediaQuery("(min-width: 1280px)");
   const [mobileOpen, setMobileOpen] = useState(false);
 
   const [playerRef, { width: playerWidth, height: playerHeight }] = useMeasure();
@@ -71,17 +73,23 @@ function SessionReplayContent() {
 
             {/* Player */}
             <div ref={playerRef} className="hidden md:block flex-1 min-w-0 overflow-hidden">
-              {playerWidth && playerHeight ? <ReplayPlayer width={playerWidth} height={playerHeight} /> : null}
+              {!isCompact && playerWidth && playerHeight ? (
+                <ReplayPlayer width={playerWidth} height={playerHeight} />
+              ) : null}
             </div>
 
             {/* Timeline */}
-            <div className="hidden min-h-0 w-[clamp(360px,21vw,460px)] shrink-0 xl:block">
-              <ReplayBreadcrumbs />
-            </div>
+            {showTimeline && (
+              <div className="hidden min-h-0 w-[clamp(360px,21vw,460px)] shrink-0 xl:block">
+                <ReplayBreadcrumbs />
+              </div>
+            )}
           </div>
         )}
 
-        {isCompact && <ReplayDrawer sessionId={sessionId} open={mobileOpen} onOpenChange={setMobileOpen} />}
+        {isCompact && (
+          <ReplayDrawer sessionId={sessionId} open={mobileOpen} onOpenChange={setMobileOpen} preservePlaybackState />
+        )}
       </div>
     </DisabledOverlay>
   );

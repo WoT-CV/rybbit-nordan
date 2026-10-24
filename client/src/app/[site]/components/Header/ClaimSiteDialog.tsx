@@ -15,6 +15,7 @@ import React, { useState } from "react";
 import type { SiteResponse } from "../../../../api/admin/endpoints/sites";
 import { claimSite } from "../../../../api/admin/endpoints";
 import { USER_ORGANIZATIONS_QUERY_KEY, useUserOrganizations } from "../../../../api/admin/hooks/useOrganizations";
+import { getRequestCacheScope, getRequestPrivateKey } from "../../../../api/requestContext";
 import { authClient } from "../../../../lib/auth";
 import { useConfigs } from "../../../../lib/configs";
 import { BACKEND_URL, IS_CLOUD } from "../../../../lib/const";
@@ -96,6 +97,7 @@ export function ClaimSiteDialog({
   const currentStepIndex = planOrganizationId ? 1 : 0;
 
   const claimInto = async (organizationId: string, pickPlan = false) => {
+    const accessScope = getRequestCacheScope(getRequestPrivateKey());
     const active = await authClient.organization.setActive({ organizationId });
     if (active.error) throw new Error(active.error.message);
     await claimSite(siteId, privateLinkKey, organizationId);
@@ -106,7 +108,7 @@ export function ClaimSiteDialog({
     router.replace(`/${siteId}/main${pickPlan && IS_CLOUD ? "?claim=plan" : ""}`);
     await queryClient.cancelQueries({ queryKey: ["get-site"] });
     for (const id of [siteId, String(siteId)]) {
-      queryClient.setQueryData(["get-site", id], (site: SiteResponse | null | undefined) =>
+      queryClient.setQueryData(["get-site", id, accessScope], (site: SiteResponse | null | undefined) =>
         site
           ? {
               ...site,

@@ -25,6 +25,43 @@ afterEach(() => {
 });
 
 describe("negotiated lossless replay uploader", () => {
+  it.each([false, true])("returns the server stop signal with gzip=%s", async gzip => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ success: true, stopRecording: true })));
+
+    await expect(createReplayUploader("https://example.test/record", { version: 1, gzip })(batch())).resolves.toEqual({
+      stopRecording: true,
+    });
+    expect(sent().headers).toEqual(
+      gzip ? { "Content-Type": "application/json", "Content-Encoding": "gzip" } : { "Content-Type": "application/json" }
+    );
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+  it.each(["Site over monthly limit", "", "invalid-json"])(
+    "accepts a legacy non-JSON success without retrying: %j",
+    async body => {
+      vi.mocked(fetch).mockResolvedValueOnce(new Response(body));
+      await expect(createReplayUploader("https://example.test/record", undefined)(batch())).resolves.toBeUndefined();
+      expect(fetch).toHaveBeenCalledOnce();
+    }
+  );
+  it.each([{}, null, [], true, { stopRecording: false }, { stopRecording: "true" }, { stopRecording: 1 }])(
+    "does not turn an unrelated success payload into a stop signal: %j",
+    async body => {
+      vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify(body)));
+      await expect(createReplayUploader("https://example.test/record", undefined)(batch())).resolves.toBeUndefined();
+    }
+  );
+  it.each([400, 413, 415, 429, 500])(
+    "keeps HTTP %s a failure even if the body contains a stop signal",
+    async status => {
+      vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ stopRecording: true }), { status }));
+      await expect(createReplayUploader("https://example.test/record", capability)(batch())).rejects.toMatchObject({
+        status,
+      });
+      expect(fetch).toHaveBeenCalledOnce();
+    }
+  );
+
   it("does not send a larger gzip representation", async () => {
     vi.stubGlobal(
       "CompressionStream",

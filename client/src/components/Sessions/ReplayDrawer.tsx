@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { VisuallyHidden } from "@radix-ui/react-visually-hidden";
 import { X } from "lucide-react";
 import { useExtracted } from "next-intl";
@@ -23,11 +23,9 @@ export function ReplayDrawer({ sessionId, open, onOpenChange, preservePlaybackSt
   // Closed drawers are also mounted in every session card. Do not subscribe
   // all of them to the playback clock (potentially 60 updates per second).
   const selectSession = useReplayStore(state => state.selectSession);
-  const resetPlayerState = useReplayStore(state => state.resetPlayerState);
   // Vaul mounts its portal after the open-state effect. Observe the actual
   // mounted node, including the width change when the desktop timeline appears.
   const [container, setContainer] = useState<HTMLDivElement | null>(null);
-  const wasOpenRef = useRef(false);
   const [dimensions, setDimensions] = useState({ width: 0, height: 0, showTimeline: false });
 
   useEffect(() => {
@@ -36,14 +34,8 @@ export function ReplayDrawer({ sessionId, open, onOpenChange, preservePlaybackSt
     }
   }, [open, preservePlaybackState, selectSession, sessionId]);
 
-  useEffect(() => {
-    const wasOpen = wasOpenRef.current;
-    wasOpenRef.current = open;
-
-    if (wasOpen && !open && !preservePlaybackState) {
-      resetPlayerState();
-    }
-  }, [open, preservePlaybackState, resetPlayerState]);
+  // The mounted player's cleanup releases only its own adapter. A reset on
+  // close would erase the page player created during a fullscreen handoff.
 
   // Measure container dimensions using getBoundingClientRect for more reliable sizing
   useEffect(() => {
@@ -80,8 +72,14 @@ export function ReplayDrawer({ sessionId, open, onOpenChange, preservePlaybackSt
   }, [container, open]);
 
   return (
-    <Drawer open={open} onOpenChange={onOpenChange}>
-      <DrawerContent className="h-[90dvh] overflow-hidden" aria-describedby={undefined}>
+    <Drawer open={open} onOpenChange={onOpenChange} handleOnly>
+      <DrawerContent
+        // `hidden` is still programmatically scrollable. Select/slider focus
+        // on mobile Safari could scroll the player out of this fixed panel.
+        className="h-[90dvh] overflow-clip"
+        aria-describedby={undefined}
+        onPointerDownOutside={event => event.preventDefault()}
+      >
         <VisuallyHidden>
           <DrawerTitle>{t("Session Replay")}</DrawerTitle>
         </VisuallyHidden>
@@ -93,13 +91,13 @@ export function ReplayDrawer({ sessionId, open, onOpenChange, preservePlaybackSt
         <div className="flex min-h-0 flex-1 gap-2 p-2" data-vaul-no-drag>
           {/* Player */}
           <div ref={setContainer} className="relative min-h-0 min-w-0 flex-1">
-            {dimensions.width > 0 && dimensions.height > 0 && (
+            {open && dimensions.width > 0 && dimensions.height > 0 && (
               <ReplayPlayer width={dimensions.width} height={dimensions.height} isDrawer={true} />
             )}
           </div>
 
           {/* Timeline sidebar */}
-          {dimensions.showTimeline && (
+          {open && dimensions.showTimeline && (
             <div className="hidden h-full min-h-0 w-[clamp(360px,22vw,460px)] shrink-0 lg:block">
               <ReplayBreadcrumbs />
             </div>

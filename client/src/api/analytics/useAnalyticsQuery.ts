@@ -9,10 +9,11 @@ import {
 } from "@tanstack/react-query";
 import { Time } from "../../components/DateSelector/types";
 import { useStore, useTimezone } from "../../lib/store";
+import { getRequestPrivateKey } from "../requestContext";
 import {
   AnalyticsContext,
   AnalyticsDescriptor,
-  AnalyticsRequest,
+  buildAnalyticsQueryKey,
   buildAnalyticsRequest,
   fetchAnalytics,
 } from "./analyticsRequest";
@@ -58,6 +59,10 @@ export function useAnalyticsContext(options: AnalyticsContextOptions = {}): {
   const time = useStore(state => state.time);
   const previousTime = useStore(state => state.previousTime);
   const filters = useStore(state => state.filters);
+  // The URL resolver is authoritative, including the render before the layout
+  // syncs its store. Subscribe to that sync so same-site link changes refetch.
+  useStore(state => state.privateKey);
+  const privateKey = getRequestPrivateKey();
   const timeZone = useTimezone();
 
   const site = options.site ?? storeSite;
@@ -91,6 +96,7 @@ export function useAnalyticsContext(options: AnalyticsContextOptions = {}): {
       time: (options.useTime ?? true) && timeToUse ? timeToUse : null,
       timeZone,
       filters: combinedFilters,
+      privateKey,
     },
   };
 }
@@ -116,27 +122,40 @@ export interface AnalyticsQueryOptions<TData> extends AnalyticsContextOptions, A
   props?: Partial<UseQueryOptions<TData, Error>>;
 }
 
-const buildQueryKey = (
-  key: string | readonly unknown[],
-  scope: number | string | undefined,
-  request: AnalyticsRequest
-) => [...(Array.isArray(key) ? key : [key]), scope, request.path, request.params, request.body];
-
 export function useAnalyticsQuery<TData>(options: AnalyticsQueryOptions<TData>): UseQueryResult<TData> {
   const { site, scope, hasScope, request, hasPeriod } = useAnalyticsRequest(options);
+  const { placeholderData: callerPlaceholder, ...props } = options.props ?? {};
 
   return useQuery<TData, Error>({
-    queryKey: buildQueryKey(options.key, scope, request),
+    queryKey: buildAnalyticsQueryKey(options.key, scope, request),
     queryFn: () => fetchAnalytics<TData>(site!, request),
     staleTime: options.staleTime ?? 60_000,
     refetchInterval: options.refetchInterval,
-    placeholderData:
-      (options.placeholder ?? true)
-        ? (previousData, previousQuery) =>
-            scope !== undefined && previousQuery?.queryKey?.includes(scope) ? previousData : undefined
-        : undefined,
     enabled: (options.enabled ?? true) && hasScope && hasPeriod,
-    ...options.props,
+    ...props,
+    // A caller may narrow the same-context policy (e.g. to the same user),
+    // but it must never bypass site or private-link credential isolation.
+    placeholderData:
+      callerPlaceholder !== undefined || (options.placeholder ?? true)
+        ? (previousData, previousQuery) => {
+            if (
+              scope === undefined ||
+              previousQuery?.queryKey.at(-4) !== scope ||
+              (previousQuery.queryKey.at(-2) as { accessScope?: string } | undefined)?.accessScope !==
+                request.accessScope
+            )
+              return undefined;
+
+            if (typeof callerPlaceholder === "function") {
+              const placeholder = callerPlaceholder as (
+                data: typeof previousData,
+                query: typeof previousQuery
+              ) => typeof previousData;
+              return placeholder(previousData, previousQuery);
+            }
+            return callerPlaceholder === undefined ? previousData : (callerPlaceholder as typeof previousData);
+          }
+        : undefined,
   });
 }
 
@@ -151,6 +170,9 @@ export interface AnalyticsInfiniteQueryOptions<TPage, TCursor> extends Analytics
   refetchInterval?: number;
   enabled?: boolean;
   refetchOnWindowFocus?: boolean;
+  // Hand the query's abort signal to the request. Cancelling the query (or unmounting its last
+  // observer) then aborts the request and stops a refetch before it walks the remaining pages.
+  abortable?: boolean;
 }
 
 export function useAnalyticsInfiniteQuery<TPage, TCursor = number>(
@@ -159,12 +181,14 @@ export function useAnalyticsInfiniteQuery<TPage, TCursor = number>(
   const { site, scope, hasScope, request, hasPeriod } = useAnalyticsRequest(options);
 
   return useInfiniteQuery<TPage, Error, InfiniteData<TPage>, readonly unknown[], TCursor>({
-    queryKey: [...buildQueryKey(options.key, scope, request), "infinite"],
-    queryFn: ({ pageParam }) =>
-      fetchAnalytics<TPage>(site!, {
-        ...request,
-        params: { ...request.params, ...options.pageParams(pageParam as TCursor) },
-      }),
+    queryKey: [...buildAnalyticsQueryKey(options.key, scope, request), "infinite"],
+    // `signal` is read only when abortable: reading it is what opts a query into cancellation.
+    queryFn: context =>
+      fetchAnalytics<TPage>(
+        site!,
+        { ...request, params: { ...request.params, ...options.pageParams(context.pageParam as TCursor) } },
+        options.abortable ? context.signal : undefined
+      ),
     initialPageParam: options.initialPageParam,
     getNextPageParam: options.getNextPageParam,
     staleTime: options.staleTime ?? 60_000,

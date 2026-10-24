@@ -28,6 +28,7 @@ export const useReplayStore = create<{
   // Player state
   player: ReplayPlayerAdapter | null;
   setPlayer: (player: ReplayPlayerAdapter | null) => void;
+  releasePlayer: (player: ReplayPlayerAdapter) => void;
 
   // Playback state
   isPlaying: boolean;
@@ -132,7 +133,14 @@ export const useReplayStore = create<{
 
   // Player state
   player: null,
-  setPlayer: player => set({ player }),
+  setPlayer: player =>
+    set(state => {
+      if (state.player && state.player !== player) state.player.pause();
+      return { player };
+    }),
+  // Keep the clock and playback intent for the single active surface's handoff.
+  // A delayed cleanup must never detach the replacement adapter.
+  releasePlayer: player => set(state => (state.player === player ? { player: null } : state)),
 
   // Playback state
   isPlaying: false,

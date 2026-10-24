@@ -1,5 +1,4 @@
 "use client";
-import { useWindowSize } from "@uidotdev/usehooks";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect } from "react";
 import { AppSidebar } from "../../components/AppSidebar";
@@ -41,27 +40,20 @@ export default function SiteLayout({ children }: { children: React.ReactNode }) 
     router.replace(`${mainPath}${window.location.search}`);
   }, [hideSidebar, pathname, router]);
 
-  const { width } = useWindowSize();
-
-  if (width && width < 768) {
-    return (
-      <div>
-        <Header />
-        <div>{children}</div>
-      </div>
-    );
-  }
-
+  // Keep the route at the same tree position when orientation crosses md.
+  // Separate mobile/desktop return trees remount it and lose an open replay.
   return (
-    <div className="flex flex-row h-dvh">
-      <AppSidebar />
-      <div className="flex flex-1 overflow-hidden">
+    <div className="md:flex md:h-dvh md:flex-row">
+      <div className="hidden shrink-0 md:block">
+        <AppSidebar />
+      </div>
+      <div className="md:flex md:flex-1 md:overflow-hidden">
         {!hideSidebar && (
           <div className="hidden md:flex">
             <Sidebar />
           </div>
         )}
-        <div className="flex-1 overflow-auto">
+        <div className="md:flex-1 md:overflow-auto">
           <div className="min-h-full flex flex-col">
             {/* <div className="px-4 py-2 max-w-[1400px] mx-auto w-full mb-4"> */}
             <Header />
@@ -71,7 +63,11 @@ export default function SiteLayout({ children }: { children: React.ReactNode }) 
               !pathname.includes("/replay") &&
               !pathname.includes("/globe") &&
               !pathname.includes("/api-playground") &&
-              !pathname.includes("/query") && <Footer disabled={embed} />}
+              !pathname.includes("/query") && (
+                <div className="hidden md:block">
+                  <Footer disabled={embed} />
+                </div>
+              )}
           </div>
         </div>
       </div>

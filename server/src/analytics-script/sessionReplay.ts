@@ -1,7 +1,13 @@
 import { getRecordNetworkPlugin, type NetworkReplayRecordPlugin } from "./networkReplay/networkPlugin.js";
 import { getJsonByteSize } from "./networkReplay/utils.js";
 import { getReplayBatchKey } from "./replayBatching.js";
-import { ScriptConfig, SessionReplayBatch, SessionReplayEvent, SessionReplayTransportError } from "./types.js";
+import {
+  ScriptConfig,
+  SessionReplayBatch,
+  SessionReplayBatchResult,
+  SessionReplayEvent,
+  SessionReplayTransportError,
+} from "./types.js";
 
 const SAMPLE_STORAGE_KEY = "rybbit-replay-sampled";
 const ACTIVITY_CAPTURE_VERSION = 2;
@@ -65,6 +71,9 @@ declare global {
 export class SessionReplayRecorder {
   private config: ScriptConfig;
   private isRecording: boolean = false;
+  // Set once the server reports the session is over its size cap; recording
+  // stays off for the rest of this page.
+  private capped: boolean = false;
   private stopRecordingFn?: () => void;
   private userId: string;
   private eventBuffer: SessionReplayEvent[] = [];
@@ -75,9 +84,13 @@ export class SessionReplayRecorder {
   private retryAttempts = new Map<string, number>();
   private batchTimer?: number;
   private retryTimer?: number;
-  private sendBatch: (batch: SessionReplayBatch) => Promise<void>;
+  private sendBatch: (batch: SessionReplayBatch) => Promise<SessionReplayBatchResult | void>;
 
-  constructor(config: ScriptConfig, userId: string, sendBatch: (batch: SessionReplayBatch) => Promise<void>) {
+  constructor(
+    config: ScriptConfig,
+    userId: string,
+    sendBatch: (batch: SessionReplayBatch) => Promise<SessionReplayBatchResult | void>
+  ) {
     this.config = config;
     this.userId = userId;
     this.sendBatch = sendBatch;
@@ -119,7 +132,7 @@ export class SessionReplayRecorder {
   }
 
   public startRecording(): void {
-    if (this.isRecording || !window.rrweb || !this.config.enableSessionReplay) {
+    if (this.capped || this.isRecording || !window.rrweb || !this.config.enableSessionReplay) {
       return;
     }
 
@@ -201,6 +214,7 @@ export class SessionReplayRecorder {
 
     if (this.stopRecordingFn) {
       this.stopRecordingFn();
+      this.stopRecordingFn = undefined;
     }
 
     this.isRecording = false;
@@ -217,6 +231,8 @@ export class SessionReplayRecorder {
   }
 
   private addEvent(event: SessionReplayEvent): void {
+    if (this.capped) return;
+
     const sequencedEvent = {
       ...event,
       sequenceNumber: event.sequenceNumber ?? this.nextSequenceNumber++,
@@ -255,7 +271,7 @@ export class SessionReplayRecorder {
   }
 
   private flushEvents(): void {
-    if (this.eventBuffer.length === 0) {
+    if (this.capped || this.eventBuffer.length === 0) {
       return;
     }
 
@@ -267,20 +283,22 @@ export class SessionReplayRecorder {
   }
 
   private async processPendingBatches(): Promise<void> {
-    if (this.isSendingBatches || this.retryTimer !== undefined) {
+    if (this.capped || this.isSendingBatches || this.retryTimer !== undefined) {
       return;
     }
 
     this.isSendingBatches = true;
 
     try {
-      while (this.pendingBatches.length > 0) {
+      while (!this.capped && this.pendingBatches.length > 0) {
         const batch = this.pendingBatches.shift();
         if (!batch) {
           continue;
         }
 
         const unsentEvents = await this.sendEventsWithPayloadFallback(batch);
+        if (this.capped) break;
+
         if (unsentEvents) {
           const batchKey = getReplayBatchKey(unsentEvents);
           const attempts = (this.retryAttempts.get(batchKey) ?? 0) + 1;
@@ -311,7 +329,7 @@ export class SessionReplayRecorder {
   }
 
   private scheduleRetry(attempt: number): void {
-    if (this.retryTimer !== undefined) {
+    if (this.capped || this.retryTimer !== undefined) {
       return;
     }
 
@@ -323,11 +341,17 @@ export class SessionReplayRecorder {
   }
 
   private async sendEventsWithPayloadFallback(batch: SessionReplayBatch): Promise<SessionReplayEvent[] | undefined> {
+    if (this.capped) return undefined;
+
     const { events } = batch;
     try {
-      await this.sendBatch(batch);
+      const result = await this.sendBatch(batch);
+      if (result?.stopRecording === true) this.stopForSizeCap();
       return undefined;
     } catch (error) {
+      // A failing recorder cleanup must not resurrect a terminally capped batch.
+      if (this.capped) return undefined;
+
       if (!this.isPayloadTooLargeError(error)) {
         return events;
       }
@@ -373,6 +397,26 @@ export class SessionReplayRecorder {
     }
 
     return typeof error === "object" && error !== null && "status" in error && error.status === 413;
+  }
+
+  // Unlike stopRecording, drops what's buffered: the server refuses it anyway.
+  private stopForSizeCap(): void {
+    this.capped = true;
+    this.isRecording = false;
+    const stopRecording = this.stopRecordingFn;
+    this.stopRecordingFn = undefined;
+    this.clearBatchTimer();
+    if (this.retryTimer !== undefined) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = undefined;
+    }
+    this.eventBuffer = [];
+    this.eventBufferSizeBytes = 0;
+    this.pendingBatches = [];
+    this.retryAttempts.clear();
+    // rrweb's plugin cleanup can emit final network events; addEvent rejects
+    // those after the terminal flag above, even if cleanup itself throws.
+    stopRecording?.();
   }
 
   // Update user ID when it changes

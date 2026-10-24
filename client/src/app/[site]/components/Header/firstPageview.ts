@@ -1,6 +1,8 @@
 import { type InfiniteData, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import type { GetSessionsResponse, LiveUserCountResponse } from "../../../../api/analytics/endpoints";
+import { getRequestCacheScope, getRequestPrivateKey } from "../../../../api/requestContext";
+import { useStore } from "../../../../lib/store";
 
 export type FirstPageviewPhase = "unknown" | "none" | "waiting" | "filling" | "ready" | "dismissed";
 
@@ -14,6 +16,7 @@ type Session = GetSessionsResponse[number];
 // useSiteHasData's key.
 const SITE_HAS_DATA_KEY = "site-has-data";
 // Both polled every 10 s by SubHeader's LiveUserCount (useGetLiveUserCount, useGetSessionsInfinite).
+// The sessions list only while its drawer is open, or while NoData holds it live (useHoldLiveSessions).
 const LIVE_USER_COUNT_KEY = "live-user-count";
 const LIVE_SESSIONS_KEY = "sessions-infinite";
 // The dashboard refetch waits for the morph (install card fade-out, then the height spring) to mostly
@@ -42,9 +45,10 @@ export function nextFirstPageviewPhase(phase: FirstPageviewPhase, event: FirstPa
 
 /**
  * Whether a query was built by useAnalyticsQuery / useAnalyticsInfiniteQuery for `site`. Those keys are
- * one or more key parts followed by [scope, path, params, body], plus "infinite" for infinite queries.
+ * one or more key parts followed by [scope, path, request context, body], plus "infinite" for infinite
+ * queries. The request context contains wire params and an opaque credential cache scope.
  */
-export function isSiteAnalyticsQueryKey(queryKey: readonly unknown[], site: string): boolean {
+export function isSiteAnalyticsQueryKey(queryKey: readonly unknown[], site: string, accessScope?: string): boolean {
   const end = queryKey[queryKey.length - 1] === "infinite" ? queryKey.length - 1 : queryKey.length;
   const scope = end - 4;
   const params = queryKey[scope + 2];
@@ -53,8 +57,14 @@ export function isSiteAnalyticsQueryKey(queryKey: readonly unknown[], site: stri
     String(queryKey[scope]) === site &&
     typeof queryKey[scope + 1] === "string" &&
     typeof params === "object" &&
-    params !== null
+    params !== null &&
+    (accessScope === undefined || (params as { accessScope?: string }).accessScope === accessScope)
   );
+}
+
+function useAccessScope() {
+  useStore(state => state.privateKey);
+  return getRequestCacheScope(getRequestPrivateKey());
 }
 
 /** The session with the earliest start across cached session-list pages. */
@@ -108,27 +118,37 @@ export function useFirstPageviewJourney(site: string, hasData: boolean | undefin
  */
 export function useLiveVisitorNudge(site: string, enabled: boolean) {
   const queryClient = useQueryClient();
+  const accessScope = useAccessScope();
 
   useEffect(() => {
     if (!enabled || !site) return;
     const cache = queryClient.getQueryCache();
     const someoneOnline = () =>
       cache
-        .findAll({ queryKey: [LIVE_USER_COUNT_KEY, site] })
+        .findAll({
+          queryKey: [LIVE_USER_COUNT_KEY, site],
+          predicate: query => isSiteAnalyticsQueryKey(query.queryKey, site, accessScope),
+        })
         .some(query => ((query.state.data as LiveUserCountResponse | undefined)?.count ?? 0) > 0);
-    const nudge = () => void queryClient.invalidateQueries({ queryKey: [SITE_HAS_DATA_KEY, site], exact: true });
+    const nudge = () =>
+      void queryClient.invalidateQueries({ queryKey: [SITE_HAS_DATA_KEY, site, accessScope], exact: true });
 
     let online = someoneOnline();
     if (online) nudge();
     return cache.subscribe(event => {
       if (event.type !== "updated" || event.action.type !== "success") return;
       const [key, scope] = event.query.queryKey;
-      if (key !== LIVE_USER_COUNT_KEY || scope !== site) return;
+      if (
+        key !== LIVE_USER_COUNT_KEY ||
+        scope !== site ||
+        !isSiteAnalyticsQueryKey(event.query.queryKey, site, accessScope)
+      )
+        return;
       const now = someoneOnline();
       if (now && !online) nudge();
       online = now;
     });
-  }, [enabled, queryClient, site]);
+  }, [accessScope, enabled, queryClient, site]);
 }
 
 /**
@@ -137,15 +157,66 @@ export function useLiveVisitorNudge(site: string, enabled: boolean) {
  */
 export function useFirstSession(site: string, enabled: boolean): Session | undefined {
   const cache = useQueryClient().getQueryCache();
+  const accessScope = useAccessScope();
   const subscribe = useCallback(
     (onChange: () => void) => (enabled ? cache.subscribe(onChange) : () => {}),
     [cache, enabled]
   );
   const getSnapshot = () =>
     enabled && site
-      ? earliestSession(cache.findAll({ queryKey: [LIVE_SESSIONS_KEY, site] }).map(query => query.state.data))
+      ? earliestSession(
+          cache
+            .findAll({
+              queryKey: [LIVE_SESSIONS_KEY, site],
+              predicate: query => isSiteAnalyticsQueryKey(query.queryKey, site, accessScope),
+            })
+            .map(query => query.state.data)
+        )
       : undefined;
   return useSyncExternalStore(subscribe, getSnapshot, () => undefined);
+}
+
+// Sites whose install card is up: waiting for the first pageview, or celebrating it until dismissed.
+// LiveUserCount keeps its sessions list live for them, since useFirstSession names the first visitor from
+// that list's cache, and an observed list is never garbage-collected from under the card. Kept here, not in
+// LiveUserCount: switching dashboard tabs remounts LiveUserCount mid-journey, while NoData (layout) stays.
+const liveSessionHolds = new Map<string, number>();
+const liveSessionListeners = new Set<() => void>();
+
+const notifyLiveSessionHolds = () => liveSessionListeners.forEach(listener => listener());
+
+/** Keeps `site`'s live sessions list polling until the returned release runs. */
+export function holdLiveSessions(site: string): () => void {
+  liveSessionHolds.set(site, (liveSessionHolds.get(site) ?? 0) + 1);
+  notifyLiveSessionHolds();
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const count = (liveSessionHolds.get(site) ?? 1) - 1;
+    if (count > 0) liveSessionHolds.set(site, count);
+    else liveSessionHolds.delete(site);
+    notifyLiveSessionHolds();
+  };
+}
+
+/** Holds `site`'s live sessions list while `active` (NoData: while its install card is on screen). */
+export function useHoldLiveSessions(site: string, active: boolean) {
+  useEffect(() => (active && site ? holdLiveSessions(site) : undefined), [active, site]);
+}
+
+const subscribeLiveSessionHolds = (listener: () => void) => {
+  liveSessionListeners.add(listener);
+  return () => void liveSessionListeners.delete(listener);
+};
+
+/** Whether LiveUserCount keeps its sessions list polling with the drawer closed. */
+export function useLiveSessionsForFirstVisitor(site: string): boolean {
+  return useSyncExternalStore(
+    subscribeLiveSessionHolds,
+    () => !!site && liveSessionHolds.has(site),
+    () => false
+  );
 }
 
 /**
@@ -155,6 +226,7 @@ export function useFirstSession(site: string, enabled: boolean): Session | undef
  */
 export function useArrivalRefresh(site: string, enabled: boolean, onSettled: () => void) {
   const queryClient = useQueryClient();
+  const accessScope = useAccessScope();
 
   useEffect(() => {
     if (!enabled || !site) return;
@@ -164,7 +236,7 @@ export function useArrivalRefresh(site: string, enabled: boolean, onSettled: () 
       if (started) return;
       started = true;
       void queryClient
-        .invalidateQueries({ predicate: query => isSiteAnalyticsQueryKey(query.queryKey, site) })
+        .invalidateQueries({ predicate: query => isSiteAnalyticsQueryKey(query.queryKey, site, accessScope) })
         .then(() => {
           if (current) onSettled();
         });
@@ -175,5 +247,5 @@ export function useArrivalRefresh(site: string, enabled: boolean, onSettled: () 
       window.clearTimeout(timeout);
       refresh();
     };
-  }, [enabled, onSettled, queryClient, site]);
+  }, [accessScope, enabled, onSettled, queryClient, site]);
 }

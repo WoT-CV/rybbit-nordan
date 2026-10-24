@@ -1,5 +1,6 @@
 import { Filter } from "@rybbit/shared";
 import { Time } from "../../components/DateSelector/types";
+import { getRequestCacheScope, getRequestPrivateKey } from "../requestContext";
 import { authedFetch, buildApiParams } from "../utils";
 import { CommonApiParams, toQueryParams } from "./endpoints/types";
 
@@ -42,6 +43,7 @@ export interface AnalyticsContext {
   time: Time | null;
   timeZone: string;
   filters?: Filter[];
+  privateKey?: string | null;
 }
 
 export interface AnalyticsRequest {
@@ -50,12 +52,15 @@ export interface AnalyticsRequest {
   params: Record<string, unknown>;
   body?: unknown;
   unwrap: boolean;
+  privateKey: string | null;
+  accessScope: string;
 }
 
 const omitUndefined = (params: Record<string, unknown>) =>
   Object.fromEntries(Object.entries(params).filter(([, value]) => value !== undefined));
 
 export function buildAnalyticsRequest(descriptor: AnalyticsDescriptor, context: AnalyticsContext): AnalyticsRequest {
+  const privateKey = context.privateKey === undefined ? getRequestPrivateKey() : context.privateKey;
   const common: CommonApiParams = context.time
     ? buildApiParams(context.time, { timeZone: context.timeZone, filters: context.filters })
     : { startDate: "", endDate: "", timeZone: context.timeZone, filters: context.filters };
@@ -71,22 +76,42 @@ export function buildAnalyticsRequest(descriptor: AnalyticsDescriptor, context: 
     params: omitUndefined({ ...contextParams, ...descriptor.params }),
     body: descriptor.body?.(common),
     unwrap: descriptor.unwrap ?? true,
+    privateKey,
+    accessScope: getRequestCacheScope(privateKey),
   };
+}
+
+export function buildAnalyticsQueryKey(
+  key: string | readonly unknown[],
+  scope: number | string | undefined,
+  request: AnalyticsRequest
+) {
+  return [
+    ...(Array.isArray(key) ? key : [key]),
+    scope,
+    request.path,
+    { params: request.params, accessScope: request.accessScope },
+    request.body,
+  ];
 }
 
 /**
  * Issue an analytics request. Used by the query hooks and by the non-React
  * callers (CSV export), so both go through the same seam.
  */
-export async function fetchAnalytics<TData>(site: number | string, request: AnalyticsRequest): Promise<TData> {
+export async function fetchAnalytics<TData>(
+  site: number | string,
+  request: AnalyticsRequest,
+  signal?: AbortSignal
+): Promise<TData> {
   const base =
     request.organizationId === undefined
       ? `/sites/${site}`
       : `/organizations/${encodeURIComponent(request.organizationId)}`;
-  const response = await authedFetch<TData | { data: TData }>(
-    `${base}/${request.path}`,
-    request.params,
-    request.body === undefined ? {} : { method: "POST", data: request.body }
-  );
+  const response = await authedFetch<TData | { data: TData }>(`${base}/${request.path}`, request.params, {
+    ...(request.body === undefined ? {} : { method: "POST", data: request.body }),
+    signal,
+    requestPrivateKey: request.privateKey,
+  });
   return request.unwrap ? (response as { data: TData }).data : (response as TData);
 }

@@ -4,10 +4,7 @@ import { clickhouse } from "../../../db/clickhouse/clickhouse.js";
 import { db } from "../../../db/postgres/postgres.js";
 import { userAliases, userProfiles } from "../../../db/postgres/schema.js";
 import { r2Storage } from "../../../services/storage/r2StorageService.js";
-import {
-  REPLAY_METADATA_V1_TABLE,
-  REPLAY_METADATA_V2_TABLE,
-} from "../../../services/replay/replayMetadataMode.js";
+import { REPLAY_METADATA_V1_TABLE, REPLAY_METADATA_V2_TABLE } from "../../../services/replay/replayMetadataMode.js";
 import {
   clickhouseResolvedUserCondition,
   resolveUserIdentity,
@@ -34,12 +31,27 @@ export async function deleteUser(req: FastifyRequest<DeleteUserRequest>, res: Fa
   const { userId } = req.params;
   const siteId = Number(req.params.siteId);
 
+  // Anonymous rows carry identified_user_id = '', so an empty id would match
+  // every one of them and erase the site's anonymous history. Any other id,
+  // whitespace included, is a real identity identify() may have stored.
+  if (!userId) {
+    return res.status(400).send({ error: "userId is required" });
+  }
+  if (!/^\d+$/.test(req.params.siteId) || !Number.isSafeInteger(siteId) || siteId <= 0 || siteId > 65535) {
+    return res.status(400).send({ error: "Invalid site ID" });
+  }
+
   try {
     const identity = await resolveUserIdentity(siteId, userId);
     const canonicalUserId = identity.canonicalUserId;
-    const anonymousIds = [...new Set([userId, ...identity.anonymousIds])];
+    if (!canonicalUserId) {
+      return res.status(400).send({ error: "Resolved user ID is required" });
+    }
+    const anonymousIds = [...new Set([userId, ...identity.anonymousIds])].filter(id => id !== "");
 
+    // The `!= ''` guard backstops the check above inside the DELETE itself.
     const userCondition = `site_id = {siteId:UInt16}
+      AND {canonicalUserId:String} != ''
       AND ${clickhouseResolvedUserCondition(undefined, "canonicalUserId", "anonymousIds")}`;
     const queryParams = { siteId, canonicalUserId, anonymousIds };
 

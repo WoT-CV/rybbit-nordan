@@ -1,6 +1,6 @@
 import { Maximize2, Pause, Play, SkipForward } from "lucide-react";
 import { useExtracted } from "next-intl";
-import { memo, useCallback, useEffect, useMemo, type ComponentProps } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, type ComponentProps } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { getReplayActivityDuration } from "@rybbit/shared";
 import { useCanOnSite } from "@/hooks/usePermissions";
@@ -33,12 +33,34 @@ interface ReplayPlayerControlsProps {
 // below the toolbar avoids rebuilding the menus and export controls every frame.
 const ReplayTimeline = memo(function ReplayTimeline({
   duration = 0,
+  onValueChange,
   ...props
 }: Omit<ComponentProps<typeof ActivitySlider>, "currentTime" | "value">) {
   const currentTime = useReplayStore(s => s.currentTime);
+  const activePointerId = useRef<number | null>(null);
   return (
     <ActivitySlider
       {...props}
+      onPointerDownCapture={event => {
+        if (event.isPrimary && event.button === 0) activePointerId.current = event.pointerId;
+      }}
+      onPointerUpCapture={event => {
+        if (activePointerId.current === event.pointerId) activePointerId.current = null;
+      }}
+      onPointerCancelCapture={() => {
+        activePointerId.current = null;
+      }}
+      onLostPointerCaptureCapture={() => {
+        activePointerId.current = null;
+      }}
+      onKeyDownCapture={() => {
+        activePointerId.current = null;
+      }}
+      onValueChange={value => {
+        // Controlled Radix keyboard changes call COMMIT before CHANGE. Only
+        // pointer gestures need preview; keyboard CHANGE must not reopen it.
+        if (activePointerId.current !== null) onValueChange?.(value);
+      }}
       duration={duration}
       currentTime={currentTime}
       value={[duration > 0 ? (currentTime / duration) * 100 : 0]}
@@ -130,6 +152,8 @@ export const ReplayPlayerControls = memo(function ReplayPlayerControls({
   return (
     <div className="border border-neutral-100 dark:border-neutral-800 bg-white p-2 pb-3 dark:bg-neutral-900 rounded-b-lg">
       <div>
+        {/* Keep the capture target stable when a rail tap moves the thumb
+            under a touch pointer (WebKit otherwise retargets pointerup). */}
         <ReplayTimeline
           onValueChange={onSliderChange}
           onValueCommit={onSliderCommit}
@@ -144,7 +168,7 @@ export const ReplayPlayerControls = memo(function ReplayPlayerControls({
           networkRequests={networkRequests}
           exportRange={canExport ? exportRange : null}
           onNetworkSeek={handleNetworkSeek}
-          className="w-full"
+          className="min-h-6 w-full [&>*]:pointer-events-none"
         />
         {canExport && exportRange && (
           <ReplayExportRangeSlider

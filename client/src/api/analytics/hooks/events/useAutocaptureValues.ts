@@ -1,7 +1,6 @@
 import { useQueries } from "@tanstack/react-query";
-import { useMemo } from "react";
 import { AUTOCAPTURE_TARGET_TYPES, AutocaptureTargetType } from "../../../../lib/events";
-import { buildAnalyticsRequest, fetchAnalytics } from "../../analyticsRequest";
+import { buildAnalyticsQueryKey, buildAnalyticsRequest, fetchAnalytics } from "../../analyticsRequest";
 import { AutocaptureValue } from "../../endpoints";
 import { useAnalyticsContext, useAnalyticsQuery } from "../../useAnalyticsQuery";
 
@@ -30,24 +29,19 @@ export function useAutocaptureValuesByType(
 ): Record<AutocaptureTargetType, AutocaptureValue[] | undefined> {
   const { site, context } = useAnalyticsContext({ useFilters: false });
 
-  const results = useQueries({
+  return useQueries({
     queries: AUTOCAPTURE_TARGET_TYPES.map(type => {
       const request = buildAnalyticsRequest(DESCRIPTOR(type), context);
       return {
-        queryKey: ["autocapture-values", site, request.path, request.params],
+        queryKey: buildAnalyticsQueryKey("autocapture-values", site, request),
         enabled: enabledTypes.has(type) && !!site,
         queryFn: () => fetchAnalytics<AutocaptureValue[]>(site, request),
       };
     }),
-  });
-
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  return useMemo(
-    () =>
+    combine: results =>
       Object.fromEntries(AUTOCAPTURE_TARGET_TYPES.map((type, index) => [type, results[index].data])) as Record<
         AutocaptureTargetType,
         AutocaptureValue[] | undefined
       >,
-    results.map(result => result.data)
-  );
+  });
 }

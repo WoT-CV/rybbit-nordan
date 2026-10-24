@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { buildAnalyticsQueryKey, buildAnalyticsRequest } from "../../../../api/analytics/analyticsRequest";
 import {
   earliestSession,
   type FirstPageviewPhase,
@@ -57,6 +58,15 @@ describe("isSiteAnalyticsQueryKey", () => {
     expect(isSiteAnalyticsQueryKey(["site-has-data", "7"], "7")).toBe(false);
     expect(isSiteAnalyticsQueryKey(["gsc-data", "pages", "7", "2026-09-01", "2026-09-28", "UTC"], "7")).toBe(false);
     expect(isSiteAnalyticsQueryKey(["site-event-count-range", 7, "2026-09-01", "2026-09-28", "UTC"], "7")).toBe(false);
+  });
+
+  it("matches credential-scoped regular and infinite keys without changing their tail layout", () => {
+    const request = buildAnalyticsRequest({ path: "sessions" }, { time: null, timeZone: "UTC", privateKey: "secret" });
+    const key = buildAnalyticsQueryKey(["session-details", "user"], "7", request);
+    expect(isSiteAnalyticsQueryKey(key, "7", request.accessScope)).toBe(true);
+    expect(isSiteAnalyticsQueryKey([...key, "infinite"], "7", request.accessScope)).toBe(true);
+    expect(isSiteAnalyticsQueryKey(key, "7", "default")).toBe(false);
+    expect(isSiteAnalyticsQueryKey(key, "8", request.accessScope)).toBe(false);
   });
 });
 

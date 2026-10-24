@@ -375,6 +375,14 @@
         if (response.status === 415 && compressed) gzipEnabled = false;
         throw new SessionReplayTransportError(response.status, response.statusText);
       }
+      try {
+        const result = await response.json();
+        if (typeof result === "object" && result !== null && "stopRecording" in result && result.stopRecording === true) {
+          return { stopRecording: true };
+        }
+      } catch {
+        return;
+      }
     };
   }
 
@@ -2187,6 +2195,9 @@
   var SessionReplayRecorder = class {
     constructor(config, userId, sendBatch) {
       this.isRecording = false;
+      // Set once the server reports the session is over its size cap; recording
+      // stays off for the rest of this page.
+      this.capped = false;
       this.eventBuffer = [];
       this.eventBufferSizeBytes = 0;
       this.nextSequenceNumber = 0;
@@ -2225,7 +2236,7 @@
       });
     }
     startRecording() {
-      if (this.isRecording || !window.rrweb || !this.config.enableSessionReplay) {
+      if (this.capped || this.isRecording || !window.rrweb || !this.config.enableSessionReplay) {
         return;
       }
       try {
@@ -2296,6 +2307,7 @@
       }
       if (this.stopRecordingFn) {
         this.stopRecordingFn();
+        this.stopRecordingFn = void 0;
       }
       this.isRecording = false;
       this.clearBatchTimer();
@@ -2307,6 +2319,7 @@
       return this.isRecording;
     }
     addEvent(event) {
+      if (this.capped) return;
       const sequencedEvent = {
         ...event,
         sequenceNumber: event.sequenceNumber ?? this.nextSequenceNumber++
@@ -2339,7 +2352,7 @@
       }
     }
     flushEvents() {
-      if (this.eventBuffer.length === 0) {
+      if (this.capped || this.eventBuffer.length === 0) {
         return;
       }
       const events = this.eventBuffer;
@@ -2349,17 +2362,18 @@
       void this.processPendingBatches();
     }
     async processPendingBatches() {
-      if (this.isSendingBatches || this.retryTimer !== void 0) {
+      if (this.capped || this.isSendingBatches || this.retryTimer !== void 0) {
         return;
       }
       this.isSendingBatches = true;
       try {
-        while (this.pendingBatches.length > 0) {
+        while (!this.capped && this.pendingBatches.length > 0) {
           const batch = this.pendingBatches.shift();
           if (!batch) {
             continue;
           }
           const unsentEvents = await this.sendEventsWithPayloadFallback(batch);
+          if (this.capped) break;
           if (unsentEvents) {
             const batchKey = getReplayBatchKey(unsentEvents);
             const attempts = (this.retryAttempts.get(batchKey) ?? 0) + 1;
@@ -2388,7 +2402,7 @@
       }
     }
     scheduleRetry(attempt) {
-      if (this.retryTimer !== void 0) {
+      if (this.capped || this.retryTimer !== void 0) {
         return;
       }
       const delay = Math.min(RETRY_BASE_DELAY_MS * 2 ** Math.max(0, attempt - 1), RETRY_MAX_DELAY_MS);
@@ -2398,11 +2412,14 @@
       }, delay);
     }
     async sendEventsWithPayloadFallback(batch) {
+      if (this.capped) return void 0;
       const { events } = batch;
       try {
-        await this.sendBatch(batch);
+        const result = await this.sendBatch(batch);
+        if (result?.stopRecording === true) this.stopForSizeCap();
         return void 0;
       } catch (error) {
+        if (this.capped) return void 0;
         if (!this.isPayloadTooLargeError(error)) {
           return events;
         }
@@ -2441,6 +2458,23 @@
         return error.status === 413;
       }
       return typeof error === "object" && error !== null && "status" in error && error.status === 413;
+    }
+    // Unlike stopRecording, drops what's buffered: the server refuses it anyway.
+    stopForSizeCap() {
+      this.capped = true;
+      this.isRecording = false;
+      const stopRecording = this.stopRecordingFn;
+      this.stopRecordingFn = void 0;
+      this.clearBatchTimer();
+      if (this.retryTimer !== void 0) {
+        clearTimeout(this.retryTimer);
+        this.retryTimer = void 0;
+      }
+      this.eventBuffer = [];
+      this.eventBufferSizeBytes = 0;
+      this.pendingBatches = [];
+      this.retryAttempts.clear();
+      stopRecording?.();
     }
     // Update user ID when it changes
     updateUserId(userId) {
@@ -2599,6 +2633,7 @@
   var Tracker = class {
     constructor(config) {
       this.customUserId = null;
+      this.identityVersion = 0;
       this.errorDedupeCache = /* @__PURE__ */ new Map();
       this.errorDedupeLastCleanup = 0;
       this.exposedFeatureFlags = /* @__PURE__ */ new Set();
@@ -2697,7 +2732,7 @@
       }
     }
     async sendSessionReplayBatch(batch) {
-      await this.sendReplay(batch);
+      return this.sendReplay(batch);
     }
     createBasePayload() {
       const url = new URL(window.location.href);
@@ -2938,6 +2973,7 @@
       }
       const nextUserId = userId.trim();
       const isAccountSwitch = Boolean(this.customUserId && this.customUserId !== nextUserId);
+      if (this.customUserId !== nextUserId) this.identityVersion++;
       if (isAccountSwitch) {
         this.sessionReplayRecorder?.updateUserId(nextUserId);
         this.config.visitorId = rotateVisitorId(this.config.namespace);
@@ -2967,7 +3003,11 @@
     }
     async sendIdentifyEvent(userId, traits, isNewIdentify = true) {
       let conflictRotationUsed = false;
+      let anonymousId = this.config.visitorId;
+      const identityVersion = this.identityVersion;
+      const isCurrentIdentity = () => this.identityVersion === identityVersion && this.customUserId === userId && this.config.visitorId === anonymousId;
       for (let attempt = 1; attempt <= IDENTIFY_MAX_ATTEMPTS; attempt += 1) {
+        if (!isCurrentIdentity()) return;
         try {
           const response = await fetch(`${this.config.analyticsHost}/identify`, {
             method: "POST",
@@ -2976,7 +3016,7 @@
             },
             body: JSON.stringify({
               site_id: this.config.siteId,
-              anonymous_id: this.config.visitorId,
+              anonymous_id: anonymousId,
               user_id: userId,
               traits,
               is_new_identify: isNewIdentify
@@ -2984,14 +3024,18 @@
             mode: "cors",
             keepalive: true
           });
+          if (!isCurrentIdentity()) return;
           if (response.ok) {
             return;
           }
           if (response.status === 409 && isNewIdentify && !conflictRotationUsed) {
             const body = await response.json().catch(() => null);
+            if (!isCurrentIdentity()) return;
             if (body?.code === "ANONYMOUS_ID_ALREADY_LINKED" && body?.rotateAnonymousId === true) {
               conflictRotationUsed = true;
-              this.config.visitorId = rotateVisitorId(this.config.namespace);
+              this.sessionReplayRecorder?.onPageChange();
+              anonymousId = rotateVisitorId(this.config.namespace);
+              this.config.visitorId = anonymousId;
               continue;
             }
           }
@@ -3000,6 +3044,7 @@
             return;
           }
         } catch (error) {
+          if (!isCurrentIdentity()) return;
           if (attempt === IDENTIFY_MAX_ATTEMPTS) {
             console.error("Failed to send identify event:", error);
             return;
@@ -3017,6 +3062,7 @@
       console.error(`Failed to send identify event after ${IDENTIFY_MAX_ATTEMPTS} attempts`);
     }
     clearUserId() {
+      this.identityVersion++;
       this.customUserId = null;
       try {
         localStorage.removeItem(`${this.config.namespace}-user-id`);
@@ -3299,6 +3345,7 @@
   };
 
   // webVitals.ts
+  var SEND_DELAY_MS = 2e4;
   var WebVitalsCollector = class {
     constructor(onReady) {
       this.data = {
@@ -3315,21 +3362,18 @@
     }
     initialize() {
       try {
-        x(this.collectMetric.bind(this));
-        L(this.collectMetric.bind(this));
-        S(this.collectMetric.bind(this));
+        x(this.collectMetric.bind(this), { reportAllChanges: true });
+        L(this.collectMetric.bind(this), { reportAllChanges: true });
+        S(this.collectMetric.bind(this), { reportAllChanges: true });
         E(this.collectMetric.bind(this));
         $(this.collectMetric.bind(this));
-        this.timeout = setTimeout(() => {
-          if (!this.sent) {
-            this.sendData();
-          }
-        }, 2e4);
-        window.addEventListener("beforeunload", () => {
-          if (!this.sent) {
+        this.timeout = setTimeout(() => this.sendData(), SEND_DELAY_MS);
+        document.addEventListener("visibilitychange", () => {
+          if (document.visibilityState === "hidden") {
             this.sendData();
           }
         });
+        window.addEventListener("pagehide", () => this.sendData());
       } catch (e2) {
         console.warn("Error initializing web vitals tracking:", e2);
       }
@@ -3338,10 +3382,6 @@
       if (this.sent) return;
       const metricName = metric.name.toLowerCase();
       this.data[metricName] = metric.value;
-      const allCollected = Object.values(this.data).every((value) => value !== null);
-      if (allCollected) {
-        this.sendData();
-      }
     }
     sendData() {
       if (this.sent) return;
@@ -3546,6 +3586,14 @@
   };
 
   // index.ts
+  function hasOptedOut(optOutKey) {
+    if (window.__RYBBIT_OPTOUT__) return true;
+    try {
+      return localStorage.getItem(optOutKey) !== null;
+    } catch {
+      return false;
+    }
+  }
   (async function() {
     const scriptTag = document.currentScript || document.querySelector('script[src*="/script.js"]');
     if (!scriptTag) {
@@ -3554,7 +3602,7 @@
     }
     const namespace = scriptTag.getAttribute("data-namespace") || "rybbit";
     const optOutKey = `disable-${namespace}`;
-    if (window.__RYBBIT_OPTOUT__ || localStorage.getItem(optOutKey) !== null) {
+    if (hasOptedOut(optOutKey)) {
       window[namespace] = {
         pageview: () => {
         },

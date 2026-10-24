@@ -60,26 +60,7 @@ validate_runtime_images() {
 }
 
 validate_compose_config() {
-  python3 - "${COMPOSE_CONFIG_FILE}" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as config_file:
-    config = json.load(config_file)
-
-services = config["services"]
-redis_ports = services["redis"].get("ports") or []
-if redis_ports:
-    raise SystemExit(f"Redis must not publish host ports: {redis_ports}")
-
-for service_name in ("clickhouse", "postgres", "backend", "client"):
-    for port in services[service_name].get("ports") or []:
-        host_ip = port.get("host_ip")
-        if host_ip not in ("127.0.0.1", "::1"):
-            raise SystemExit(f"{service_name} publishes a non-loopback port: {port}")
-
-print("Compose port validation passed.")
-PY
+  wotcv_validate_compose_ports "${COMPOSE_CONFIG_FILE}"
 }
 
 require_persistent_volumes() {
@@ -89,54 +70,64 @@ require_persistent_volumes() {
 }
 
 validate_persistent_storage() {
+  local clickhouse_id postgres_id redis_id
+  clickhouse_id="$("${COMPOSE[@]}" ps -q clickhouse)" || return 1
+  postgres_id="$("${COMPOSE[@]}" ps -q postgres)" || return 1
+  redis_id="$("${COMPOSE[@]}" ps -q redis)" || return 1
   wotcv_validate_container_persistence \
-    "$("${COMPOSE[@]}" ps -q clickhouse)" \
+    "${clickhouse_id}" \
     clickhouse \
     "${EXPECTED_COMPOSE_PROJECT_NAME}" \
     "${CLICKHOUSE_VOLUME_NAME}" \
-    /var/lib/clickhouse
+    /var/lib/clickhouse || return 1
   wotcv_validate_container_persistence \
-    "$("${COMPOSE[@]}" ps -q postgres)" \
+    "${postgres_id}" \
     postgres \
     "${EXPECTED_COMPOSE_PROJECT_NAME}" \
     "${POSTGRES_VOLUME_NAME}" \
-    /var/lib/postgresql/data
+    /var/lib/postgresql/data || return 1
   wotcv_validate_container_persistence \
-    "$("${COMPOSE[@]}" ps -q redis)" \
+    "${redis_id}" \
     redis \
     "${EXPECTED_COMPOSE_PROJECT_NAME}" \
     "${REDIS_VOLUME_NAME}" \
-    /data
+    /data || return 1
 }
 
 capture_clickhouse_event_baseline() {
-  CLICKHOUSE_EVENT_BASELINE="$(wotcv_clickhouse_event_invariants "$("${COMPOSE[@]}" ps -q clickhouse)")"
-  CLICKHOUSE_REPLAY_WINDOW_START="$(wotcv_clickhouse_replay_window_start "${CLICKHOUSE_EVENT_BASELINE}")"
-  CLICKHOUSE_PROTECTED_COHORT_END="$(wotcv_clickhouse_protected_cohort_end "${CLICKHOUSE_EVENT_BASELINE}")"
+  local container_id
+  container_id="$("${COMPOSE[@]}" ps -q clickhouse)" || return 1
+  CLICKHOUSE_EVENT_BASELINE="$(wotcv_clickhouse_event_invariants "${container_id}")" || return 1
+  CLICKHOUSE_REPLAY_WINDOW_START="$(wotcv_clickhouse_replay_window_start "${CLICKHOUSE_EVENT_BASELINE}")" || return 1
+  CLICKHOUSE_PROTECTED_COHORT_END="$(wotcv_clickhouse_protected_cohort_end "${CLICKHOUSE_EVENT_BASELINE}")" || return 1
   printf 'ClickHouse event baseline: %s\n' "${CLICKHOUSE_EVENT_BASELINE}"
 }
 
 capture_postgres_data_baseline() {
-  POSTGRES_DATA_BASELINE="$(wotcv_postgres_data_invariants "$("${COMPOSE[@]}" ps -q postgres)")"
+  local container_id
+  container_id="$("${COMPOSE[@]}" ps -q postgres)" || return 1
+  POSTGRES_DATA_BASELINE="$(wotcv_postgres_data_invariants "${container_id}")" || return 1
   printf 'PostgreSQL data baseline: %s\n' "${POSTGRES_DATA_BASELINE}"
 }
 
 validate_clickhouse_event_baseline() {
-  local current_invariants
+  local current_invariants container_id
+  container_id="$("${COMPOSE[@]}" ps -q clickhouse)" || return 1
 
   current_invariants="$(wotcv_clickhouse_event_invariants \
-    "$("${COMPOSE[@]}" ps -q clickhouse)" \
+    "${container_id}" \
     "${CLICKHOUSE_REPLAY_WINDOW_START}" \
-    "${CLICKHOUSE_PROTECTED_COHORT_END}")"
+    "${CLICKHOUSE_PROTECTED_COHORT_END}")" || return 1
   wotcv_assert_clickhouse_event_invariants_not_decreased \
     "${CLICKHOUSE_EVENT_BASELINE}" \
     "${current_invariants}"
 }
 
 validate_postgres_data_baseline() {
-  local current_invariants
+  local current_invariants container_id
+  container_id="$("${COMPOSE[@]}" ps -q postgres)" || return 1
 
-  current_invariants="$(wotcv_postgres_data_invariants "$("${COMPOSE[@]}" ps -q postgres)")"
+  current_invariants="$(wotcv_postgres_data_invariants "${container_id}")" || return 1
   wotcv_assert_postgres_invariants_not_decreased \
     "${POSTGRES_DATA_BASELINE}" \
     "${current_invariants}"
@@ -315,11 +306,11 @@ rollback() {
   WOTCV_DEPLOYED_AT="${rollback_deployed_at}" \
   BACKEND_IMAGE_DIGEST="${previous_backend_digest:-unknown}" \
   CLIENT_IMAGE_DIGEST="${previous_client_digest:-unknown}" \
-    "${COMPOSE[@]}" up -d --no-deps --force-recreate backend client
+    "${COMPOSE[@]}" up -d --no-deps --force-recreate backend client || return 1
 
-  validate_persistent_storage
-  validate_clickhouse_event_baseline
-  validate_postgres_data_baseline
+  validate_persistent_storage || return 1
+  validate_clickhouse_event_baseline || return 1
+  validate_postgres_data_baseline || return 1
 
   if ! rollback_response="$(wotcv_wait_for_health "${HEALTHCHECK_URL}" "${previous_git_sha}" "${previous_tag}")"; then
     echo "Rollback health check failed; manual intervention is required." >&2

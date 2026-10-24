@@ -15,10 +15,6 @@ export function useRollupQueryContext(lite: boolean): AnalyticsContext {
   return lite || filters.length === 0 ? context : { ...context, filters };
 }
 
-/** Changes whenever the set of queries or any of their results changes. */
-export const querySignature = (siteIds: number[], queries: UseQueryResult[]) =>
-  `${siteIds.join(",")}|${queries.map(q => q.dataUpdatedAt).join(",")}`;
-
 /**
  * Each site is its own request, so results land one at a time. Rendering them
  * as they land makes the chart and totals climb site by site. Instead hold the
@@ -27,17 +23,19 @@ export const querySignature = (siteIds: number[], queries: UseQueryResult[]) =>
  */
 export function useSettledSnapshot<T>(
   value: T,
-  queries: UseQueryResult[]
+  queries: UseQueryResult[],
+  accessScope = "default"
 ): { data: T | undefined; isLoading: boolean } {
   const hasAllData = queries.every(q => !q.isPending);
   // Background refetches land one site at a time too, so wait for them as well.
   const settled = hasAllData && queries.every(q => !q.isFetching);
-  const [snapshot, setSnapshot] = useState<{ value: T } | null>(null);
+  const [snapshot, setSnapshot] = useState<{ value: T; accessScope: string } | null>(null);
+  const currentSnapshot = snapshot?.accessScope === accessScope ? snapshot : null;
   // Cached data that is refetching on mount is still a complete first frame.
-  if ((settled || (hasAllData && snapshot === null)) && snapshot?.value !== value) {
-    setSnapshot({ value });
+  if ((settled || (hasAllData && currentSnapshot === null)) && currentSnapshot?.value !== value) {
+    setSnapshot({ value, accessScope });
   }
   if (settled) return { data: value, isLoading: false };
-  if (snapshot) return { data: snapshot.value, isLoading: false };
+  if (currentSnapshot) return { data: currentSnapshot.value, isLoading: false };
   return { data: hasAllData ? value : undefined, isLoading: !hasAllData };
 }

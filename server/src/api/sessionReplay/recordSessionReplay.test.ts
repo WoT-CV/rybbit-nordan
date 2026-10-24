@@ -1,6 +1,7 @@
 import { FastifyReply, FastifyRequest } from "fastify";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { RecordSessionReplayRequest } from "../../types/sessionReplay.js";
+import { ReplayBudgetUnavailableError } from "../../services/replay/replayBudgetError.js";
 import { recordSessionReplay } from "./recordSessionReplay.js";
 
 const mocks = vi.hoisted(() => ({
@@ -9,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   isSiteOverLimit: vi.fn(),
   isSiteWithoutReplay: vi.fn(),
   recordEvents: vi.fn(),
+  loggerDebug: vi.fn(),
   loggerInfo: vi.fn(),
   loggerError: vi.fn(),
 }));
@@ -88,6 +90,7 @@ function createRequest(overrides: RequestOverrides = {}): ReplayRequest {
     ip: overrides.ip ?? "203.0.113.10",
     log: {
       error: mocks.loggerError,
+      debug: mocks.loggerDebug,
       info: mocks.loggerInfo,
     },
   } as unknown as ReplayRequest;
@@ -130,7 +133,7 @@ describe("recordSessionReplay exclusions", () => {
     mocks.decideSiteExclusion.mockResolvedValue({ excluded: false });
     mocks.isSiteOverLimit.mockReturnValue(false);
     mocks.isSiteWithoutReplay.mockReturnValue(false);
-    mocks.recordEvents.mockResolvedValue(undefined);
+    mocks.recordEvents.mockResolvedValue({ capped: false });
   });
 
   it("records the replay when the Site Exclusion Decision accepts the request", async () => {
@@ -146,6 +149,43 @@ describe("recordSessionReplay exclusions", () => {
       referrer: "https://example.com/admin/users",
     });
     expect(reply.sentPayload).toEqual({ success: true });
+  });
+
+  it("tells the script to stop recording once the session is over its size cap", async () => {
+    mocks.recordEvents.mockResolvedValue({ capped: true });
+
+    const reply = createReply();
+    await recordSessionReplay(createRequest(), reply);
+
+    expect(reply.sentPayload).toEqual({
+      success: true,
+      stopRecording: true,
+      message: "Session replay size limit reached",
+    });
+  });
+
+  it("returns a retryable 503 without stopping the recorder when reservation state is uncertain", async () => {
+    mocks.recordEvents.mockRejectedValue(new ReplayBudgetUnavailableError());
+    const reply = createReply();
+
+    await recordSessionReplay(createRequest(), reply);
+
+    expect(reply.statusCodeValue).toBe(503);
+    expect(reply.sentPayload).toEqual({ error: "Session replay temporarily unavailable" });
+    expect(reply.sentPayload).not.toHaveProperty("stopRecording");
+    expect(mocks.loggerError).toHaveBeenCalledOnce();
+  });
+
+  it("does not misclassify other storage failures as a successful cap response", async () => {
+    const error = new Error("storage failed");
+    mocks.recordEvents.mockRejectedValue(error);
+    const reply = createReply();
+
+    await recordSessionReplay(createRequest(), reply);
+
+    expect(reply.statusCodeValue).toBe(500);
+    expect(reply.sentPayload).toEqual({ error });
+    expect(reply.sentPayload).not.toHaveProperty("stopRecording");
   });
 
   it("maps an IP Site Exclusion Decision to the replay skip response", async () => {

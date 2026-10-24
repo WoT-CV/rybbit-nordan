@@ -67,6 +67,28 @@ describe("useReplaySeek", () => {
     expect(replacement.play).not.toHaveBeenCalled();
   });
 
+  it.each(["player", "selection"] as const)("ignores late previews and commit after a %s replacement", change => {
+    const { result } = renderHook(useReplaySeek);
+    act(() => result.current.previewSeek(5000));
+    const replacement = change === "player" ? mockPlayer() : player;
+    useReplayStore.setState({
+      player: replacement as unknown as ReplayPlayerAdapter,
+      selectionVersion: change === "selection" ? 1 : 0,
+      currentTime: 700,
+      isPlaying: false,
+      playbackState: "paused",
+    });
+    replacement.pause.mockClear();
+    act(() => result.current.previewSeek(8000));
+    act(() => result.current.commitPreviewSeek(8000));
+
+    expect(replacement.pause).not.toHaveBeenCalled();
+    expect(replacement.seek).not.toHaveBeenCalled();
+    expect(replacement.play).not.toHaveBeenCalled();
+    expect(useReplayStore.getState().currentTime).toBe(700);
+    expect(useReplayStore.getState().playbackState).toBe("paused");
+  });
+
   it("clamps offsets and rejects non-finite positions", () => {
     const { result } = renderHook(useReplaySeek);
     act(() => {

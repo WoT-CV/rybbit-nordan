@@ -92,6 +92,8 @@ describe("homepage Site cards", () => {
       },
       {
         method: "POST",
+        requestPrivateKey: null,
+        signal: undefined,
         data: {
           siteIds: sites.map(site => site.siteId),
           comparison: { time_zone: "America/New_York", past_minutes_start: 2880, past_minutes_end: 1440 },

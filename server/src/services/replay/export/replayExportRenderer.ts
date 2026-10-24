@@ -8,11 +8,10 @@ import puppeteer, { type Browser, type Page } from "puppeteer";
 
 import { createServiceLogger } from "../../../lib/logger/logger.js";
 import { SessionReplayQueryService } from "../sessionReplayQueryService.js";
+import { createReplayExportPage } from "./replayExportPage.js";
 import type { ReplayExportJobData, ReplayExportResult } from "./replayExportTypes.js";
 import { validateReplayExportActivityDuration } from "./replayExportTiming.js";
 
-const REPLAY_WIDTH = 1280;
-const REPLAY_HEIGHT = 720;
 const SENSITIVE_NAME_PATTERN = /(authorization|cookie|token|secret|password|api[-_]?key|credential)/i;
 const NETWORK_PLUGIN_NAME = "rrweb/network@1";
 const EXPORT_FILE_NAMES = {
@@ -66,10 +65,7 @@ export class ReplayExportRenderer {
         jobData.sessionId
       );
       const firstTimestamp = events[0]?.timestamp ?? 0;
-      const totalDuration = Math.max(
-        0,
-        (events[events.length - 1]?.timestamp ?? firstTimestamp) - firstTimestamp
-      );
+      const totalDuration = Math.max(0, (events[events.length - 1]?.timestamp ?? firstTimestamp) - firstTimestamp);
       const options = normalizeOptions(jobData.options, totalDuration);
       const playbackWindows = getActivePlaybackWindows(events, options.startMs, options.endMs);
       const outputDurationMs = validateReplayExportActivityDuration(playbackWindows);
@@ -87,7 +83,7 @@ export class ReplayExportRenderer {
         args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
       });
 
-      const replayPage = await createReplayPage(browser, events);
+      const replayPage = await createReplayExportPage(browser, events);
       await onProgress(15);
 
       const videoPath = join(workDirectory, EXPORT_FILE_NAMES.video);
@@ -113,6 +109,11 @@ export class ReplayExportRenderer {
               exportedActiveDurationMs: outputDurationMs,
             },
             session: getExportMetadata(metadata),
+            rendering: {
+              offline: true,
+              externalAssets: "blocked",
+              assetFidelity: "External images, styles and fonts are omitted unless embedded as data/blob resources.",
+            },
             network: {
               host: REPLAY_EXPORT_NETWORK_HOST,
               requestCount: requests.length,
@@ -153,29 +154,6 @@ export class ReplayExportCancelledError extends Error {
     super("Replay export cancelled");
     this.name = "ReplayExportCancelledError";
   }
-}
-
-async function createReplayPage(browser: Browser, events: any[]): Promise<Page> {
-  const page = await browser.newPage();
-  await page.setViewport({ width: REPLAY_WIDTH, height: REPLAY_HEIGHT, deviceScaleFactor: 1 });
-  await page.setContent(
-    `<html><head><style>html,body,#replay{width:100%;height:100%;margin:0;overflow:hidden;background:#000}iframe{border:0}</style></head><body><div id="replay"></div></body></html>`
-  );
-  await page.addScriptTag({ path: join(process.cwd(), "public", "rrweb.min.js") });
-  await page.evaluate(replayEvents => {
-    const replayWindow = window as any;
-    if (typeof replayWindow.rrweb?.Replayer !== "function") {
-      throw new Error("rrweb Replayer is unavailable in the export renderer");
-    }
-    replayWindow.__replayer = new replayWindow.rrweb.Replayer(replayEvents, {
-      root: document.getElementById("replay"),
-      mouseTail: false,
-      showWarning: false,
-      showDebug: false,
-    });
-  }, events);
-  await new Promise(resolve => setTimeout(resolve, 250));
-  return page;
 }
 
 async function pauseReplayAt(page: Page, offset: number) {

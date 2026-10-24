@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { buildAnalyticsRequest, fetchAnalytics } from "../../analyticsRequest";
+import { buildAnalyticsQueryKey, buildAnalyticsRequest, fetchAnalytics } from "../../analyticsRequest";
 import { CursorEventsResponse, NewEventsResponse } from "../../endpoints";
 import { useAnalyticsContext, useAnalyticsInfiniteQuery } from "../../useAnalyticsQuery";
 
@@ -13,7 +13,7 @@ export function useNewEventsPoll(options: { getSinceTimestamp: () => string | nu
   const request = buildAnalyticsRequest({ path: "events", unwrap: false }, context);
 
   return useQuery({
-    queryKey: ["events-poll", site, request.params],
+    queryKey: buildAnalyticsQueryKey("events-poll", site, request),
     queryFn: () => {
       const since = options.getSinceTimestamp();
       if (!since) return { data: [] } as NewEventsResponse;

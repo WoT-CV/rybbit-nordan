@@ -97,8 +97,6 @@ export function RangePanel({
   // refire every query than dragging a range does.
   const [draftComparison, setDraftComparison] = useState<Comparison>(comparison);
 
-  const setDraftTime = (next: Time) => setDraft({ time: next, fields: rangeFieldsForTime(next, zone) });
-
   const editField = (key: keyof RangeFields, value: string) =>
     setDraft(prev => {
       const fields = { ...prev.fields, [key]: value };
@@ -254,11 +252,14 @@ export function RangePanel({
             // it is read again once the breakpoint is known.
             key={months}
             mode="range"
+            // Passing `onSelect` is what makes `selected` controlled. Without it
+            // react-day-picker copies `selected` once on mount and then runs its
+            // own range logic on every click, so the highlighting drifted away
+            // from the draft that the bound fields (and Apply) actually read.
+            // The range it proposes is ignored: `pickDay` owns the two-click
+            // sequence. Disabled days never reach this.
             selected={selected}
-            onDayClick={(date, modifiers) => {
-              if (modifiers.disabled) return;
-              pickDay(fromCalendarDate(date));
-            }}
+            onSelect={(_range, triggerDate) => pickDay(fromCalendarDate(triggerDate))}
             defaultMonth={(selected?.to ? DateTime.fromJSDate(selected.to).startOf("month") : lastMonth)
               .minus({ months: months - 1 })
               .toJSDate()}

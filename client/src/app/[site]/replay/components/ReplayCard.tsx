@@ -1,4 +1,4 @@
-import { getTimezone } from "@/lib/store";
+import { getTimezone, useStore } from "@/lib/store";
 import { Clock, MousePointerClick, Trash2 } from "lucide-react";
 import { DateTime } from "luxon";
 import { useExtracted } from "next-intl";
@@ -67,11 +67,10 @@ function cleanUrl(url: string) {
 export function ReplayCard({ replay, onSelect }: { replay: SessionReplayListItem; onSelect?: () => void }) {
   const t = useExtracted();
   const { formatRelative } = useDateTimeFormat();
-  const { sessionId, selectSession, resetPlayerState } = useReplayStore(
+  const { sessionId, selectSession } = useReplayStore(
     useShallow(s => ({
       sessionId: s.sessionId,
       selectSession: s.selectSession,
-      resetPlayerState: s.resetPlayerState,
     }))
   );
   const [isDialogOpen, setIsDialogOpen] = useState(false);
@@ -82,10 +81,12 @@ export function ReplayCard({ replay, onSelect }: { replay: SessionReplayListItem
   const isSelected = sessionId === replay.session_id;
 
   const handleDelete = async () => {
+    const deletionSite = useStore.getState().site;
     try {
       await deleteSessionReplay.mutateAsync({ sessionId: replay.session_id });
-      if (sessionId === replay.session_id) {
-        resetPlayerState();
+      // Invalidation is complete. Keep a newer user/list selection intact.
+      if (useStore.getState().site === deletionSite && useReplayStore.getState().sessionId === replay.session_id) {
+        selectSession("", false);
       }
       setIsDialogOpen(false);
     } catch (error) {
@@ -109,6 +110,7 @@ export function ReplayCard({ replay, onSelect }: { replay: SessionReplayListItem
         onSelect?.();
       }}
       onKeyDown={e => {
+        if (e.target !== e.currentTarget) return;
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           selectSession(replay.session_id, true);

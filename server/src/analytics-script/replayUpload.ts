@@ -1,4 +1,4 @@
-import { SessionReplayTransportError, type SessionReplayBatch } from "./types.js";
+import { SessionReplayTransportError, type SessionReplayBatch, type SessionReplayBatchResult } from "./types.js";
 
 export interface ReplayUploadCapability {
   version: 1;
@@ -19,7 +19,7 @@ export function acceptsReplayGzip(value: unknown): boolean {
 /** Stateful only for downgrade fallback. The recorder owns ordering and the unchanged retry budget. */
 export function createReplayUploader(url: string, capability: unknown) {
   let gzipEnabled = acceptsReplayGzip(capability);
-  return async (batch: SessionReplayBatch): Promise<void> => {
+  return async (batch: SessionReplayBatch): Promise<SessionReplayBatchResult | void> => {
     const json = JSON.stringify(batch); // Freeze identity/events before asynchronous work.
     let body: BodyInit = json;
     let compressed = false;
@@ -61,6 +61,16 @@ export function createReplayUploader(url: string, capability: unknown) {
     if (!response.ok) {
       if (response.status === 415 && compressed) gzipEnabled = false;
       throw new SessionReplayTransportError(response.status, response.statusText);
+    }
+    // Older servers also return plain text or an empty success response.
+    // Only the exact boolean signal may terminate recording.
+    try {
+      const result: unknown = await response.json();
+      if (typeof result === "object" && result !== null && "stopRecording" in result && result.stopRecording === true) {
+        return { stopRecording: true };
+      }
+    } catch {
+      return;
     }
   };
 }

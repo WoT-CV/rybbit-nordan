@@ -50,6 +50,8 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Build shared contracts
         run: pnpm --filter @rybbit/shared build
+      - name: Verify operational and client quality contracts
+        run: node --test scripts/tests/*.test.mjs
       - name: Verify generated tracker artifacts
         working-directory: server
         run: pnpm test:run --maxWorkers=4 --minWorkers=1 && pnpm db:check && pnpm build && pnpm check:analytics
@@ -76,6 +78,8 @@ jobs:
             -f docker-compose.wotcv.yml \
             -f docker-compose.wotcv.branch-build.yml \
             config --format json > "${RUNNER_TEMP}/wotcv-compose.json"
+          source scripts/lib/wotcv-common.sh
+          wotcv_validate_compose_ports "${RUNNER_TEMP}/wotcv-compose.json"
           python3 scripts/lib/wotcv_persistence.py validate-config \
             --config "${RUNNER_TEMP}/wotcv-compose.json" \
             --expected-project rybbit \

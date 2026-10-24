@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM node:24-alpine AS base
+FROM node:24.22.1-alpine AS base
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
 RUN corepack enable
@@ -44,7 +44,7 @@ ENV NEXT_PUBLIC_WOTCV_GIT_SHA=${WOTCV_GIT_SHA}
 RUN pnpm run build:client
 
 # Production image, copy all the files and run next
-FROM node:24-alpine AS runner
+FROM node:24.22.1-alpine AS runner
 WORKDIR /app
 
 ARG WOTCV_GIT_SHA=unknown

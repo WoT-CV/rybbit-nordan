@@ -9,3 +9,11 @@ updates:
     directory: "/docs"
     schedule:
       interval: "daily"
+  # Base images are pinned to exact Node patch releases, so let Dependabot raise
+  # them when Node ships a security release instead of relying on a floating tag.
+  - package-ecosystem: "docker"
+    directories:
+      - "/server"
+      - "/client"
+    schedule:
+      interval: "daily"

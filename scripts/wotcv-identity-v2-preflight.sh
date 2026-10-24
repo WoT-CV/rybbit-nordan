@@ -59,21 +59,7 @@ echo "[1/7] Validating effective Compose ports and persistence..."
 compose_config="$(mktemp "${TMPDIR:-/tmp}/rybbit-identity-preflight.${UID}.XXXXXX.json")"
 trap 'rm -f "${compose_config}"' EXIT
 "${COMPOSE[@]}" config --format json >"${compose_config}"
-python3 - "${compose_config}" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as stream:
-    services = json.load(stream)["services"]
-
-if services["redis"].get("ports"):
-    raise SystemExit(f"Redis must not publish a host port: {services['redis']['ports']}")
-
-for service_name in ("clickhouse", "postgres", "backend", "client"):
-    for port in services[service_name].get("ports") or []:
-        if port.get("host_ip") not in ("127.0.0.1", "::1"):
-            raise SystemExit(f"{service_name} publishes outside loopback: {port}")
-PY
+wotcv_validate_compose_ports "${compose_config}"
 wotcv_validate_compose_persistence \
   "${compose_config}" \
   "${EXPECTED_COMPOSE_PROJECT_NAME}" \

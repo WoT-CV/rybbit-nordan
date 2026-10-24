@@ -7,6 +7,7 @@ import { siteConfig } from "../../lib/siteConfig.js";
 import { usageService } from "../usageService.js";
 import { userIdService } from "../userId/userIdService.js";
 import { resolveClientIp } from "./resolveClientIp.js";
+import { isTrustedServerSideIngestion } from "./trackingRequest.js";
 import { createServiceLogger } from "../../lib/logger/logger.js";
 import { claimLegacyClientAlias, claimTrackerAlias } from "../userIdentity/userIdentityService.js";
 
@@ -61,12 +62,20 @@ export async function handleIdentify(request: FastifyRequest, reply: FastifyRepl
 
     const siteId = siteConfiguration.siteId;
 
-    const requestIp = ip_address || resolveClientIp(request, { firstPartyProxy: siteConfiguration.firstPartyProxy });
-    const requestUserAgent = user_agent || request.headers["user-agent"] || "";
     // A site whose organization has no plan collects nothing, profiles and aliases included.
     if (usageService.isSiteWithoutPlan(siteId)) {
       return reply.status(200).send("Site has no plan, identify not stored");
     }
+
+    // Like tracking, only a bearer with ingest:write may speak for another
+    // visitor. Otherwise anyone who knew a visitor's IP and user agent could
+    // point that visitor's fingerprint at a user id of their choosing.
+    const trustedOverride =
+      (ip_address !== undefined || user_agent !== undefined) && (await isTrustedServerSideIngestion(request, siteId));
+    const requestIp =
+      (trustedOverride && ip_address) ||
+      resolveClientIp(request, { firstPartyProxy: siteConfiguration.firstPartyProxy });
+    const requestUserAgent = (trustedOverride && user_agent) || request.headers["user-agent"] || "";
 
     const anonymousId = anonymous_id
       ? await userIdService.generateUserIdFromClientId(anonymous_id, siteId)

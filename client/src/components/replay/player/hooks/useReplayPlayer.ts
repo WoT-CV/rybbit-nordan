@@ -15,14 +15,18 @@ export const useReplayPlayer = ({ data, width, height }: UseReplayPlayerProps) =
   const events = data?.events;
   const playerContainerRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<ReplayPlayerAdapter | null>(null);
-  const { setPlayer, setCurrentTime, setIsPlaying, setDuration } = useReplayStore(
-    useShallow(state => ({
-      setPlayer: state.setPlayer,
-      setCurrentTime: state.setCurrentTime,
-      setIsPlaying: state.setIsPlaying,
-      setDuration: state.setDuration,
-    }))
-  );
+  const { sessionId, selectionVersion, setPlayer, releasePlayer, setCurrentTime, setIsPlaying, setDuration } =
+    useReplayStore(
+      useShallow(state => ({
+        sessionId: state.sessionId,
+        selectionVersion: state.selectionVersion,
+        setPlayer: state.setPlayer,
+        releasePlayer: state.releasePlayer,
+        setCurrentTime: state.setCurrentTime,
+        setIsPlaying: state.setIsPlaying,
+        setDuration: state.setDuration,
+      }))
+    );
 
   const widthRef = useRef(width);
   const heightRef = useRef(height);
@@ -36,150 +40,161 @@ export const useReplayPlayer = ({ data, width, height }: UseReplayPlayerProps) =
     const target = playerContainerRef.current;
     if (!events || !target) return;
 
-    const initializedState = useReplayStore.getState();
-    const initializedSessionId = initializedState.sessionId;
-    const initializedSelectionVersion = initializedState.selectionVersion;
-    const initializedCurrentTime = initializedState.currentTime;
-    const initializedWasPlaying = initializedState.isPlaying;
-    let initialPlaybackApplied = false;
+    let cancelled = false;
     let handleVisibilityChange: (() => void) | undefined;
     let resizeObserver: ResizeObserver | undefined;
     let adapter: ReplayPlayerAdapter;
     let cleanupPlayer = () => target.replaceChildren();
     const cleanup = () => {
+      if (cancelled) return;
+      cancelled = true;
       if (handleVisibilityChange) document.removeEventListener("visibilitychange", handleVisibilityChange);
       resizeObserver?.disconnect();
       cleanupPlayer();
     };
 
-    target.replaceChildren();
+    // StrictMode's trial setup is cleaned up before this microtask. Avoid
+    // constructing a throwaway rrweb instance with an uncancellable poster timer.
+    queueMicrotask(() => {
+      if (cancelled) return;
+      const initializedState = useReplayStore.getState();
+      if (initializedState.sessionId !== sessionId || initializedState.selectionVersion !== selectionVersion) return;
+      const initializedSessionId = sessionId;
+      const initializedSelectionVersion = selectionVersion;
+      const initializedCurrentTime = initializedState.currentTime;
+      const initializedWasPlaying = initializedState.isPlaying;
+      let initialPlaybackApplied = false;
 
-    try {
-      const initialRect = target.getBoundingClientRect();
-      adapter = new ReplayPlayerAdapter({
-        target,
-        events,
-        width: initialRect.width || widthRef.current,
-        height: initialRect.height || heightRef.current,
-      });
+      target.replaceChildren();
 
-      playerRef.current = adapter;
-      cleanupPlayer = () => {
-        adapter.destroy();
-        if (playerRef.current === adapter) playerRef.current = null;
-        if (useReplayStore.getState().player === adapter) setPlayer(null);
-      };
-      setPlayer(adapter);
+      try {
+        const initialRect = target.getBoundingClientRect();
+        adapter = new ReplayPlayerAdapter({
+          target,
+          events,
+          width: initialRect.width || widthRef.current,
+          height: initialRect.height || heightRef.current,
+        });
 
-      adapter.onCurrentTime(currentTime => {
-        const state = useReplayStore.getState();
-        if (state.player !== adapter || state.playbackState === "seeking") return;
-        const playerDuration = adapter.getDuration();
-        if (playerDuration && currentTime > playerDuration) {
-          adapter.pause();
-          setCurrentTime(playerDuration);
-          setIsPlaying(false);
-        } else {
-          setCurrentTime(currentTime);
-        }
-      });
+        playerRef.current = adapter;
+        cleanupPlayer = () => {
+          releasePlayer(adapter);
+          adapter.destroy();
+          if (playerRef.current === adapter) playerRef.current = null;
+        };
+        setPlayer(adapter);
 
-      adapter.onPlayingChange(isNowPlaying => {
-        if (useReplayStore.getState().player !== adapter) return;
-        setIsPlaying(isNowPlaying);
-        if (!isNowPlaying) return;
-
-        const state = useReplayStore.getState();
-        if (
-          state.sessionId === initializedSessionId &&
-          state.autoplayRequest?.sessionId === initializedSessionId &&
-          state.autoplayRequest.selectionVersion === initializedSelectionVersion &&
-          state.player === adapter
-        ) {
-          state.setPlaybackState("playing");
-          state.consumeAutoplay(state.autoplayRequest);
-        }
-      });
-
-      const syncDurationAndPlayback = () => {
-        const state = useReplayStore.getState();
-        if (
-          state.player !== adapter ||
-          state.sessionId !== initializedSessionId ||
-          state.selectionVersion !== initializedSelectionVersion
-        ) {
-          return;
-        }
-
-        const playerDuration = adapter.getDuration();
-        if (playerDuration) setDuration(playerDuration);
-        if (!playerDuration || initialPlaybackApplied) return;
-        initialPlaybackApplied = true;
-
-        const resumeAt = Math.max(0, Math.min(playerDuration, initializedCurrentTime));
-        if (resumeAt > 0) {
-          adapter.seek(resumeAt);
-          setCurrentTime(resumeAt);
-        }
-
-        const autoplayRequest = state.autoplayRequest;
-        const shouldAutoplay =
-          autoplayRequest?.sessionId === initializedSessionId &&
-          autoplayRequest.selectionVersion === initializedSelectionVersion;
-        if (shouldAutoplay || initializedWasPlaying) {
-          adapter.play();
-          state.setIsPlaying(true);
-          state.setPlaybackState("playing");
-        }
-        if (shouldAutoplay && autoplayRequest) {
-          state.consumeAutoplay(autoplayRequest);
-        }
-      };
-
-      adapter.onDuration(playerDuration => {
-        if (useReplayStore.getState().player !== adapter) return;
-        setDuration(playerDuration);
-        syncDurationAndPlayback();
-      });
-      queueMicrotask(syncDurationAndPlayback);
-
-      let wasPlayingBeforeHidden = false;
-      handleVisibilityChange = () => {
-        if (useReplayStore.getState().player !== adapter) return;
-        if (document.hidden) {
-          wasPlayingBeforeHidden = adapter.getIsPlaying();
-          if (wasPlayingBeforeHidden) {
+        adapter.onCurrentTime(currentTime => {
+          const state = useReplayStore.getState();
+          if (state.player !== adapter || state.playbackState === "seeking") return;
+          const playerDuration = adapter.getDuration();
+          if (playerDuration && currentTime > playerDuration) {
             adapter.pause();
+            setCurrentTime(playerDuration);
             setIsPlaying(false);
+          } else {
+            setCurrentTime(currentTime);
           }
-          return;
-        }
+        });
 
-        if (wasPlayingBeforeHidden) {
+        adapter.onPlayingChange(isNowPlaying => {
+          if (useReplayStore.getState().player !== adapter) return;
+          setIsPlaying(isNowPlaying);
+          if (!isNowPlaying) return;
+
+          const state = useReplayStore.getState();
+          if (
+            state.sessionId === initializedSessionId &&
+            state.autoplayRequest?.sessionId === initializedSessionId &&
+            state.autoplayRequest.selectionVersion === initializedSelectionVersion &&
+            state.player === adapter
+          ) {
+            state.setPlaybackState("playing");
+            state.consumeAutoplay(state.autoplayRequest);
+          }
+        });
+
+        const syncDurationAndPlayback = () => {
+          const state = useReplayStore.getState();
+          if (
+            cancelled ||
+            state.player !== adapter ||
+            state.sessionId !== initializedSessionId ||
+            state.selectionVersion !== initializedSelectionVersion
+          ) {
+            return;
+          }
+
           const playerDuration = adapter.getDuration();
           if (playerDuration) setDuration(playerDuration);
-          adapter.play();
-          setIsPlaying(true);
-          wasPlayingBeforeHidden = false;
-        }
-      };
+          if (!playerDuration || initialPlaybackApplied) return;
+          initialPlaybackApplied = true;
 
-      document.addEventListener("visibilitychange", handleVisibilityChange);
+          const resumeAt = Math.max(0, Math.min(playerDuration, initializedCurrentTime));
+          if (resumeAt > 0) {
+            adapter.seek(resumeAt);
+            setCurrentTime(resumeAt);
+          }
 
-      resizeObserver = new ResizeObserver(entries => {
-        const entry = entries[0];
-        if (!entry || entry.contentRect.width <= 0 || entry.contentRect.height <= 0) return;
-        adapter.resize(entry.contentRect.width, entry.contentRect.height);
-      });
-      resizeObserver.observe(target);
-    } catch (error) {
-      cleanup();
-      console.error("Failed to initialize rrweb player:", error);
-      return;
-    }
+          const autoplayRequest = state.autoplayRequest;
+          const shouldAutoplay =
+            autoplayRequest?.sessionId === initializedSessionId &&
+            autoplayRequest.selectionVersion === initializedSelectionVersion;
+          if (shouldAutoplay || initializedWasPlaying) {
+            adapter.play();
+            state.setIsPlaying(true);
+            state.setPlaybackState("playing");
+          }
+          if (shouldAutoplay && autoplayRequest) {
+            state.consumeAutoplay(autoplayRequest);
+          }
+        };
+
+        adapter.onDuration(playerDuration => {
+          if (useReplayStore.getState().player !== adapter) return;
+          setDuration(playerDuration);
+          syncDurationAndPlayback();
+        });
+        queueMicrotask(syncDurationAndPlayback);
+
+        let wasPlayingBeforeHidden = false;
+        handleVisibilityChange = () => {
+          if (useReplayStore.getState().player !== adapter) return;
+          if (document.hidden) {
+            wasPlayingBeforeHidden = adapter.getIsPlaying();
+            if (wasPlayingBeforeHidden) {
+              adapter.pause();
+              setIsPlaying(false);
+            }
+            return;
+          }
+
+          if (wasPlayingBeforeHidden) {
+            const playerDuration = adapter.getDuration();
+            if (playerDuration) setDuration(playerDuration);
+            adapter.play();
+            setIsPlaying(true);
+            wasPlayingBeforeHidden = false;
+          }
+        };
+
+        document.addEventListener("visibilitychange", handleVisibilityChange);
+
+        resizeObserver = new ResizeObserver(entries => {
+          const entry = entries[0];
+          if (cancelled || !entry || entry.contentRect.width <= 0 || entry.contentRect.height <= 0) return;
+          adapter.resize(entry.contentRect.width, entry.contentRect.height);
+        });
+        resizeObserver.observe(target);
+      } catch (error) {
+        cleanup();
+        console.error("Failed to initialize rrweb player:", error);
+        return;
+      }
+    });
 
     return cleanup;
-  }, [events, setCurrentTime, setDuration, setIsPlaying, setPlayer]);
+  }, [events, releasePlayer, selectionVersion, sessionId, setCurrentTime, setDuration, setIsPlaying, setPlayer]);
 
   useEffect(() => {
     const target = playerContainerRef.current;

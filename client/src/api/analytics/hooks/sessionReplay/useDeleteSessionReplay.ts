@@ -16,7 +16,7 @@ export function useDeleteSessionReplay() {
     },
     onSuccess: () => {
       // Invalidate the session replay list query to refetch data
-      queryClient.invalidateQueries({ queryKey: ["session-replays", site] });
+      return queryClient.invalidateQueries({ queryKey: ["session-replays", site] });
     },
   });
 }

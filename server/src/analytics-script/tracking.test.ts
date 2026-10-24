@@ -237,6 +237,44 @@ describe("Tracker", () => {
   });
 
   describe("tracking methods", () => {
+    it("propagates a replay stop signal through its uploader to the recorder", async () => {
+      const stopRecording = vi.fn();
+      let emit: ((event: unknown) => void) | undefined;
+      window.rrweb = {
+        record: vi.fn(options => {
+          emit = options.emit;
+          return stopRecording;
+        }),
+      };
+      vi.mocked(global.fetch).mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: vi.fn().mockResolvedValue({ success: true, stopRecording: true }),
+      } as unknown as Response);
+      tracker = new Tracker({ ...config, enableSessionReplay: true, sessionReplayBatchSize: 2 });
+      try {
+        emit?.({ type: 2, timestamp: 123, data: { text: "Zażółć 🐸" } });
+        await vi.waitFor(() => expect(tracker.isSessionReplayActive()).toBe(false));
+
+        expect(global.fetch).toHaveBeenCalledOnce();
+        expect(global.fetch).toHaveBeenCalledWith(
+          "https://analytics.example.com/session-replay/record/123",
+          expect.objectContaining({
+            body: expect.stringContaining('"anonymousId":"visitor-123"'),
+            keepalive: false,
+          })
+        );
+        expect(stopRecording).toHaveBeenCalledOnce();
+        tracker.startSessionReplay();
+        tracker.stopSessionReplay();
+        expect(tracker.isSessionReplayActive()).toBe(false);
+        expect(global.fetch).toHaveBeenCalledOnce();
+      } finally {
+        tracker.cleanup();
+        delete window.rrweb;
+      }
+    });
+
     it("should track pageview", async () => {
       tracker.trackPageview();
 
@@ -549,6 +587,127 @@ describe("Tracker", () => {
       const identifyCalls = vi.mocked(global.fetch).mock.calls.filter(([url]) => String(url).endsWith("/identify"));
       expect(identifyCalls).toHaveLength(2);
       vi.useRealTimers();
+    });
+
+    it.each(["logout", "account-switch"])("does not retry an old identified user after %s", async boundary => {
+      vi.useFakeTimers();
+      try {
+        vi.mocked(global.fetch).mockResolvedValueOnce({ ok: false, status: 503 } as Response);
+        tracker.identify("user-alice");
+        await vi.advanceTimersByTimeAsync(0);
+
+        if (boundary === "logout") tracker.clearUserId();
+        tracker.identify("user-bob");
+        const currentAnonymousId = config.visitorId;
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        const identifyBodies = vi
+          .mocked(global.fetch)
+          .mock.calls.filter(([url]) => String(url).endsWith("/identify"))
+          .map(([, options]) => JSON.parse(options?.body as string));
+        expect(identifyBodies.map(body => body.user_id)).toEqual(["user-alice", "user-bob"]);
+        expect(identifyBodies[0].anonymous_id).toBe("visitor-123");
+        expect(identifyBodies[1].anonymous_id).toBe(currentAnonymousId);
+        expect(currentAnonymousId).not.toBe("visitor-123");
+        expect(config.visitorId).toBe(currentAnonymousId);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("ignores a late 409 from the previous account instead of rotating the current anonymous ID", async () => {
+      vi.useFakeTimers();
+      try {
+        let respond!: (response: Response) => void;
+        vi.mocked(global.fetch).mockImplementationOnce(() => new Promise<Response>(resolve => (respond = resolve)));
+        tracker.identify("user-alice");
+        tracker.identify("user-bob");
+        const currentAnonymousId = config.visitorId;
+
+        respond({
+          ok: false,
+          status: 409,
+          json: async () => ({ code: "ANONYMOUS_ID_ALREADY_LINKED", rotateAnonymousId: true }),
+        } as Response);
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(config.visitorId).toBe(currentAnonymousId);
+        const identifyBodies = vi
+          .mocked(global.fetch)
+          .mock.calls.filter(([url]) => String(url).endsWith("/identify"))
+          .map(([, options]) => JSON.parse(options?.body as string));
+        expect(identifyBodies.map(body => body.user_id)).toEqual(["user-alice", "user-bob"]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("rechecks identity after asynchronously reading a 409 response body", async () => {
+      vi.useFakeTimers();
+      try {
+        let readConflict!: (body: unknown) => void;
+        vi.mocked(global.fetch).mockResolvedValueOnce({
+          ok: false,
+          status: 409,
+          json: () => new Promise(resolve => (readConflict = resolve)),
+        } as Response);
+        tracker.identify("user-alice");
+        await vi.advanceTimersByTimeAsync(0);
+        tracker.identify("user-bob");
+        const currentAnonymousId = config.visitorId;
+
+        readConflict({ code: "ANONYMOUS_ID_ALREADY_LINKED", rotateAnonymousId: true });
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(config.visitorId).toBe(currentAnonymousId);
+        const identifyCalls = vi.mocked(global.fetch).mock.calls.filter(([url]) => String(url).endsWith("/identify"));
+        expect(identifyCalls).toHaveLength(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("flushes captured replay identity before rotating after a current-account 409", async () => {
+      vi.useFakeTimers();
+      let emit!: (event: unknown) => void;
+      window.rrweb = { record: vi.fn(options => ((emit = options.emit), vi.fn())) };
+      config.enableSessionReplay = true;
+      tracker = new Tracker(config);
+      try {
+        tracker.onPageChange();
+        await vi.advanceTimersByTimeAsync(0);
+        vi.mocked(global.fetch).mockClear();
+        let respond!: (response: Response) => void;
+        vi.mocked(global.fetch).mockImplementationOnce(() => new Promise<Response>(resolve => (respond = resolve)));
+        tracker.identify("user-bob");
+        emit({ type: 3, data: { captured: "before-rotation" }, timestamp: 1_700_000_000_000 });
+
+        respond({
+          ok: false,
+          status: 409,
+          json: async () => ({ code: "ANONYMOUS_ID_ALREADY_LINKED", rotateAnonymousId: true }),
+        } as Response);
+        await vi.advanceTimersByTimeAsync(0);
+        const rotatedId = config.visitorId;
+        emit({ type: 3, data: { captured: "after-rotation" }, timestamp: 1_700_000_001_000 });
+        tracker.onPageChange();
+        await vi.advanceTimersByTimeAsync(0);
+
+        const replayBodies = vi
+          .mocked(global.fetch)
+          .mock.calls.filter(([url]) => String(url).includes("/session-replay/record/"))
+          .map(([, options]) => JSON.parse(options?.body as string));
+        expect(replayBodies).toHaveLength(2);
+        expect(replayBodies[0]).toMatchObject({ anonymousId: "visitor-123", userId: "user-bob" });
+        expect(replayBodies[0].events[0].data).toEqual({ captured: "before-rotation" });
+        expect(replayBodies[1]).toMatchObject({ anonymousId: rotatedId, userId: "user-bob" });
+        expect(replayBodies[1].events[0].data).toEqual({ captured: "after-rotation" });
+        expect(rotatedId).not.toBe("visitor-123");
+      } finally {
+        tracker.cleanup();
+        delete window.rrweb;
+        vi.useRealTimers();
+      }
     });
 
     it("should clear user ID", () => {

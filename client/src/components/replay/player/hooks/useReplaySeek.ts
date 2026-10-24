@@ -48,7 +48,10 @@ export function useReplaySeek() {
     const state = useReplayStore.getState();
     if (!state.player || !Number.isFinite(offset)) return;
 
-    if (!previewRef.current || !isCurrentPreview(previewRef.current)) {
+    // Late movements from a gesture on the old selection must not start a new
+    // preview against its replacement player. Commit/cancel clears the gesture.
+    if (previewRef.current && !isCurrentPreview(previewRef.current)) return;
+    if (!previewRef.current) {
       previewRef.current = {
         player: state.player,
         selectionVersion: state.selectionVersion,

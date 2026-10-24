@@ -1,4 +1,5 @@
 import { usePathname } from "next/navigation";
+import { useHydrated } from "@/hooks/useHydrated";
 import { authClient } from "@/lib/auth";
 import { getSiteRouteContext } from "@/lib/siteRoute";
 
@@ -8,7 +9,8 @@ import { getSiteRouteContext } from "@/lib/siteRoute";
  * neither. (Embeds are checked when a key arrives: see isEmbedView.)
  */
 export function useCommandPaletteAvailable(): boolean {
+  const hydrated = useHydrated();
   const { data: session } = authClient.useSession();
   const pathname = usePathname();
-  return !!session?.user && !getSiteRouteContext(pathname).privateKey;
+  return hydrated && !!session?.user && !getSiteRouteContext(pathname).privateKey;
 }

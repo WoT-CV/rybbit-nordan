@@ -44,7 +44,13 @@ export function OperatingSystem({ os = "", size = 16 }: { os?: string; size?: nu
   return (
     <>
       {OS_TO_LOGO[os] ? (
-        <Image src={`/operating-systems/${OS_TO_LOGO[os]}`} alt={os || "Other"} width={size} height={size} />
+        <Image
+          src={`/operating-systems/${OS_TO_LOGO[os]}`}
+          alt={os || "Other"}
+          width={size}
+          height={size}
+          style={{ width: size, height: size, objectFit: "contain" }}
+        />
       ) : (
         <Compass width={size} height={size} />
       )}

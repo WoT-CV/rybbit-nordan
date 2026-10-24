@@ -35,6 +35,7 @@ import {
 } from "@icons-pack/react-simple-icons";
 import { AnimatePresence, motion, useIsPresent, useReducedMotion } from "framer-motion";
 import { ChevronRight } from "lucide-react";
+import Image from "next/image";
 import { useExtracted } from "next-intl";
 import React, { type Ref, useCallback, useId, useLayoutEffect, useRef, useState } from "react";
 import type { SiteResponse } from "../../../../api/admin/endpoints";
@@ -46,7 +47,13 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../../components
 import { FADE_IN, FADE_OUT, INSTANT, SPRING_DISCLOSE } from "../../../../lib/motion";
 import { useStore } from "../../../../lib/store";
 import { FirstPageviewCard } from "./FirstPageviewCard";
-import { useArrivalRefresh, useFirstPageviewJourney, useFirstSession, useLiveVisitorNudge } from "./firstPageview";
+import {
+  useArrivalRefresh,
+  useFirstPageviewJourney,
+  useFirstSession,
+  useHoldLiveSessions,
+  useLiveVisitorNudge,
+} from "./firstPageview";
 
 const ICON = "h-3.5 w-3.5";
 
@@ -105,7 +112,7 @@ const PLATFORM_GUIDES: PlatformGuide[] = [
   { title: "SvelteKit", icon: <SiSvelte className={ICON} />, href: "https://rybbit.com/docs/guides/svelte/sveltekit" },
   {
     title: "ThriveCart",
-    icon: <img src="/platforms/thrivecart.svg" alt="" className={`${ICON} grayscale`} />,
+    icon: <Image src="/platforms/thrivecart.svg" alt="" width={14} height={14} className={`${ICON} grayscale`} />,
     href: "https://rybbit.com/docs/guides/thrivecart",
   },
   { title: "VitePress", icon: <SiVitepress className={ICON} />, href: "https://rybbit.com/docs/guides/vitepress" },
@@ -157,6 +164,7 @@ export function NoData() {
   const arrived = filling || phase === "ready";
 
   useLiveVisitorNudge(site, waiting);
+  useHoldLiveSessions(site, waiting || arrived);
   useArrivalRefresh(site, filling, settle);
   const firstSession = useFirstSession(site, arrived);
 

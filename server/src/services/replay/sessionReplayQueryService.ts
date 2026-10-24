@@ -20,6 +20,7 @@ import {
   REPLAY_METADATA_V1_TABLE,
   REPLAY_METADATA_V2_TABLE,
 } from "./replayMetadataMode.js";
+import { SessionReplayNotFoundError } from "./sessionReplayNotFoundError.js";
 
 /**
  * Service responsible for querying/retrieving session replay data
@@ -179,7 +180,7 @@ export class SessionReplayQueryService {
     const metadata = metadataResults[0];
 
     if (!metadata) {
-      throw new Error("Session replay not found for session " + sessionId);
+      throw new SessionReplayNotFoundError(sessionId);
     }
 
     // Get events
@@ -191,7 +192,9 @@ export class SessionReplayQueryService {
           event_data as data,
           event_data_key,
           batch_index,
-          sequence_number
+          sequence_number,
+          user_id,
+          identified_user_id
         FROM session_replay_events
         WHERE site_id = {siteId:UInt16} 
           AND session_id = {sessionId:String}
@@ -208,6 +211,8 @@ export class SessionReplayQueryService {
       event_data_key: string | null;
       batch_index: number | null;
       sequence_number: number;
+      user_id: string;
+      identified_user_id: string;
     };
 
     const eventsResults = await processResults<EventRow>(eventsResult);
@@ -230,6 +235,8 @@ export class SessionReplayQueryService {
       eventDataKey: string | null;
       batchIndex: number | null;
       sequenceNumber: number;
+      userId: string;
+      identifiedUserId: string;
     }> = [];
 
     // Separate R2 and ClickHouse batches
@@ -254,6 +261,8 @@ export class SessionReplayQueryService {
           eventDataKey: event.event_data_key,
           batchIndex: event.batch_index,
           sequenceNumber: event.sequence_number,
+          userId: event.user_id,
+          identifiedUserId: event.identified_user_id,
         });
       }
     }
@@ -283,7 +292,7 @@ export class SessionReplayQueryService {
     for (const { batchEvents, data } of r2Results) {
       if (data) {
         for (const event of batchEvents) {
-          if (event.batch_index !== null && data[event.batch_index]) {
+          if (event.batch_index !== null && data[event.batch_index] !== undefined) {
             events.push({
               timestamp: event.timestamp,
               type: event.type,
@@ -291,6 +300,8 @@ export class SessionReplayQueryService {
               eventDataKey: event.event_data_key,
               batchIndex: event.batch_index,
               sequenceNumber: event.sequence_number,
+              userId: event.user_id,
+              identifiedUserId: event.identified_user_id,
             });
           }
         }
@@ -307,15 +318,23 @@ export class SessionReplayQueryService {
 
     const seenEvents = new Set<string>();
     const orderedEvents = events.flatMap(event => {
-      const storageKey = event.eventDataKey
-        ? `r2:${event.eventDataKey}:${event.batchIndex ?? -1}`
-        : `ch:${event.timestamp}:${event.type}:${event.sequenceNumber}:${JSON.stringify(event.data)}`;
+      // A retry may land in a different R2 object or fall back to ClickHouse.
+      // Match the complete logical event, never its physical storage location
+      // or sequence alone (sequences can restart after a document reload).
+      const eventKey = JSON.stringify([
+        event.userId,
+        event.identifiedUserId,
+        event.timestamp,
+        event.type,
+        event.sequenceNumber,
+        event.data,
+      ]);
 
-      if (seenEvents.has(storageKey)) {
+      if (seenEvents.has(eventKey)) {
         return [];
       }
 
-      seenEvents.add(storageKey);
+      seenEvents.add(eventKey);
       return [{ timestamp: event.timestamp, type: event.type, data: event.data }];
     });
 
