@@ -1,17 +1,29 @@
+x-wotcv-logging: &wotcv-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "5"
+
 services:
+  clickhouse:
+    logging: *wotcv-logging
+
   redis:
     # Redis is consumed over the internal Compose network. Do not publish its
     # port on production hosts, where a system Redis may already use 6379.
     ports: !reset []
+    logging: *wotcv-logging
 
   postgres:
     # Keep the existing WoT-CV host mapping instead of inheriting upstream's
     # localhost:5432 binding.
     ports: !override
       - "${HOST_POSTGRES_PORT:-127.0.0.1:5433:5432}"
+    logging: *wotcv-logging
 
   backend:
     image: ghcr.io/wot-cv/rybbit-wotcv-backend:${IMAGE_TAG:?IMAGE_TAG must use an immutable sha-* tag}
+    logging: *wotcv-logging
     environment:
       WOTCV_VERSION: wotcv
       WOTCV_REPLAY_UPLOAD_GZIP: ${WOTCV_REPLAY_UPLOAD_GZIP:-false}
@@ -21,6 +33,7 @@ services:
 
   client:
     image: ghcr.io/wot-cv/rybbit-wotcv-client:${IMAGE_TAG:?IMAGE_TAG must use an immutable sha-* tag}
+    logging: *wotcv-logging
     environment:
       WOTCV_VERSION: wotcv
       WOTCV_IMAGE_TAG: ${IMAGE_TAG}

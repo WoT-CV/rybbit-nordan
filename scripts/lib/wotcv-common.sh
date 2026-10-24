@@ -70,6 +70,12 @@ print("Compose port validation passed.")
 PY
 }
 
+wotcv_validate_compose_logging() {
+  local config_file="$1"
+
+  python3 "${WOTCV_COMMON_DIR}/wotcv_logging.py" "${config_file}"
+}
+
 wotcv_validate_compose_persistence() {
   local config_file="$1"
   local expected_project="$2"

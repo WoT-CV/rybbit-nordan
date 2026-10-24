@@ -180,6 +180,7 @@ echo "Validating Compose configuration for ${IMAGE_TAG}..."
 COMPOSE_CONFIG_FILE="$(mktemp "${TMPDIR:-/tmp}/rybbit-wotcv-deploy-compose.${UID}.XXXXXX.json")"
 "${COMPOSE[@]}" config --format json >"${COMPOSE_CONFIG_FILE}"
 wotcv_validate_compose_ports "${COMPOSE_CONFIG_FILE}"
+wotcv_validate_compose_logging "${COMPOSE_CONFIG_FILE}"
 wotcv_validate_compose_persistence \
   "${COMPOSE_CONFIG_FILE}" \
   "${EXPECTED_COMPOSE_PROJECT_NAME}" \

@@ -60,6 +60,7 @@ compose_config="$(mktemp "${TMPDIR:-/tmp}/rybbit-identity-preflight.${UID}.XXXXX
 trap 'rm -f "${compose_config}"' EXIT
 "${COMPOSE[@]}" config --format json >"${compose_config}"
 wotcv_validate_compose_ports "${compose_config}"
+wotcv_validate_compose_logging "${compose_config}"
 wotcv_validate_compose_persistence \
   "${compose_config}" \
   "${EXPECTED_COMPOSE_PROJECT_NAME}" \

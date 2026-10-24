@@ -61,6 +61,7 @@ validate_runtime_images() {
 
 validate_compose_config() {
   wotcv_validate_compose_ports "${COMPOSE_CONFIG_FILE}"
+  wotcv_validate_compose_logging "${COMPOSE_CONFIG_FILE}"
 }
 
 require_persistent_volumes() {
