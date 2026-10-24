@@ -238,7 +238,7 @@ rollback() {
   local previous_build_time="$3"
   local previous_backend_digest="$4"
   local previous_client_digest="$5"
-  local rollback_deployed_at
+  local previous_identity_kind="${6:-legacy}"
   local rollback_response
 
   if [[ -z "${previous_tag}" || -z "${previous_git_sha}" ]]; then
@@ -246,28 +246,9 @@ rollback() {
     return 1
   fi
 
-  if ! docker image inspect "${BACKEND_IMAGE}:${previous_tag}" >/dev/null 2>&1; then
-    echo "Previous backend image ${BACKEND_IMAGE}:${previous_tag} is not present locally." >&2
-    return 1
-  fi
-
-  if ! docker image inspect "${CLIENT_IMAGE}:${previous_tag}" >/dev/null 2>&1; then
-    echo "Previous client image ${CLIENT_IMAGE}:${previous_tag} is not present locally." >&2
-    return 1
-  fi
-
   echo "Rolling back to ${previous_tag}..." >&2
-  wotcv_auth_assert_rollback_safe "${BACKEND_IMAGE}:${previous_tag}" "$("${COMPOSE[@]}" ps -q postgres)" || return 1
-  wotcv_drain_backend || return 1
-  rollback_deployed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-  IMAGE_TAG="${previous_tag}" \
-  WOTCV_GIT_SHA="${previous_git_sha}" \
-  WOTCV_BUILD_TIME="${previous_build_time:-unknown}" \
-  WOTCV_DEPLOYED_AT="${rollback_deployed_at}" \
-  BACKEND_IMAGE_DIGEST="${previous_backend_digest:-unknown}" \
-  CLIENT_IMAGE_DIGEST="${previous_client_digest:-unknown}" \
-    "${COMPOSE[@]}" up -d --no-deps --force-recreate backend client || return 1
+  wotcv_resolve_recorded_applications "${previous_tag}" "${previous_git_sha}" "${previous_backend_digest}" "${previous_client_digest}" "${previous_identity_kind}" || return 1
+  wotcv_restore_recorded_applications "${previous_tag}" "${previous_git_sha}" "${previous_build_time}" "${previous_backend_digest}" "${previous_client_digest}" "${previous_identity_kind}" || return 1
 
   validate_persistent_storage || return 1
   validate_clickhouse_event_baseline || return 1
@@ -286,6 +267,7 @@ rollback() {
   wotcv_wait_for_client || return 1
   IMAGE_TAG="${previous_tag}" WOTCV_GIT_SHA="${previous_git_sha}" \
     bash "${ROOT_DIR}/scripts/wotcv-identity-v2-preflight.sh" || return 1
+  wotcv_assert_application_images "${WOTCV_RECORDED_BACKEND_ID}" "${WOTCV_RECORDED_CLIENT_ID}" "${previous_git_sha}" running || return 1
   wotcv_leave_maintenance || return 1
 
   echo "Rollback completed: ${previous_tag}" >&2
@@ -296,6 +278,8 @@ PREVIOUS_GIT_SHA="$(wotcv_read_state "${STATE_FILE}" LAST_GIT_SHA)"
 PREVIOUS_BUILD_TIME="$(wotcv_read_state "${STATE_FILE}" BUILD_TIME)"
 PREVIOUS_BACKEND_DIGEST="$(wotcv_read_state "${STATE_FILE}" BACKEND_IMAGE_DIGEST)"
 PREVIOUS_CLIENT_DIGEST="$(wotcv_read_state "${STATE_FILE}" CLIENT_IMAGE_DIGEST)"
+PREVIOUS_IDENTITY_KIND="$(wotcv_read_state "${STATE_FILE}" IMAGE_IDENTITY_KIND)"
+PREVIOUS_IDENTITY_KIND="${PREVIOUS_IDENTITY_KIND:-legacy}"
 
 echo "Fetching and fast-forwarding ${DEPLOY_REMOTE}/${DEPLOY_BRANCH}..."
 SCRIPT_START_SHA="$(git rev-parse HEAD)"
@@ -347,6 +331,7 @@ if [[ "${WOTCV_BUILD_PULL:-0}" == "1" ]]; then
 fi
 
 echo "Building backend and client locally from ${DEPLOY_BRANCH}..."
+wotcv_preserve_recorded_applications "${PREVIOUS_TAG}" "${PREVIOUS_GIT_SHA}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" "${PREVIOUS_IDENTITY_KIND}"
 "${COMPOSE[@]}" "${BUILD_COMMAND[@]}" backend client
 
 echo "Validating runtime contents of backend and client images..."
@@ -369,7 +354,7 @@ validate_postgres_data_baseline
 echo "Starting backend and client..."
 if ! "${COMPOSE[@]}" up -d --no-deps --force-recreate backend client; then
   echo "Compose startup failed. Attempting rollback..." >&2
-  rollback "${PREVIOUS_TAG}" "${PREVIOUS_GIT_SHA}" "${PREVIOUS_BUILD_TIME}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" || true
+  rollback "${PREVIOUS_TAG}" "${PREVIOUS_GIT_SHA}" "${PREVIOUS_BUILD_TIME}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" "${PREVIOUS_IDENTITY_KIND}" || true
   exit 1
 fi
 
@@ -380,32 +365,32 @@ validate_postgres_data_baseline
 if ! HEALTH_RESPONSE="$(wotcv_wait_for_health "${HEALTHCHECK_URL}" "${WOTCV_GIT_SHA}" "${IMAGE_TAG}")"; then
   echo "Health check failed. Recent logs:" >&2
   "${COMPOSE[@]}" logs --since=10m backend client >&2 || true
-  rollback "${PREVIOUS_TAG}" "${PREVIOUS_GIT_SHA}" "${PREVIOUS_BUILD_TIME}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" || true
+  rollback "${PREVIOUS_TAG}" "${PREVIOUS_GIT_SHA}" "${PREVIOUS_BUILD_TIME}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" "${PREVIOUS_IDENTITY_KIND}" || true
   exit 1
 fi
 
 if [[ "${HEALTH_RESPONSE}" != *"\"gitSha\":\"${WOTCV_GIT_SHA}\""* ]]; then
   echo "Health endpoint returned an unexpected git SHA: ${HEALTH_RESPONSE}" >&2
-  rollback "${PREVIOUS_TAG}" "${PREVIOUS_GIT_SHA}" "${PREVIOUS_BUILD_TIME}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" || true
+  rollback "${PREVIOUS_TAG}" "${PREVIOUS_GIT_SHA}" "${PREVIOUS_BUILD_TIME}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" "${PREVIOUS_IDENTITY_KIND}" || true
   exit 1
 fi
 
 if [[ "${HEALTH_RESPONSE}" != *"\"imageTag\":\"${IMAGE_TAG}\""* ]]; then
   echo "Health endpoint returned an unexpected image tag: ${HEALTH_RESPONSE}" >&2
-  rollback "${PREVIOUS_TAG}" "${PREVIOUS_GIT_SHA}" "${PREVIOUS_BUILD_TIME}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" || true
+  rollback "${PREVIOUS_TAG}" "${PREVIOUS_GIT_SHA}" "${PREVIOUS_BUILD_TIME}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" "${PREVIOUS_IDENTITY_KIND}" || true
   exit 1
 fi
 
 if ! wotcv_wait_for_client; then
   echo "Client readiness check failed. Attempting application rollback..." >&2
-  rollback "${PREVIOUS_TAG}" "${PREVIOUS_GIT_SHA}" "${PREVIOUS_BUILD_TIME}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" || true
+  rollback "${PREVIOUS_TAG}" "${PREVIOUS_GIT_SHA}" "${PREVIOUS_BUILD_TIME}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" "${PREVIOUS_IDENTITY_KIND}" || true
   exit 1
 fi
 
 echo "Running Identity Resolution v2 post-deployment preflight..."
 if ! bash scripts/wotcv-identity-v2-preflight.sh; then
   echo "Identity preflight failed. Attempting application rollback..." >&2
-  rollback "${PREVIOUS_TAG}" "${PREVIOUS_GIT_SHA}" "${PREVIOUS_BUILD_TIME}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" || true
+  rollback "${PREVIOUS_TAG}" "${PREVIOUS_GIT_SHA}" "${PREVIOUS_BUILD_TIME}" "${PREVIOUS_BACKEND_DIGEST}" "${PREVIOUS_CLIENT_DIGEST}" "${PREVIOUS_IDENTITY_KIND}" || true
   exit 1
 fi
 
@@ -415,11 +400,13 @@ LAST_GIT_SHA=${WOTCV_GIT_SHA}
 LAST_IMAGE_TAG=${IMAGE_TAG}
 BACKEND_IMAGE_DIGEST=${BACKEND_IMAGE_DIGEST}
 CLIENT_IMAGE_DIGEST=${CLIENT_IMAGE_DIGEST}
+IMAGE_IDENTITY_KIND=local-id
 BUILD_TIME=${WOTCV_BUILD_TIME}
 DEPLOYED_AT=${WOTCV_DEPLOYED_AT}
 EOF
 mv "${STATE_FILE}.tmp" "${STATE_FILE}"
 wotcv_leave_maintenance
+wotcv_release_retained_applications || echo "Warning: previous-image retention aliases remain; review them before manual image pruning." >&2
 
 echo "Branch build deployment completed."
 echo "Branch: ${DEPLOY_BRANCH}"

@@ -1,7 +1,8 @@
 """Maintenance gate ownership, narrow installation and fixture-only file tests."""
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -36,15 +37,52 @@ class GateTests(unittest.TestCase):
         self.assertNotIn(b"/run/wotcv-rybbit-maintenance", GATE.CONTENT)
 
     def test_status_is_read_only_and_has_stable_machine_output(self):
-        with patch.object(GATE, "require_installed"), patch.object(GATE, "read_flag", return_value=None), \
-                patch.object(GATE, "gate_lock") as lock, patch("builtins.print") as output:
-            GATE.manage("status")
-            output.assert_called_once_with("inactive")
-            lock.assert_not_called()
-        with patch.object(GATE, "require_installed"), patch.object(GATE, "read_flag", return_value={"owner": "test"}), \
-                patch("builtins.print") as output:
-            GATE.manage("status")
-            output.assert_called_once_with("active")
+        for existing, state in ((None, "inactive"), ({"owner": "test"}, "active")):
+            with self.subTest(state=state), patch.object(GATE, "require_installed"), \
+                    patch.object(GATE, "read_flag", return_value=existing), \
+                    patch.object(GATE, "gate_lock") as lock, patch.object(GATE, "create_flag") as create, \
+                    patch.object(GATE, "sync_directory") as sync, patch.object(GATE, "verify_active_origin") as canary, \
+                    patch.object(GATE.os, "open") as opening, patch.object(Path, "unlink") as unlink, \
+                    redirect_stdout(io.StringIO()) as output:
+                GATE.manage("status")
+                self.assertEqual(output.getvalue(), state + "\n")
+                for mutation in (lock, create, sync, canary, opening, unlink):
+                    mutation.assert_not_called()
+
+    def test_failed_leave_reports_inactive_or_unknown_if_restoration_fails(self):
+        existing = {"version": 1, "owner": "mine"}
+        for current, error, expected in ((None, None, "flag is inactive; traffic may be open"),
+                                         (None, OSError("unreadable"), "flag state is unknown"),
+                                         (None, GATE.Refused("untrusted"), "flag state is unknown")):
+            with self.subTest(expected=expected, error=error), \
+                    patch.object(GATE, "create_flag", side_effect=OSError("cannot restore")), \
+                    patch.object(GATE, "read_flag", return_value=current, side_effect=error), \
+                    patch.object(GATE, "sync_directory") as sync, patch.object(Path, "unlink") as unlink, \
+                    self.assertRaisesRegex(GATE.Refused, expected) as refused:
+                GATE.refuse_failed_leave(existing)
+            self.assertIn("Do not remove a flag blindly", str(refused.exception))
+            self.assertNotIn("retained", str(refused.exception))
+            sync.assert_not_called()
+            unlink.assert_not_called()
+
+    def test_failed_leave_preserves_a_competing_flag_instead_of_overwriting_it(self):
+        existing = {"version": 1, "owner": "mine"}
+        replacement = {"version": 1, "owner": "other"}
+        with patch.object(GATE, "create_flag", side_effect=FileExistsError("a competing flag exists")) as create, \
+                patch.object(GATE, "read_flag", return_value=replacement), \
+                patch.object(GATE, "sync_directory") as sync, patch.object(Path, "unlink") as unlink, \
+                self.assertRaisesRegex(GATE.Refused, "replacement maintenance flag is active and was preserved"):
+            GATE.refuse_failed_leave(existing)
+        create.assert_called_once_with(existing)
+        sync.assert_not_called()
+        unlink.assert_not_called()
+
+    def test_failed_leave_does_not_claim_durability_when_restore_sync_fails(self):
+        existing = {"version": 1, "owner": "mine"}
+        with patch.object(GATE, "create_flag"), patch.object(GATE, "read_flag", return_value=existing), \
+                patch.object(GATE, "sync_directory", side_effect=OSError("restore barrier failed")), \
+                self.assertRaisesRegex(GATE.Refused, "currently active; durability and live origin gating are not confirmed"):
+            GATE.refuse_failed_leave(existing)
 
     def test_other_owner_cannot_enter_or_leave(self):
         for action in ("enter", "leave"):
@@ -232,6 +270,144 @@ class GateTests(unittest.TestCase):
             self.assertFalse((root / "tmpfiles.conf").exists())
             self.assertFalse((root / "runtime").exists())
             command.assert_not_called()
+
+    @contextmanager
+    def owned_flag_directory(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(GATE, "DIRECTORY", Path(temporary)), \
+                patch.object(GATE, "require_installed"), patch.object(GATE, "verify_active_origin") as canary, \
+                patch.object(GATE, "deployment_identity", return_value=(os.getuid(), os.getgid())):
+            with redirect_stdout(io.StringIO()):
+                GATE.manage("enter", "fixture-owner")
+            canary.reset_mock()
+            yield Path(temporary) / "active", canary
+
+    @unittest.skipUnless(os.name == "posix", "Linux flag durability contract required")
+    def test_failed_leave_after_unlink_restores_owned_flag_then_allows_safe_retry(self):
+        with self.owned_flag_directory() as (active, canary):
+            original = active.read_bytes()
+            observed = []
+            real_sync = GATE.sync_directory
+            def sync(path):
+                observed.append(active.exists())
+                if len(observed) == 1:
+                    raise OSError("fsync after unlink failed")
+                real_sync(path)
+            with patch.object(GATE, "sync_directory", side_effect=sync), redirect_stdout(io.StringIO()) as output, \
+                    self.assertRaisesRegex(GATE.Refused, "owned maintenance flag was restored and directory-synced"):
+                GATE.manage("leave", "fixture-owner")
+            self.assertEqual(observed, [False, True])
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(active.read_bytes(), original)
+            canary.assert_not_called()
+            with redirect_stdout(io.StringIO()) as output:
+                GATE.manage("status")
+            self.assertEqual(output.getvalue(), "active\n")
+            with redirect_stdout(io.StringIO()):
+                GATE.manage("enter", "fixture-owner")
+                GATE.manage("leave", "fixture-owner")
+            canary.assert_called_once()
+            self.assertIsNone(GATE.read_flag())
+            with self.assertRaisesRegex(GATE.Refused, "unowned leave"):
+                GATE.manage("leave", "fixture-owner")
+
+    @unittest.skipUnless(os.name == "posix", "Linux flag durability contract required")
+    def test_failed_leave_with_failed_restore_reports_actual_inactive_state(self):
+        with self.owned_flag_directory() as (active, _):
+            with patch.object(GATE, "sync_directory", side_effect=OSError("unlink barrier failed")), \
+                    patch.object(GATE, "create_flag", side_effect=OSError("restore creation failed")), \
+                    patch.object(GATE.sys, "argv", ["maintenance.py", "leave", "--owner", "fixture-owner"]), \
+                    redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(GATE.main(), 1)
+            self.assertFalse(active.exists())
+            self.assertEqual(output.getvalue(), "")
+            self.assertIn("flag is inactive; traffic may be open", errors.getvalue())
+            self.assertIn("Do not remove a flag blindly", errors.getvalue())
+            with redirect_stdout(io.StringIO()) as output:
+                GATE.manage("status")
+            self.assertEqual(output.getvalue(), "inactive\n")
+            with self.assertRaisesRegex(GATE.Refused, "unowned leave"):
+                GATE.manage("leave", "fixture-owner")
+            with redirect_stdout(io.StringIO()):
+                GATE.manage("enter", "fixture-owner")
+                GATE.manage("leave", "fixture-owner")
+
+    @unittest.skipUnless(os.name == "posix", "Linux flag durability contract required")
+    def test_restored_gate_with_unconfirmed_directory_durability_can_be_reentered(self):
+        with self.owned_flag_directory() as (active, canary):
+            original = active.read_bytes()
+            with patch.object(GATE, "sync_directory", side_effect=OSError("persistent directory barrier failure")) as sync, \
+                    self.assertRaisesRegex(GATE.Refused, "currently active; durability and live origin gating are not confirmed"):
+                GATE.manage("leave", "fixture-owner")
+            self.assertEqual(sync.call_count, 2)
+            self.assertEqual(active.read_bytes(), original)
+            canary.assert_not_called()
+            with redirect_stdout(io.StringIO()):
+                GATE.manage("enter", "fixture-owner")
+            canary.assert_called_once()
+            self.assertEqual(active.read_bytes(), original)
+
+    @unittest.skipUnless(os.name == "posix", "Linux flag ownership contract required")
+    def test_leave_rechecks_owner_and_preserves_changes_before_unlink(self):
+        for replacement in (None, {"version": 1, "owner": "other"}):
+            with self.subTest(replacement=replacement), self.owned_flag_directory() as (active, _):
+                real_read = GATE.read_flag
+                reads = 0
+                def read():
+                    nonlocal reads
+                    reads += 1
+                    if reads == 2:
+                        active.unlink()
+                        if replacement:
+                            GATE.create_flag(replacement)
+                    return real_read()
+                with patch.object(GATE, "read_flag", side_effect=read), \
+                        self.assertRaisesRegex(GATE.Refused, "changed before leave; no removal attempted"):
+                    GATE.manage("leave", "fixture-owner")
+                self.assertEqual(real_read(), replacement)
+
+    @unittest.skipUnless(os.name == "posix", "Linux flag ownership contract required")
+    def test_replacement_during_leave_is_never_removed_even_when_sync_fails(self):
+        for fail_sync in (False, True):
+            with self.subTest(fail_sync=fail_sync), self.owned_flag_directory() as (active, _):
+                replacement = {"version": 1, "owner": "other"}
+                def sync(path):
+                    self.assertFalse(active.exists())
+                    GATE.create_flag(replacement)
+                    if fail_sync:
+                        raise OSError("barrier failure with competing owner")
+                with patch.object(GATE, "sync_directory", side_effect=sync), \
+                        self.assertRaisesRegex(GATE.Refused, "preserved"):
+                    GATE.manage("leave", "fixture-owner")
+                self.assertEqual(GATE.read_flag(), replacement)
+                with self.assertRaisesRegex(GATE.Refused, "another operation"):
+                    GATE.manage("leave", "fixture-owner")
+
+    @unittest.skipUnless(os.name == "posix", "Linux flag ownership contract required")
+    def test_concurrent_unlink_failure_restores_ownership_instead_of_claiming_success(self):
+        with self.owned_flag_directory() as (active, _):
+            original = active.read_bytes()
+            real_unlink = Path.unlink
+            def unlink(path, *args, **kwargs):
+                real_unlink(path, *args, **kwargs)
+                raise FileNotFoundError("flag disappeared at unlink")
+            with patch.object(Path, "unlink", unlink), \
+                    self.assertRaisesRegex(GATE.Refused, "owned maintenance flag was restored"):
+                GATE.manage("leave", "fixture-owner")
+            self.assertEqual(active.read_bytes(), original)
+
+    @unittest.skipUnless(os.name == "posix", "Linux flock ownership contract required")
+    def test_cooperating_operations_cannot_enter_or_leave_while_gate_is_locked(self):
+        with self.owned_flag_directory() as (active, canary):
+            original = active.read_bytes()
+            with GATE.gate_lock():
+                for action in ("enter", "leave"):
+                    with self.subTest(action=action), self.assertRaises(BlockingIOError):
+                        GATE.manage(action, "fixture-owner")
+                with redirect_stdout(io.StringIO()) as output:
+                    GATE.manage("status")
+                self.assertEqual(output.getvalue(), "active\n")
+            self.assertEqual(active.read_bytes(), original)
+            canary.assert_not_called()
 
     @unittest.skipUnless(os.name == "posix", "Linux ownership and O_NOFOLLOW required")
     def test_native_flag_create_read_leave_in_isolated_directory(self):

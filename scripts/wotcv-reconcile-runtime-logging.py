@@ -22,6 +22,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import subprocess
 import sys
@@ -56,6 +57,63 @@ IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 CONTAINER_ID = re.compile(r"[0-9a-f]{64}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 MAX_BACKUP_AGE = 6 * 60 * 60
+# This is a bounded, one-off repair for the inspected native production
+# profile, NOT a portable Docker-defaults table. Any other engine/CLI or new
+# inspect field requires review before a database can be replaced or rolled
+# back. In particular, never infer a missing/unknown setting from a falsey
+# value: an unrepresented security/resource control must fail before `up`.
+NATIVE_ENGINE = "29.9.2|linux|amd64"
+NATIVE_COMPOSE = "5.6.1"
+ENGINE_FORMAT = "{{.Server.Version}}|{{.Server.Os}}|{{.Server.Arch}}"
+CLI_ENVIRONMENT = {
+    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C",
+    "DOCKER_HOST": "unix:///var/run/docker.sock",
+    "COMPOSE_REMOVE_ORPHANS": "false", "COMPOSE_IGNORE_ORPHANS": "true",
+    "COMPOSE_DISABLE_ENV_FILE": "true", "COMPOSE_ENV_FILES": "",
+    "COMPOSE_PROFILES": "", "COMPOSE_BAKE": "false", "COMPOSE_MENU": "false",
+    "COMPOSE_EXPERIMENTAL": "false", "COMPOSE_PARALLEL_LIMIT": "1",
+}
+NATIVE_HOST_CONFIG = {
+    "AutoRemove": False, "BlkioDeviceReadBps": None, "BlkioDeviceReadIOps": None,
+    "BlkioDeviceWriteBps": None, "BlkioDeviceWriteIOps": None, "BlkioWeight": 0,
+    "BlkioWeightDevice": None, "CapAdd": None, "CapDrop": None, "Cgroup": "",
+    "CgroupParent": "", "CgroupnsMode": "private", "ConsoleSize": [0, 0],
+    "ContainerIDFile": "", "CpuCount": 0, "CpuPercent": 0, "CpuPeriod": 0,
+    "CpuQuota": 0, "CpuRealtimePeriod": 0, "CpuRealtimeRuntime": 0, "CpuShares": 0,
+    "CpusetCpus": "", "CpusetMems": "", "DeviceCgroupRules": None,
+    "DeviceRequests": None, "Devices": None, "Dns": [], "DnsOptions": [],
+    "DnsSearch": [], "ExtraHosts": [], "GroupAdd": None, "IOMaximumBandwidth": 0,
+    "IOMaximumIOps": 0, "IpcMode": "private", "Isolation": "", "Links": None,
+    "MaskedPaths": ["/proc/acpi", "/proc/asound", "/proc/interrupts", "/proc/kcore",
+                    "/proc/keys", "/proc/latency_stats", "/proc/sched_debug", "/proc/scsi",
+                    "/proc/timer_list", "/proc/timer_stats", "/sys/devices/virtual/powercap",
+                    "/sys/firmware"],
+    "Memory": 0, "MemoryReservation": 0, "MemorySwap": 0, "MemorySwappiness": None,
+    "NanoCpus": 0, "OomKillDisable": None, "OomScoreAdj": 0, "PidMode": "",
+    "PidsLimit": None, "Privileged": False, "PublishAllPorts": False,
+    "ReadonlyPaths": ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"],
+    "ReadonlyRootfs": False, "Runtime": "runc", "SecurityOpt": None,
+    "ShmSize": 67108864, "UTSMode": "", "Ulimits": None, "UsernsMode": "",
+    "VolumeDriver": "", "VolumesFrom": None,
+}
+# These are represented and independently compared to the candidate below.
+REPRESENTED_HOST_FIELDS = {"Binds", "Mounts", "PortBindings", "NetworkMode", "RestartPolicy", "LogConfig"}
+NATIVE_ATTACH_CONFIG = {"AttachStdin": False, "AttachStdout": True, "AttachStderr": True,
+                        "OpenStdin": False, "StdinOnce": False, "Tty": False}
+PINNED_NATIVE_FIELDS = {"runtime": "runc", "ipc": "private", "cgroup": "private", "shm_size": "67108864"}
+REPRESENTED_CONFIG_FIELDS = {
+    "Cmd", "Domainname", "Entrypoint", "Env", "ExposedPorts", "Healthcheck", "Hostname",
+    "Image", "Labels", "StopSignal", "User", "Volumes", "WorkingDir",
+}
+PROBE_LABEL = "io.wotcv.runtime-logging-probe"
+# Observed `docker create` spellings on the reviewed Engine/CLI, unlike the
+# Compose-created production containers. Normalize ONLY these probe-copy
+# alternatives; never weaken the original profile or post-recreate comparison.
+PROBE_NATIVE_SPELLINGS = {
+    "BlkioDeviceReadBps": [], "BlkioDeviceReadIOps": [], "BlkioDeviceWriteBps": [],
+    "BlkioDeviceWriteIOps": [], "BlkioWeightDevice": [], "Devices": [],
+    "Dns": None, "ExtraHosts": None, "OomKillDisable": False,
+}
 PG_SNAPSHOT = '''SELECT json_build_object(
  'system_identifier', (SELECT system_identifier::text FROM pg_control_system()),
  'database', current_database(), 'users', (SELECT count(*) FROM "user"),
@@ -94,7 +152,9 @@ class Refused(RuntimeError):
 def environment(repo: Path) -> dict[str, str]:
     # Never inherit Docker contexts, Compose overrides, BASH_ENV or user PATH
     # into a root maintenance operation. Read .env only through Compose.
-    env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"}
+    # Shell values win over .env; pin lifecycle controls even while rendering
+    # the original explicit --env-file (which may contain Compose controls).
+    env = dict(CLI_ENVIRONMENT)
     state = repo / ".wotcv-deployment.env"
     if state.exists():
         tags = [line.split("=", 1)[1] for line in state.read_text().splitlines()
@@ -118,6 +178,179 @@ def compose(repo: Path) -> list[str]:
     return ["docker", "compose", "--project-directory", str(repo), "--env-file", str(repo / ".env"),
             "--project-name", PROJECT, "-f", str(repo / "docker-compose.yml"),
             "-f", str(repo / "docker-compose.wotcv.yml")]
+
+
+def pinned_compose_command(path: Path) -> list[str]:
+    """The same self-contained, poison-resistant argv is archived for recovery.
+
+    Explicit /dev/null prevents both cwd and project dotenv discovery. env -i
+    also protects a later operator invocation, outside command()'s clean env.
+    The protected audit directory contains no Docker client config/proxy file.
+    A version guard keeps this reviewed native profile bounded on rollback too.
+    """
+    env = dict(CLI_ENVIRONMENT, DOCKER_CONFIG=str(path.parent))
+    guard = (f"wotcv_engine=$(docker version --format '{ENGINE_FORMAT}'); "
+             f'test "$wotcv_engine" = "{NATIVE_ENGINE}"; '
+             'wotcv_compose=$(docker compose version --short); '
+             f'test "$wotcv_compose" = "{NATIVE_COMPOSE}"; '
+             'exec docker compose "$@"')
+    return ["/usr/bin/env", "-i", *(f"{key}={value}" for key, value in env.items()),
+            "/bin/sh", "-ec", guard, "wotcv-runtime-logging",
+            "--project-directory", str(path.parent), "--env-file", "/dev/null",
+            "--project-name", PROJECT, "-f", str(path)]
+
+
+def isolated_docker_command(audit: Path, args: list[str]) -> list[str]:
+    env = dict(CLI_ENVIRONMENT, DOCKER_CONFIG=str(audit))
+    return ["/usr/bin/env", "-i", *(f"{key}={value}" for key, value in env.items()), "docker", *args]
+
+
+def require_native_cli(repo: Path) -> None:
+    engine = command(repo, ["docker", "version", "--format", ENGINE_FORMAT]).decode().strip()
+    cli = command(repo, ["docker", "compose", "version", "--short"]).decode().strip()
+    if engine != NATIVE_ENGINE or cli != NATIVE_COMPOSE:
+        raise Refused("Database logging repair requires the reviewed native Docker/Compose versions")
+
+
+def require_native_runtime_record(record: dict, *, probe=False) -> None:
+    native = {key: value for key, value in record["HostConfig"].items() if key not in REPRESENTED_HOST_FIELDS}
+    if probe:
+        native = copy.deepcopy(native)
+        for field, alternative in PROBE_NATIVE_SPELLINGS.items():
+            if field in native and type(native[field]) is type(alternative) and native[field] == alternative:
+                native[field] = copy.deepcopy(NATIVE_HOST_CONFIG[field])
+    # JSON comparison is type-strict (False must not accidentally equal 0).
+    if json.dumps(native, sort_keys=True) != json.dumps(NATIVE_HOST_CONFIG, sort_keys=True):
+        raise Refused("Database HostConfig has unsupported resource/security/runtime settings; nothing recreated")
+    native = {key: value for key, value in record["Config"].items() if key not in REPRESENTED_CONFIG_FIELDS}
+    if json.dumps(native, sort_keys=True) != json.dumps(NATIVE_ATTACH_CONFIG, sort_keys=True):
+        raise Refused("Database Config has unsupported execution/attachment settings; nothing recreated")
+
+
+def require_native_runtime_settings(records: dict) -> None:
+    for name in TARGETS:
+        require_native_runtime_record(records[name])
+
+
+def database_images(repo: Path, records: dict) -> dict:
+    images = {}
+    for name in TARGETS:
+        image = json.loads(command(repo, ["docker", "image", "inspect", records[name]["Image"]]))
+        if len(image) != 1 or image[0].get("Id") != records[name]["Image"]:
+            raise Refused("Exact database image is unavailable locally; no pull is allowed")
+        images[name] = image[0]
+    return images
+
+
+def inspect_native_probe(repo: Path, audit: Path, identifier: str) -> dict:
+    values = json.loads(command(repo, isolated_docker_command(audit, ["inspect", identifier])))
+    if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+        raise Refused("Native daemon probe inspection is ambiguous; operator review required")
+    return values[0]
+
+
+def require_owned_native_probe(record: dict, expected: dict, identifier: str) -> None:
+    if (record.get("Id") != identifier or not CONTAINER_ID.fullmatch(identifier)
+            or record.get("Name") != "/" + expected["name"] or record.get("Image") != expected["image"]
+            or record.get("Config", {}).get("Image") != expected["image"]
+            or record.get("Config", {}).get("Labels", {}).get(PROBE_LABEL) != expected["nonce"]
+            or record.get("State", {}).get("Status") != "created"
+            or record.get("State", {}).get("Running") is not False):
+        raise Refused("Native daemon probe ownership or never-started state is unproven; no removal allowed")
+
+
+def require_isolated_native_probe(record: dict, target: str) -> None:
+    host = record["HostConfig"]
+    mount = {"Type": "tmpfs", "Source": "", "Destination": target, "Mode": "", "RW": True, "Propagation": ""}
+    networks = record.get("NetworkSettings", {}).get("Networks") or {}
+    if (record.get("Config", {}).get("Entrypoint") != ["/bin/true"]
+            or host.get("NetworkMode") != "none" or set(networks) - {"none"}
+            or host.get("Binds") not in (None, []) or host.get("PortBindings") not in (None, {})
+            or host.get("RestartPolicy") != {"Name": "no", "MaximumRetryCount": 0}
+            or host.get("Mounts") != [{"Type": "tmpfs", "Target": target}]
+            or record.get("Mounts") != [mount]):
+        raise Refused("Native daemon probe is not the exact isolated tmpfs-only helper; operator review required")
+
+
+def cleanup_native_probe(repo: Path, audit: Path, expected: dict, identifier: str | None) -> str | None:
+    if identifier is None:
+        # A CLI failure/timeout may happen after creation. Discover only the
+        # unique name AND unguessable operation label, never a production name.
+        raw = command(repo, isolated_docker_command(audit, ["ps", "--all", "--no-trunc",
+            "--filter", f"label={PROBE_LABEL}={expected['nonce']}",
+            "--filter", "name=" + expected["name"], "--format", "{{.ID}}"])).decode().splitlines()
+        if not raw:
+            return None
+        if len(raw) != 1 or not CONTAINER_ID.fullmatch(raw[0]):
+            raise Refused("Native daemon probe recovery is ambiguous; no removal allowed")
+        identifier = raw[0]
+    record = inspect_native_probe(repo, audit, identifier)
+    write_json(audit / ("probe-" + expected["service"] + ".cleanup-inspect.json"), record)
+    require_owned_native_probe(record, expected, identifier)
+    require_isolated_native_probe(record, expected["target"])
+    # No --force, --volumes, prune, start, or name-based removal is allowed.
+    command(repo, isolated_docker_command(audit, ["rm", identifier]))
+    remaining = command(repo, isolated_docker_command(audit, ["ps", "--all", "--no-trunc",
+        "--filter", "id=" + identifier, "--format", "{{.ID}}"])).strip()
+    if remaining:
+        raise Refused("Native daemon probe removal was not confirmed; operator review required")
+    return identifier
+
+
+def probe_native_daemon(repo: Path, audit: Path, records: dict, owner: str) -> None:
+    """Exercise current daemon create defaults, NEVER a database or process.
+
+    Docker documents `create` as never starting the container. Explicit tmpfs
+    covers the image data directory and prevents anonymous image-volume
+    allocation. This pre-start inspection does NOT prove active kernel policy
+    (notably AppArmor/seccomp); no helper entrypoint or image CMD is ever run.
+    https://docs.docker.com/reference/cli/docker/container/create/
+    https://docs.docker.com/engine/storage/tmpfs/
+    """
+    for spec in SPECS[1:]:
+        require_gate(owner)
+        nonce = secrets.token_hex(16)
+        expected = {"service": spec.service_name, "target": spec.target, "nonce": nonce,
+                    "name": f"wotcv-runtime-logging-probe-{nonce}-{spec.service_name}",
+                    "image": records[spec.service_name]["Image"]}
+        if not IMAGE_ID.fullmatch(expected["image"]):
+            raise Refused("Native daemon probe requires the exact inspected immutable database image")
+        prefix = "probe-" + spec.service_name
+        write_json(audit / (prefix + ".request.json"), expected)
+        sync_directory(audit)
+        identifier = None
+        try:
+            raw = command(repo, isolated_docker_command(audit, ["create", "--name", expected["name"],
+                "--label", f"{PROBE_LABEL}={nonce}", "--pull", "never", "--entrypoint", "/bin/true",
+                "--network", "none", "-a", "stdout", "-a", "stderr", "--runtime", "runc", "--ipc", "private",
+                "--cgroupns", "private", "--shm-size", "67108864", "--mount", f"type=tmpfs,dst={spec.target}",
+                expected["image"]])).decode().strip()
+            if not CONTAINER_ID.fullmatch(raw):
+                raise Refused("Native daemon probe create response is unproven; database replacement refused")
+            identifier = raw
+            record = inspect_native_probe(repo, audit, identifier)
+            write_json(audit / (prefix + ".inspect.json"), record)
+            require_owned_native_probe(record, expected, identifier)
+            require_isolated_native_probe(record, spec.target)
+            require_native_runtime_record(record, probe=True)
+            if record.get("AppArmorProfile") != "":
+                raise Refused("Native daemon probe pre-start AppArmor metadata differs from the reviewed profile")
+        finally:
+            try:
+                removed = cleanup_native_probe(repo, audit, expected, identifier)
+            except BaseException:
+                try:
+                    write_json(audit / (prefix + ".cleanup.json"), {"cleanupConfirmed": False, "operatorReviewRequired": True})
+                    sync_directory(audit)
+                except BaseException:
+                    pass
+                raise Refused("Native daemon probe cleanup could not be proven; review the protected audit before recovery") from None
+            # An unanswered create can still finish in the daemon after an
+            # empty lookup. Absence at that instant is not a cleanup proof.
+            write_json(audit / (prefix + ".cleanup.json"), {"cleanupConfirmed": removed is not None,
+                       "removedHelperId": removed, "createOutcomeUncertain": removed is None,
+                       "operatorReviewRequired": removed is None, "effectiveKernelPolicyProven": False})
+            sync_directory(audit)
 
 
 def inspect_owned(repo: Path) -> dict:
@@ -220,6 +453,14 @@ def plan(repo: Path) -> tuple[dict, dict, tuple[str, ...]]:
     config = decode_compose_export(command(repo, [*compose(repo), "config", "--format", "json"]))
     records = inspect_owned(repo)
     validate_storage_and_ports(config, records)
+    # Do the same read-only eligibility check before an operator stops backend,
+    # not only after entering the acknowledged maintenance apply path.
+    require_native_cli(repo)
+    require_native_runtime_settings(records)
+    images = database_images(repo, records)
+    require_matching_command_environment(config, records, images)
+    pinned_compose(config, records, rollback=False)
+    pinned_compose(config, records, rollback=True)
     drift = tuple(name for name in SERVICES
                   if records[name]["HostConfig"].get("LogConfig") != EXPECTED_RUNTIME_LOGGING)
     return config, records, drift
@@ -459,9 +700,10 @@ def stable_runtime(records: dict) -> dict:
 
 
 def pinned_compose(config: dict, records: dict, *, rollback: bool) -> dict:
+    require_native_runtime_settings(records)
     validate_database_mounts(config, records)
     allowed = {"image", "container_name", "environment", "volumes", "healthcheck", "restart", "ports",
-               "command", "entrypoint", "logging", "networks", "labels"}
+               "command", "entrypoint", "logging", "networks", "labels", *PINNED_NATIVE_FIELDS}
     result = {"name": PROJECT, "services": {},
               "volumes": {key: copy.deepcopy(config["volumes"][key]) for key in ("postgres-data", "redis-data")},
               "networks": {"default": copy.deepcopy(config.get("networks", {}).get("default", {}))}}
@@ -469,12 +711,21 @@ def pinned_compose(config: dict, records: dict, *, rollback: bool) -> dict:
         service = copy.deepcopy(config["services"][name])
         if set(service) - allowed:
             raise Refused("Unsupported database Compose fields; a general deployment is not permitted")
+        if any(field in service and service[field] != value for field, value in PINNED_NATIVE_FIELDS.items()):
+            raise Refused("Database Compose runtime settings differ from the reviewed native profile")
+        # Preserve version-sensitive representable defaults explicitly instead
+        # of relying on the current daemon's default runtime/namespace/shm size.
+        service.update(PINNED_NATIVE_FIELDS)
         service["image"] = records[name]["Image"]
         actual = records[name]["HostConfig"]["LogConfig"]
         if rollback:
             if not isinstance(actual.get("Type"), str) or not isinstance(actual.get("Config"), dict):
                 raise Refused("Original logging cannot be represented safely for configuration rollback")
-            service["logging"] = {"driver": actual["Type"], "options": actual["Config"]}
+            service["logging"] = {"driver": actual["Type"]}
+            # Compose 5.6.1 canonically omits an empty options map. Keep the
+            # exact export/source roundtrip strict for rollback as well.
+            if actual["Config"]:
+                service["logging"]["options"] = actual["Config"]
         result["services"][name] = service
     return result
 
@@ -522,6 +773,7 @@ def effective_healthcheck(desired: dict, image: dict) -> dict:
 
 
 def require_matching_command_environment(config: dict, records: dict, image_configs: dict) -> None:
+    require_native_runtime_settings(records)
     for name in TARGETS:
         desired = config["services"][name]
         actual = records[name]["Config"]
@@ -547,6 +799,11 @@ def require_matching_command_environment(config: dict, records: dict, image_conf
                 or actual.get("Hostname") != records[name]["Id"][:12]
                 or records[name]["HostConfig"]["RestartPolicy"] != {"Name": desired.get("restart", "no"), "MaximumRetryCount": 0}):
             raise Refused("Database execution settings differ from the pinned image/Compose")
+        exposed = copy.deepcopy(image.get("ExposedPorts") or {})
+        exposed.update({key: {} for key in port_bindings(desired)})
+        if ((actual.get("ExposedPorts") or {}) != exposed
+                or actual.get("Volumes") != image.get("Volumes")):
+            raise Refused("Database image port/volume metadata drift would change more than logging")
         if canonical_healthcheck(actual.get("Healthcheck")) != effective_healthcheck(desired, image):
             raise Refused("Database declared/inherited health-check drift would change more than logging")
         labels = non_compose_labels(image.get("Labels"))
@@ -643,8 +900,10 @@ def reconcile(repo: Path, *, apply=False, owner="", ack="", backup_manifest: Pat
         _, _, drift = plan(repo)
         if drift:
             raise Refused("Runtime log rotation drift: " + ", ".join(drift)
-                          + "; no changes made; arrange separate approved PostgreSQL/Redis maintenance")
-        print("CHECK PASS: all five actual containers use json-file 50m x 5; no changes made")
+                          + "; no changes made; arrange separate approved PostgreSQL/Redis maintenance; "
+                            "daemon-default creation probe is apply-only and was not run")
+        print("CHECK PASS: all five actual containers use json-file 50m x 5; no changes made; "
+              "daemon-default creation probe is apply-only and was not run")
         return None
     require_apply_authority(repo, ack, backup_manifest)
     require_gate(owner)
@@ -667,12 +926,7 @@ def reconcile(repo: Path, *, apply=False, owner="", ack="", backup_manifest: Pat
         pg_before = postgres_snapshot(repo, records["postgres"]["Id"])
         redis_before = redis_snapshot(repo, records["redis"])
         backup = verify_backup(repo, backup_manifest, records, pg_before)
-        images = {}
-        for name in TARGETS:
-            image = json.loads(command(repo, ["docker", "image", "inspect", records[name]["Image"]]))
-            if len(image) != 1 or image[0].get("Id") != records[name]["Image"]:
-                raise Refused("Exact database image is unavailable locally; no pull is allowed")
-            images[name] = image[0]
+        images = database_images(repo, records)
         require_matching_command_environment(config, records, images)
         candidate = pinned_compose(config, records, rollback=False)
         rollback = pinned_compose(config, records, rollback=True)
@@ -688,23 +942,29 @@ def reconcile(repo: Path, *, apply=False, owner="", ack="", backup_manifest: Pat
             write_json(audit / filename, value)
         write_json(audit / "recovery.json", {
             "maintenanceOwner": owner, "maintenanceMustRemainActive": True, "backendMustRemainStopped": True,
-            "configurationRollbackOnly": ["docker", "compose", "--project-name", PROJECT, "-f",
-                str(audit / "rollback.compose.json"), "up", "-d", "--no-deps", "--no-build", "--pull", "never",
-                "--force-recreate", *drift],
+            "configurationRollbackOnly": [*pinned_compose_command(audit / "rollback.compose.json"),
+                "up", "-d", "--no-deps", "--no-build", "--pull", "never", "--force-recreate", *drift],
+            "requiredNativeEngine": NATIVE_ENGINE, "requiredNativeCompose": NATIVE_COMPOSE,
             "warning": "Operator must verify current pinned images, mounts and data before configuration rollback. "
                        "Never restore database data automatically. Never start backend here: entrypoint runs migrations.",
         })
         sync_directory(audit)
         sync_directory(audit_root)
         print(f"Protected runtime/rollback audit: {audit}", flush=True)
-        rendered_candidate = decode_compose_export(command(repo, ["docker", "compose", "--project-name", PROJECT,
-            "-f", str(audit / "candidate.compose.json"), "config", "--format", "json"]))
+        rendered_candidate = decode_compose_export(command(repo, [*pinned_compose_command(audit / "candidate.compose.json"),
+            "config", "--format", "json"]))
         if rendered_candidate != candidate:
             raise Refused("Candidate Compose export/source roundtrip changed the effective configuration")
         require_matching_command_environment(rendered_candidate, records, images)
         validate_database_mounts(rendered_candidate, records)
         if any(rendered_candidate["services"][name]["image"] != records[name]["Image"] for name in TARGETS):
             raise Refused("Candidate Compose interpolation changed a pinned database image")
+        rendered_rollback = decode_compose_export(command(repo, [*pinned_compose_command(audit / "rollback.compose.json"),
+            "config", "--format", "json"]))
+        if rendered_rollback != rollback:
+            raise Refused("Rollback Compose export/source roundtrip changed the effective configuration")
+        require_matching_command_environment(rendered_rollback, records, images)
+        validate_database_mounts(rendered_rollback, records)
         # The fresh snapshot closes the gap after backup verification and local
         # image validation. Shared locks cannot prevent arbitrary docker commands.
         fresh_config, fresh_records, fresh_drift = plan(repo)
@@ -712,14 +972,22 @@ def reconcile(repo: Path, *, apply=False, owner="", ack="", backup_manifest: Pat
                 or stable_runtime(fresh_records) != stable_runtime(records)):
             raise Refused("Compose or containers changed during preflight; nothing recreated")
         try:
+            # Live container config can predate daemon-default changes. Both
+            # isolated never-started probes must pass and be cleaned before any
+            # production database recreation is attempted.
+            probe_native_daemon(repo, audit, records, owner)
             for name in drift:
                 require_gate(owner)
                 current = inspect_owned(repo)
                 if (current["backend"]["State"].get("Status") != "exited"
                         or current["backend"]["State"].get("ExitCode") != 0):
                     raise Refused("Backend was restarted during maintenance; further replacement refused")
-                command(repo, ["docker", "compose", "--project-name", PROJECT, "-f",
-                    str(audit / "candidate.compose.json"), "up", "-d", "--no-deps", "--no-build", "--pull", "never",
+                require_matching_command_environment(config, current, images)
+                if (current[name]["Id"] != records[name]["Id"]
+                        or preserved_config(current[name]) != preserved_config(records[name])):
+                    raise Refused("Database configuration changed immediately before replacement; nothing further recreated")
+                command(repo, [*pinned_compose_command(audit / "candidate.compose.json"),
+                    "up", "-d", "--no-deps", "--no-build", "--pull", "never",
                     "--force-recreate", "--wait", "--wait-timeout", "120", name], timeout=150)
                 after = inspect_owned(repo)
                 validate_storage_and_ports(config, after)
@@ -749,11 +1017,13 @@ def reconcile(repo: Path, *, apply=False, owner="", ack="", backup_manifest: Pat
         except Exception:
             if (audit / "success.json").exists():
                 os.replace(audit / "success.json", audit / "success.invalid.json")
-            write_json(audit / "failure.json", {"maintenanceLeftActive": True, "backendStarted": False,
+            write_json(audit / "failure.json", {"maintenanceRemovalAttempted": False, "maintenanceStatusUnconfirmed": True,
+                       "backendStartAttempted": False, "backendStatusUnconfirmed": True,
                        "automaticDataOrConfigurationRestore": False, "requiresOperatorReview": True})
             sync_directory(audit)
             sync_directory(audit_root)
-            print(f"FAILED CLOSED: maintenance remains active; backend not started. Review {audit}/recovery.json", file=sys.stderr)
+            print("FAILED CLOSED: no maintenance removal or backend start was attempted; "
+                  f"maintenance/backend status is unconfirmed. Review {audit}/recovery.json", file=sys.stderr)
             raise
         print("RECONCILED PostgreSQL/Redis logging only; pinned images, volumes and data verified. "
               "Backend remains stopped; maintenance remains active. No migrations or data restore run.")

@@ -43,6 +43,42 @@ application images have been deployed.
    rollback must pass equivalent readiness checks. An unverified failure keeps
    maintenance active for explicit recovery.
 
+### Immutable application rollback
+
+A Git-based tag is not an immutable image identity: rebuilding the same commit
+changes the build timestamp and can replace the last-good tag with a new image.
+Rollback must select the recorded local image ID or exact repository digest for
+**both** applications, not the current contents of that tag. The stored Git SHA
+must agree with both images' OCI revision labels. Runtime `WOTCV_GIT_SHA` and
+`WOTCV_IMAGE_DIGEST` are reporting metadata, not evidence of the running image.
+
+Before a build/pull can replace a tag, the updater resolves both recorded
+last-good artifacts and creates verified, operation-specific retention aliases
+in their original repositories. This also keeps the old index reachable in the
+containerd image store when a same-commit rebuild moves its original tag; see
+[Compose's documented image-store behavior](https://github.com/docker/compose/blob/v5.6.1/pkg/compose/images.go#L84).
+These aliases retain content, but do not replace immutable identities in the
+selection/attestation path. They remain after any failed forward deployment,
+including a successful rollback. Only a fully successful forward deployment may
+release aliases created by that operation, after rechecking their exact IDs.
+
+Before an application-only rollback starts anything, it validates those image
+identities and Better Auth compatibility, confirms that application workers are
+quiescent, creates the replacement containers without starting them, and checks
+their actual image IDs. It repeats the running-image identity check before
+reopening traffic. Missing/unknown last-good identities require explicit
+operator recovery, never a fallback to a mutable tag or the newest image.
+
+A failed candidate with a nonzero exit code may be replaced by this
+application-only recovery once there are no running, restarting or paused
+application workers. This does **not** relax the clean-exit requirement before
+PostgreSQL/Redis backups, logging repair or shared-infrastructure changes.
+
+If removal of the maintenance flag encounters an I/O/durability error, the tool
+must report its observed state rather than claim that maintenance is definitely
+still active. Preserve the owner token and inspect status and the origin before
+any recovery. Do not blindly remove a flag or adopt another operation's owner.
+
 Repository guidance forbids the agent from running database migration scripts.
 The implementation preserves the existing operator-run deployment step; tests
 fake deployment commands. Agent validation must not execute a real updater.
@@ -121,6 +157,15 @@ snapshot are hashed and checked with native tools from the exact existing local
 images. Verification helpers have no network, no writable filesystem, no
 capabilities and no database startup entrypoint. Backup output is size/time
 bounded. This is native archive verification, **not a full restore rehearsal**.
+Failed publication invalidates the normal manifest path and synchronizes both
+the failure marker/rename directory and its parent. If these invalidation
+barriers also fail, the tool explicitly reports uncertain durability and does
+not print a verified manifest. Do not use files from that attempt.
+Failure evidence describes actions taken by the tool, not an unverified live
+state: neither backup nor reconciliation removes maintenance or starts backend.
+If the operation fails, its gate status is marked unconfirmed and must be
+checked by the operator; a failed gate verification must never be reported as
+proof that maintenance is still active.
 
 Use the printed path, not a guessed path or a previous cutover's backup:
 
@@ -139,6 +184,34 @@ restores database data, runs migrations, starts the backend, or opens maintenanc
 Original runtime and a pinned configuration-only rollback plan are retained in
 the printed root-private audit directory. An invariant failure stops immediately
 and requires operator review, not automatic restoration over current data.
+
+Candidate execution and the archived configuration-recovery command use an
+isolated environment and explicitly disable orphan removal. A checkout's
+`.env`, inherited `COMPOSE_*`/Docker controls, or a user's Docker context must not
+expand the operation beyond the selected PostgreSQL/Redis services. In
+particular, a model containing just those two services must never delete
+backend, client or ClickHouse as orphans. Compose reads this option separately
+from the service model; see its [up implementation](https://github.com/docker/compose/blob/v5.6.1/cmd/compose/up.go#L116).
+
+The preflight also rejects unrepresented live resource/security/execution drift
+**before** database recreation. A memory limit, shared-memory override, capability,
+security option or unknown effective runtime field must not be overwritten and
+only discovered afterward. This is a narrow repair for the inspected native
+Docker/Compose profile, not a general-purpose container configuration migrator.
+An unsupported daemon version/profile or additional configuration requires a
+separate review; do not work around the refusal by removing the check or raising
+limits. Resource limits are not increased by this repair.
+
+The bounded profile reviewed here is Docker Engine `29.9.2`, Linux `amd64`, and
+Compose `5.6.1`. Version matching alone does not establish that daemon defaults
+have not changed since the current databases were created. The acknowledged
+apply operation therefore additionally checks isolated **never-started** probe
+containers from the exact existing images before replacing a database. Probes
+have no network, published port, bind mount or production volume; tmpfs masks
+the image's data path. Only helpers whose unique label, name, immutable image,
+ID, mounts and stopped state are proven may be removed. Read-only `--check`
+does not create these probes. This is not a proof of every effective kernel
+security-policy behavior after process startup.
 
 The preflight compares effective runtime values, not just the JSON's spelling.
 Compose `command: null` / `entrypoint: null` inherit image defaults; empty

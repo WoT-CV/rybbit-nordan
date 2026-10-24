@@ -28,10 +28,13 @@ wotcv_maintenance_control() {
   printf 'maintenance %s\n' "$*" >>"$TRACE"
   [[ "$CASE" != "maintenance_$1" ]] || return 19
   case "$1" in
-    status) printf '%s\n' "$MAINTENANCE_STATE" ;;
+    status)
+      if [[ "$CASE" == partial_status_error ]]; then printf 'inactive\n'; return 19; fi
+      if [[ -f "$GATE_ENTERED" ]]; then printf 'active\n'; else printf '%s\n' "$MAINTENANCE_STATE"; fi ;;
     enter)
-      [[ "$CASE" != wrong_owner || "${*: -1}" == gate-real-owner ]] ;;
-    leave) return 0 ;;
+      [[ "$CASE" != wrong_owner || "${*: -1}" == gate-real-owner ]] || return 19
+      touch "$GATE_ENTERED" ;;
+    leave) rm -f -- "$GATE_ENTERED" ;;
     *) return 99 ;;
   esac
 }
@@ -40,7 +43,7 @@ mock_compose() {
   case "$1" in
     ps) printf '%s\n' "$CONTAINER"; [[ "$CASE" != ps_error ]] ;;
     config) printf '%s %s\n' "${*: -1}" "$DESIRED_HASH"; [[ "$CASE" != hash_error ]] ;;
-    stop) [[ "$CASE" != stop_error ]] ;;
+    stop) [[ "$CASE" != stop_error ]] || return 19; touch "$QUIESCED" ;;
     pull) touch "$PULLED" ;;
     up) [[ "$CASE" != up_error ]] ;;
     *) printf 'Unexpected compose: %s\n' "$*" >&2; return 99 ;;
@@ -57,6 +60,9 @@ docker() {
       if [[ "$*" == *'ExitCode'* ]]; then
         printf '%s\n' "$STOPPED"
         [[ "$CASE" != stopped_inspect_error ]] || return 11
+      elif [[ "$*" == *'State.Restarting'* ]]; then
+        if [[ -f "$QUIESCED" ]]; then printf '%s\n' "$QUIESCENCE_STOPPED";
+        else printf '%s\n' "$QUIESCENCE_INITIAL"; fi
       elif [[ "$*" == *'State.Running'* ]]; then printf '%s\n' "$RUNNING";
       elif [[ "${*: -1}" == '{{.State.Status}}' ]]; then printf '%s\n' "$STATE";
       elif [[ "${*: -1}" == *'.State.Health'* ]]; then printf '%s\n' "$HEALTH";
@@ -87,6 +93,7 @@ case "$ACTION" in
   digests) if wotcv_service_config_digests "$2" clickhouse; then :; else exit 42; fi ;;
   prepare) if wotcv_prepare_infrastructure_image clickhouse "$2"; then :; else exit 42; fi ;;
   drain) if wotcv_drain_backend; then :; else exit 42; fi ;;
+  quiesce) if wotcv_quiesce_applications; then :; else exit 42; fi ;;
   client) if wotcv_wait_for_client; then :; else exit 42; fi ;;
   gate)
     if ! wotcv_require_maintenance_gate; then exit 42; fi
@@ -97,6 +104,10 @@ case "$ACTION" in
     if ! wotcv_leave_maintenance || ! wotcv_leave_maintenance; then
       wotcv_maintenance_failure_notice; exit 42
     fi ;;
+  notice)
+    WOTCV_MAINTENANCE_STARTED=1
+    wotcv_maintenance_failure_notice
+    exit 42 ;;
   apply)
     WOTCV_MAINTENANCE_STARTED="$APPLY_MAINTENANCE"
     if wotcv_apply_infrastructure_change clickhouse "$REQUIRED"; then :; else exit 42; fi ;;
@@ -136,6 +147,8 @@ class AvailabilityTests(unittest.TestCase):
                 "MOUNTED_DIGEST": DIGEST, "RUNNING": "true", "STOPPED": "false 0",
                 "HEALTH": "healthy", "MAINTENANCE_STATE": "inactive", "APPLY_MAINTENANCE": "1", "REQUIRED": "1",
                 "TRACE": (path / "trace").as_posix(), "PULLED": (path / "pulled").as_posix(),
+                "QUIESCED": (path / "quiesced").as_posix(), "GATE_ENTERED": (path / "gate-entered").as_posix(),
+                "QUIESCENCE_INITIAL": "true false false running", "QUIESCENCE_STOPPED": "false false false exited",
                 "HTTP_COUNT": (path / "http-count").as_posix(), "HTTP_FAILURE": "503",
                 "HTTP_SUCCESS": "200", "HTTP_READY_AT": "1", "WOTCV_HEALTHCHECK_ATTEMPTS": "3",
                 **overrides,
@@ -313,6 +326,39 @@ class AvailabilityTests(unittest.TestCase):
         self.assertNotIn("compose stop", trace)
         self.assertNotIn("compose up", trace)
 
+    def test_app_only_quiescence_allows_stopped_failed_candidates_without_relaxing_strict_drain(self):
+        result, trace = self.run_case(ACTION="quiesce", QUIESCENCE_INITIAL="false false false exited", STOPPED="false 1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("compose stop", trace)
+        self.assertNotIn("ExitCode", trace)
+        self.assertEqual(trace.count(".State.Restarting"), 2)
+        result, trace = self.run_case(ACTION="drain", RUNNING="false", STOPPED="false 1")
+        self.assertEqual(result.returncode, 42, result.stderr)
+        self.assertNotIn("compose up", trace)
+
+    def test_app_only_quiescence_stops_and_verifies_both_applications(self):
+        result, trace = self.run_case(ACTION="quiesce")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # This fixture shares one stopped flag; the second service is already
+        # quiescent when checked. Both still get their own inspected snapshots.
+        self.assertIn("compose stop --timeout 60 backend", trace)
+        self.assertIn("compose ps -a -q client", trace)
+        self.assertEqual(trace.count(".State.Restarting"), 3)
+
+    def test_app_only_quiescence_rejects_running_restarting_paused_or_uncertain_workers(self):
+        for changes in (
+            {"QUIESCENCE_STOPPED": "true false false running"},
+            {"QUIESCENCE_STOPPED": "false true false restarting"},
+            {"QUIESCENCE_STOPPED": "false false true paused"},
+            {"QUIESCENCE_STOPPED": "false false false unknown"},
+            {"CASE": "stop_error"}, {"CASE": "inspect_error"},
+            {"CONTAINER": "one\ntwo"},
+        ):
+            with self.subTest(changes=changes):
+                result, trace = self.run_case(ACTION="quiesce", **changes)
+                self.assertEqual(result.returncode, 42, result.stderr)
+                self.assertNotIn("compose up", trace)
+
     def test_frontend_requires_exact_200_and_retries_transient_failures(self):
         for failure in ("000", "301", "302", "404", "500", "503"):
             with self.subTest(status=failure):
@@ -363,7 +409,7 @@ class AvailabilityTests(unittest.TestCase):
                 if case != "maintenance_leave":
                     self.assertNotIn("maintenance leave", trace)
                 if case != "maintenance_enter":
-                    self.assertIn("Maintenance remains enabled", result.stderr)
+                    self.assertIn("Maintenance flag is verified active", result.stderr)
 
     def test_active_gate_can_only_resume_with_its_explicit_verified_owner(self):
         result, trace = self.run_case(
@@ -399,8 +445,23 @@ class AvailabilityTests(unittest.TestCase):
             CASE="after_enter_error",
         )
         self.assertEqual(result.returncode, 42, result.stderr)
-        self.assertIn("Maintenance remains enabled (owner=gate-real-owner)", result.stderr)
+        self.assertIn("Maintenance flag is verified active (operation-owner=gate-real-owner; current flag ownership is not attested)", result.stderr)
         self.assertNotIn("maintenance leave", trace)
+
+    def test_failure_notice_reports_observed_marker_state_and_never_trusts_partial_error_output(self):
+        for changes, expected in (
+            ({"MAINTENANCE_STATE": "active"}, "flag is verified active"),
+            ({"MAINTENANCE_STATE": "inactive"}, "traffic may already be open"),
+            ({"MAINTENANCE_STATE": "unknown"}, "do not assume traffic is gated"),
+            ({"CASE": "maintenance_status"}, "do not assume traffic is gated"),
+            ({"CASE": "partial_status_error"}, "do not assume traffic is gated"),
+        ):
+            with self.subTest(changes=changes):
+                result, trace = self.run_case(ACTION="notice", **changes)
+                self.assertEqual(result.returncode, 42, result.stderr)
+                self.assertIn(expected, result.stderr)
+                self.assertNotIn("remains enabled", result.stderr)
+                self.assertEqual(trace, "maintenance status\n")
 
     def test_changed_shared_infrastructure_requires_gate_and_verified_clean_drain(self):
         result, trace = self.run_case(ACTION="apply")

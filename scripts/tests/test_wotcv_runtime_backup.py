@@ -86,12 +86,19 @@ class BackupTests(unittest.TestCase):
     def test_late_directory_sync_failure_invalidates_published_manifest(self):
         self.backup_flow(fail_verification=False, fail_publication=True)
 
+    def test_invalidation_barrier_failure_does_not_claim_backup_or_durable_invalidation(self):
+        self.backup_flow(fail_verification=False, fail_publication=True, fail_invalidation=True)
+
+    def test_lost_gate_invalidates_backup_without_claiming_maintenance_is_active(self):
+        self.backup_flow(fail_verification=False, fail_gate=True)
+
     def test_new_backup_root_parent_sync_failure_prevents_native_backups(self):
         for existing in (False, True):
             with self.subTest(existing=existing):
                 self.backup_flow(fail_verification=False, fail_parent=True, existing_root=existing)
 
-    def backup_flow(self, *, fail_verification, fail_publication=False, fail_parent=False, existing_root=False):
+    def backup_flow(self, *, fail_verification, fail_publication=False, fail_parent=False,
+                    existing_root=False, fail_invalidation=False, fail_gate=False):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             if existing_root:
@@ -111,17 +118,23 @@ class BackupTests(unittest.TestCase):
                 if fail_verification:
                     raise RUNTIME.Refused("native verification failure")
                 return path.read_bytes()
+            sync_events = []
             def sync_directory(path, **kwargs):
+                sync_events.append((path, (path / "manifest.json").exists(),
+                                    (path / "failed.json").exists(), (path / "manifest.invalid.json").exists()))
                 if fail_parent and path == root:
                     self.assertIs(kwargs.get("private"), False)
                     raise OSError("fixture parent sync failure")
                 if fail_publication and (path / "manifest.json").exists():
                     raise OSError("fixture fsync failure")
+                if fail_invalidation and (path / "failed.json").exists():
+                    raise OSError("fixture invalidation fsync failure")
             with patch.object(BACKUP, "require_root"), \
                     patch.object(BACKUP.os, "O_NOFOLLOW", 0, create=True), \
                     patch.object(RUNTIME, "uid", return_value=root.stat().st_uid), \
                     patch.object(RUNTIME, "lock_file", side_effect=lambda *args: nullcontext()), \
-                    patch.object(BACKUP, "preflight", return_value=({}, records)), \
+                    patch.object(BACKUP, "preflight", side_effect=[({}, records), RUNTIME.Refused("gate unconfirmed")]
+                                 if fail_gate else None, return_value=({}, records)), \
                     patch.object(RUNTIME, "postgres_snapshot", return_value=pg), \
                     patch.object(RUNTIME, "redis_snapshot", return_value={}), \
                     patch.object(RUNTIME, "protected_directory") as protected, \
@@ -133,22 +146,40 @@ class BackupTests(unittest.TestCase):
                     patch.object(BACKUP, "stream_artifact", side_effect=write_artifact) as stream, \
                     patch.object(BACKUP, "native_verify") as native, \
                     patch.object(BACKUP.shutil, "disk_usage", return_value=type("Disk", (), {"free": 4 * 1024**3})()), \
-                    patch("builtins.print"):
+                    patch("builtins.print") as output:
                 if fail_parent:
                     with self.assertRaisesRegex(OSError, "parent sync failure"):
                         BACKUP.create(root, owner="mine", apply=True, backup_root=root / "backups")
                     stream.assert_not_called()
                     native.assert_not_called()
                     self.assertEqual(list((root / "backups").iterdir()), [])
-                elif fail_verification or fail_publication:
+                elif fail_verification or fail_publication or fail_gate:
                     error = OSError if fail_publication else RUNTIME.Refused
-                    with self.assertRaisesRegex(error, "fsync failure" if fail_publication else "verification failure"):
+                    expected = "invalidation fsync failure" if fail_invalidation else (
+                        "fsync failure" if fail_publication else "gate unconfirmed" if fail_gate else "verification failure")
+                    with self.assertRaisesRegex(error, expected):
                         BACKUP.create(root, owner="mine", apply=True, backup_root=root / "backups")
                     directory = next((root / "backups").iterdir())
                     self.assertTrue((directory / "failed.json").exists())
+                    failure = json.loads((directory / "failed.json").read_text())
+                    self.assertNotIn("maintenanceLeftActive", failure)
+                    self.assertIs(failure["maintenanceRemovalAttempted"], False)
+                    self.assertIs(failure["maintenanceStatusUnconfirmed"], True)
+                    self.assertIs(failure["noDataRestoreOrBackendStart"], True)
                     self.assertFalse((directory / "manifest.json").exists())
                     if fail_publication:
                         self.assertTrue((directory / "manifest.invalid.json").exists())
+                    if fail_invalidation:
+                        self.assertEqual(sync_events[-1], (directory, False, True, True))
+                        self.assertTrue(any("durable invalidation is unconfirmed" in str(call)
+                                            for call in output.call_args_list))
+                        self.assertFalse(any("invalidation directory-synced" in str(call)
+                                             for call in output.call_args_list))
+                    else:
+                        self.assertEqual(sync_events[-2], (directory, False, True, fail_publication))
+                        self.assertEqual(sync_events[-1][0], root / "backups")
+                    self.assertFalse(any("VERIFIED native backup manifest" in str(call)
+                                         for call in output.call_args_list))
                 else:
                     manifest = BACKUP.create(root, owner="mine", apply=True, backup_root=root / "backups")
                     value = json.loads(manifest.read_text())

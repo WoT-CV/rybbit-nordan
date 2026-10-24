@@ -144,12 +144,22 @@ def create(repo: Path, *, owner: str, apply=False, backup_root=ROOT):
             # Publication is not successful until its directory entries have
             # been synced. Never leave the normal consumer path usable after
             # a late fsync failure, even when the rename already succeeded.
-            published = directory / "manifest.json"
-            if published.exists():
-                os.replace(published, directory / "manifest.invalid.json")
-            RUNTIME.write_json(directory / "failed.json", {"usableBackupManifest": False,
-                               "maintenanceLeftActive": True, "noDataRestoreOrBackendStart": True})
-            print("BACKUP FAILED: files remain private; do not use them for logging reconciliation", file=sys.stderr)
+            try:
+                published = directory / "manifest.json"
+                if published.exists():
+                    os.replace(published, directory / "manifest.invalid.json")
+                RUNTIME.write_json(directory / "failed.json", {"usableBackupManifest": False,
+                                   "maintenanceRemovalAttempted": False, "maintenanceStatusUnconfirmed": True,
+                                   "noDataRestoreOrBackendStart": True})
+                # The invalidation entries need their own durability barriers:
+                # file fsync alone cannot make the rename/failed marker survive
+                # a crash after the unsuccessful publication barrier.
+                RUNTIME.sync_directory(directory)
+                RUNTIME.sync_directory(backup_root)
+            except BaseException:
+                print("BACKUP FAILED: durable invalidation is unconfirmed; do not use any files from this attempt", file=sys.stderr)
+                raise
+            print("BACKUP FAILED: invalidation directory-synced; files remain private and unusable for logging reconciliation", file=sys.stderr)
             raise
         print(f"VERIFIED native backup manifest: {manifest}")
         print("Native archive checks passed; this is not a full restore drill. Backend remains stopped; maintenance active.")

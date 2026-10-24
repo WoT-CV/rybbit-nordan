@@ -164,6 +164,15 @@ class AuthCutoverTests(unittest.TestCase):
         self.assertEqual(result.returncode, 42, result.stderr)
 
     def test_both_deploy_entrypoints_wire_cutover_before_migration(self):
+        availability = (ROOT / "scripts/lib/wotcv-deployment-availability.sh").read_text()
+        restore = availability[availability.index("wotcv_restore_recorded_applications() ("):
+                               availability.index("\nwotcv_service_image()")]
+        self.assertLess(restore.index("wotcv_auth_assert_rollback_safe"),
+                        restore.index("wotcv_quiesce_applications"))
+        self.assertLess(restore.index("wotcv_auth_assert_rollback_safe"),
+                        restore.index("up --no-start"))
+        self.assertLess(restore.index("wotcv_assert_application_images"),
+                        restore.index("docker start"))
         for name in ("wotcv-branch-build-deploy.sh", "wotcv-deploy.sh"):
             with self.subTest(name=name):
                 script = (ROOT / "scripts" / name).read_text()
@@ -173,8 +182,8 @@ class AuthCutoverTests(unittest.TestCase):
                 self.assertLess(prepare, migrate)
                 self.assertIn('wotcv_auth_schema_state "$(' , script[migrate:])
                 rollback = script[script.index("rollback() {"):script.index("PREVIOUS_TAG=")]
-                self.assertLess(rollback.index("wotcv_auth_assert_rollback_safe"),
-                                rollback.index("up -d --no-deps --force-recreate backend client"))
+                self.assertLess(rollback.index("wotcv_restore_recorded_applications"),
+                                rollback.index("wotcv_wait_for_health"))
 
 
 if __name__ == "__main__":

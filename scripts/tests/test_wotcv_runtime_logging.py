@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -170,10 +171,12 @@ def fixture():
                    "networks": {"default": None}}
         record["Config"].update({"Env": ["TEST=do-not-print-this"], "Cmd": [name], "Entrypoint": ["entrypoint"],
                                  "User": "", "WorkingDir": "", "Hostname": record["Id"][:12], "Image": name + ":fixed"})
+        record["Config"].update(copy.deepcopy(REPAIR.NATIVE_ATTACH_CONFIG))
         record["State"].update({"StartedAt": "2026-01-01T00:00:00Z", "FinishedAt": "0001-01-01T00:00:00Z"})
         record["RestartCount"] = 0
         record["HostConfig"].update({"PortBindings": {}, "NetworkMode": "rybbit_default",
                                    "RestartPolicy": {"Name": "unless-stopped", "MaximumRetryCount": 0}})
+        record["HostConfig"].update(copy.deepcopy(REPAIR.NATIVE_HOST_CONFIG))
         record["Mounts"] = []
         record["NetworkSettings"] = {"Networks": {"rybbit_default": {
             "NetworkID": "network1", "Aliases": [name, name], "IPAMConfig": None, "IPAddress": "172.1.0.1"}}}
@@ -191,6 +194,106 @@ def fixture():
     return config, records
 
 
+def images_for(records):
+    fields = ("Env", "Cmd", "Entrypoint", "User", "WorkingDir", "ExposedPorts", "Volumes", "StopSignal")
+    return {name: {"Id": records[name]["Image"], "Config": {
+        key: copy.deepcopy(records[name]["Config"].get(key)) for key in fields}}
+        for name in REPAIR.TARGETS}
+
+
+def read_only_response(config, records, args):
+    if args[:2] == ["docker", "version"]:
+        return (REPAIR.NATIVE_ENGINE + "\n").encode()
+    if args == ["docker", "compose", "version", "--short"]:
+        return (REPAIR.NATIVE_COMPOSE + "\n").encode()
+    if args[:3] == ["docker", "image", "inspect"]:
+        images = images_for(records)
+        image = next(image for image in images.values() if image["Id"] == args[3])
+        return json.dumps([image]).encode()
+    return json.dumps(config if "config" in args else list(records.values())).encode()
+
+
+class ProbeDockerFixture:
+    """Only implements never-started helper create/inspect/list/remove calls."""
+
+    def __init__(self, events=None):
+        self.helpers = {}
+        self.calls = []
+        self.events = events if events is not None else []
+        self.poison = lambda record: None
+        self.inspect_hook = lambda record, count: None
+        self.inspect_count = 0
+        self.create_failure = None
+        self.lookup_failure = self.remove_failure = False
+
+    def command(self, args):
+        operation = args[args.index("docker"):] if args[:2] == ["/usr/bin/env", "-i"] and "docker" in args else args
+        if operation[:2] == ["docker", "create"]:
+            self.calls.append(args)
+            if self.create_failure == "before":
+                raise REPAIR.Refused("Synthetic create failure")
+            name = operation[operation.index("--name") + 1]
+            service = name.rsplit("-", 1)[1]
+            identifier = "e" * 63 + ("1" if service == "postgres" else "2")
+            label = operation[operation.index("--label") + 1].split("=", 1)
+            target = operation[operation.index("--mount") + 1].split("dst=", 1)[1]
+            host = copy.deepcopy(REPAIR.NATIVE_HOST_CONFIG)
+            host.update(copy.deepcopy(REPAIR.PROBE_NATIVE_SPELLINGS))
+            host.update(NetworkMode="none", RestartPolicy={"Name": "no", "MaximumRetryCount": 0},
+                        Binds=None, PortBindings=None, Mounts=[{"Type": "tmpfs", "Target": target}],
+                        LogConfig={"Type": "json-file", "Config": {}})
+            record = {"Id": identifier, "Name": "/" + name, "Image": operation[-1],
+                      "Config": dict(copy.deepcopy(REPAIR.NATIVE_ATTACH_CONFIG), Image=operation[-1],
+                                     Labels={label[0]: label[1]}, Entrypoint=["/bin/true"]),
+                      "HostConfig": host, "AppArmorProfile": "",
+                      "State": {"Status": "created", "Running": False},
+                      "NetworkSettings": {"Networks": {"none": {}}},
+                      "Mounts": [{"Type": "tmpfs", "Source": "", "Destination": target,
+                                  "Mode": "", "RW": True, "Propagation": ""}]}
+            self.poison(record)
+            self.helpers[identifier] = record
+            self.events.append(("probe-create", service))
+            if self.create_failure == "after":
+                raise REPAIR.Refused("Synthetic create response failure")
+            return b"not-an-id\n" if self.create_failure == "response" else (identifier + "\n").encode()
+        if operation[:2] == ["docker", "inspect"] and len(operation) == 3 and operation[2] in self.helpers:
+            self.calls.append(args)
+            record = self.helpers[operation[2]]
+            self.inspect_count += 1
+            self.inspect_hook(record, self.inspect_count)
+            return json.dumps([record]).encode()
+        if operation[:2] == ["docker", "ps"]:
+            self.calls.append(args)
+            if self.lookup_failure:
+                raise REPAIR.Refused("Synthetic helper lookup failure")
+            filters = [operation[index + 1] for index, value in enumerate(operation) if value == "--filter"]
+            found = []
+            for identifier, record in self.helpers.items():
+                matches = True
+                for item in filters:
+                    key, value = item.split("=", 1)
+                    if key == "id":
+                        matches &= identifier == value
+                    elif key == "name":
+                        matches &= record["Name"] == "/" + value
+                    elif key == "label":
+                        label, expected = value.split("=", 1)
+                        matches &= record["Config"]["Labels"].get(label) == expected
+                if matches:
+                    found.append(identifier)
+            return "\n".join(found).encode()
+        if operation[:2] == ["docker", "rm"]:
+            self.calls.append(args)
+            if self.remove_failure:
+                raise REPAIR.Refused("Synthetic helper removal failure")
+            if len(operation) != 3 or operation[2] not in self.helpers:
+                raise AssertionError("Only an exact owned fixture helper ID may be removed")
+            record = self.helpers.pop(operation[2])
+            self.events.append(("probe-remove", record["Name"].rsplit("-", 1)[1]))
+            return (operation[2] + "\n").encode()
+        return None
+
+
 class RepairReadOnlyTests(unittest.TestCase):
     def test_default_check_only_renders_and_inspects_and_reports_live_drift(self):
         config, records = fixture()
@@ -198,16 +301,17 @@ class RepairReadOnlyTests(unittest.TestCase):
 
         def command(repo, args, **kwargs):
             calls.append(args)
-            return json.dumps(config if "config" in args else list(records.values())).encode()
+            return read_only_response(config, records, args)
 
         with tempfile.TemporaryDirectory() as directory, patch.object(REPAIR, "command", side_effect=command), \
                 patch.object(REPAIR, "lock_file", side_effect=AssertionError("check must not create locks")), \
                 patch.object(REPAIR, "write_json", side_effect=AssertionError("check must not write files")):
             with self.assertRaisesRegex(REPAIR.Refused, "postgres, redis"):
                 REPAIR.reconcile(Path(directory))
-            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(calls), 6)
             self.assertIn("config", calls[0])
             self.assertEqual(calls[1], ["docker", "inspect", *SERVICES])
+            self.assertTrue(all("up" not in call and "create" not in call for call in calls))
             self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_check_passes_correct_hostconfig_and_can_audit_stopped_backend(self):
@@ -216,7 +320,7 @@ class RepairReadOnlyTests(unittest.TestCase):
             record["HostConfig"]["LogConfig"] = copy.deepcopy(EXPECTED_RUNTIME_LOGGING)
         records["backend"]["State"].update({"Status": "exited", "Running": False})
         with tempfile.TemporaryDirectory() as directory, patch.object(REPAIR, "command", side_effect=lambda _, args, **kw:
-                json.dumps(config if "config" in args else list(records.values())).encode()):
+                read_only_response(config, records, args)):
             self.assertIsNone(REPAIR.reconcile(Path(directory)))
 
     def test_no_root_apply_fails_before_any_docker_or_gate_action(self):
@@ -240,12 +344,301 @@ class RepairReadOnlyTests(unittest.TestCase):
             with self.subTest(kind=kind), self.assertRaises((ValueError, REPAIR.Refused)):
                 REPAIR.validate_storage_and_ports(config, records)
 
+    def test_check_rejects_unsupported_resource_or_execution_drift_without_stopping_backend_or_writes(self):
+        for section, field, value in (("HostConfig", "Memory", 536870912),
+                                      ("HostConfig", "ShmSize", 1073741824),
+                                      ("Config", "Tty", True)):
+            config, records = fixture()
+            records["postgres"][section][field] = value
+            with self.subTest(section=section, field=field), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(REPAIR, "command", side_effect=lambda _, args, **kw: read_only_response(config, records, args)) as docker, \
+                    patch.object(REPAIR, "lock_file", side_effect=AssertionError("check must not lock")), \
+                    patch.object(REPAIR, "write_json", side_effect=AssertionError("check must not write")), \
+                    self.assertRaisesRegex(REPAIR.Refused, "unsupported"):
+                REPAIR.reconcile(Path(directory))
+            self.assertTrue(all("up" not in call.args[1] for call in docker.call_args_list))
+
+    def test_check_requires_exact_database_images_available_locally_before_maintenance(self):
+        config, records = fixture()
+
+        def response(repo, args, **kwargs):
+            if args[:3] == ["docker", "image", "inspect"]:
+                return b"[]"
+            return read_only_response(config, records, args)
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(REPAIR, "command", side_effect=response) as docker, \
+                patch.object(REPAIR, "lock_file", side_effect=AssertionError("check must not lock")), \
+                patch.object(REPAIR, "write_json", side_effect=AssertionError("check must not write")), \
+                self.assertRaisesRegex(REPAIR.Refused, "unavailable locally; no pull"):
+            REPAIR.reconcile(Path(directory))
+        self.assertEqual(records["backend"]["State"]["Status"], "running")
+        self.assertFalse(any("up" in call.args[1] or "pull" in call.args[1] for call in docker.call_args_list))
+
+
+class RepairCliIsolationTests(unittest.TestCase):
+    def test_source_environment_pins_lifecycle_controls_against_inherited_and_dotenv_poisoning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            tag = "sha-" + "a" * 40
+            (repo / ".wotcv-deployment.env").write_text("LAST_IMAGE_TAG=" + tag + "\n")
+            poison = {"COMPOSE_REMOVE_ORPHANS": "true", "COMPOSE_IGNORE_ORPHANS": "false",
+                      "COMPOSE_DISABLE_ENV_FILE": "false", "COMPOSE_ENV_FILES": "/outside/poison.env",
+                      "COMPOSE_FILE": "/outside/poison.yml", "COMPOSE_PROJECT_NAME": "foreign",
+                      "COMPOSE_PROFILES": "*", "COMPOSE_BAKE": "true", "DOCKER_CONTEXT": "remote",
+                      "DOCKER_HOST": "tcp://untrusted:2375", "BASH_ENV": "/outside/poison.sh", "PATH": "/outside"}
+            (repo / ".env").write_text("\n".join(f"{key}={value}" for key, value in poison.items()))
+            with patch.dict(os.environ, poison), patch.object(REPAIR.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=b"{}")) as run:
+                REPAIR.command(repo, ["docker", "compose", "config"])
+            actual = run.call_args.kwargs["env"]
+            self.assertEqual(actual, dict(REPAIR.CLI_ENVIRONMENT, IMAGE_TAG=tag))
+            self.assertEqual(actual["COMPOSE_REMOVE_ORPHANS"], "false")
+            self.assertEqual(actual["COMPOSE_IGNORE_ORPHANS"], "true")
+            self.assertEqual(actual["DOCKER_HOST"], "unix:///var/run/docker.sock")
+            for field in ("COMPOSE_FILE", "COMPOSE_PROJECT_NAME", "DOCKER_CONTEXT", "BASH_ENV"):
+                self.assertNotIn(field, actual)
+            source = REPAIR.compose(repo)
+            self.assertEqual(source[source.index("--env-file") + 1], str(repo / ".env"))
+
+    def test_pinned_invocation_is_self_contained_for_candidate_and_operator_recovery(self):
+        for filename in ("candidate.compose.json", "rollback.compose.json"):
+            path = Path("/protected-audit/run") / filename
+            with self.subTest(filename=filename), patch.dict(os.environ, {"COMPOSE_REMOVE_ORPHANS": "true", "DOCKER_CONTEXT": "foreign"}):
+                args = REPAIR.pinned_compose_command(path)
+            self.assertEqual(args[:2], ["/usr/bin/env", "-i"])
+            assignments = dict(item.split("=", 1) for item in args[2:args.index("/bin/sh")])
+            self.assertEqual(assignments, dict(REPAIR.CLI_ENVIRONMENT, DOCKER_CONFIG=str(path.parent)))
+            self.assertEqual(args[args.index("--env-file") + 1], "/dev/null")
+            self.assertEqual(args[args.index("--project-directory") + 1], str(path.parent))
+            self.assertEqual(args[args.index("--project-name") + 1], "rybbit")
+            self.assertEqual(args[args.index("-f") + 1], str(path))
+            guard = args[args.index("-ec") + 1]
+            self.assertIn(REPAIR.NATIVE_ENGINE, guard)
+            self.assertIn(REPAIR.NATIVE_COMPOSE, guard)
+            self.assertTrue(guard.endswith('exec docker compose "$@"'))
+
+    def test_unknown_engine_platform_or_compose_version_refuses_instead_of_guessing_defaults(self):
+        for engine, cli in (("29.9.3|linux|amd64", REPAIR.NATIVE_COMPOSE),
+                            ("29.9.2|linux|arm64", REPAIR.NATIVE_COMPOSE),
+                            (REPAIR.NATIVE_ENGINE, "5.6.2")):
+            with self.subTest(engine=engine, cli=cli), patch.object(REPAIR, "command", side_effect=[engine.encode(), cli.encode()]), \
+                    self.assertRaisesRegex(REPAIR.Refused, "reviewed native"):
+                REPAIR.require_native_cli(Path("/repo"))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX shell required for isolated recovery guard fixture")
+    def test_recovery_guard_never_executes_compose_when_native_version_probe_fails_or_drifts(self):
+        guard = REPAIR.pinned_compose_command(Path("/protected/rollback.compose.json"))
+        script = guard[guard.index("-ec") + 1]
+        with tempfile.TemporaryDirectory() as directory:
+            docker = Path(directory) / "docker"
+            docker.write_text('#!/bin/sh\n'
+                              'if [ "$1" = version ]; then printf "%s\\n" "$WOTCV_ENGINE"; exit "$WOTCV_PROBE_EXIT"; fi\n'
+                              'if [ "$2" = version ]; then printf "%s\\n" "$WOTCV_COMPOSE"; exit 0; fi\n'
+                              'printf "COMPOSE_MUTATION_REACHED\\n"\n')
+            docker.chmod(0o700)
+            for engine, compose, status, allowed in ((REPAIR.NATIVE_ENGINE, REPAIR.NATIVE_COMPOSE, "0", True),
+                                                      ("unknown", REPAIR.NATIVE_COMPOSE, "0", False),
+                                                      (REPAIR.NATIVE_ENGINE, "unknown", "0", False),
+                                                      (REPAIR.NATIVE_ENGINE, REPAIR.NATIVE_COMPOSE, "1", False)):
+                env = {"PATH": directory, "WOTCV_ENGINE": engine, "WOTCV_COMPOSE": compose, "WOTCV_PROBE_EXIT": status}
+                result = subprocess.run(["/bin/sh", "-ec", script, "guard-fixture", "up"], env=env,
+                                        capture_output=True, text=True, timeout=10)
+                with self.subTest(engine=engine, compose=compose, status=status):
+                    self.assertEqual("COMPOSE_MUTATION_REACHED" in result.stdout, allowed)
+                    self.assertEqual(result.returncode == 0, allowed)
+
+
+class RepairNativeDaemonProbeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.outer = Path(self.temp.name)
+        self.config, self.records = fixture()
+        self.docker = ProbeDockerFixture()
+        self.counter = 0
+        for name, replacement in (("require_gate", lambda *args: None), ("sync_directory", lambda *args: None),
+                                  ("command", lambda repo, args, **kwargs: self.native_command(args))):
+            mock = patch.object(REPAIR, name, side_effect=replacement)
+            mock.start()
+            self.addCleanup(mock.stop)
+        mock = patch.object(REPAIR.os, "O_NOFOLLOW", getattr(os, "O_NOFOLLOW", 0), create=True)
+        mock.start()
+        self.addCleanup(mock.stop)
+
+    def native_command(self, args):
+        result = self.docker.command(args)
+        if result is None:
+            raise AssertionError("Probe attempted an unsupported operation")
+        return result
+
+    def run_probe(self):
+        self.counter += 1
+        audit = self.outer / ("audit-" + str(self.counter))
+        audit.mkdir()
+        REPAIR.probe_native_daemon(self.outer, audit, self.records, "fixture-owner")
+        return audit
+
+    def test_both_exact_images_are_created_never_started_isolated_and_removed_by_proven_id(self):
+        before = copy.deepcopy(self.records)
+        audit = self.run_probe()
+        self.assertEqual(self.docker.events, [("probe-create", "postgres"), ("probe-remove", "postgres"),
+                                            ("probe-create", "redis"), ("probe-remove", "redis")])
+        self.assertEqual(self.records, before)
+        self.assertEqual(self.docker.helpers, {})
+        creates = [call for call in self.docker.calls if "create" in call]
+        self.assertEqual([call[-1] for call in creates], [self.records[name]["Image"] for name in REPAIR.TARGETS])
+        for call, spec in zip(creates, REPAIR.SPECS[1:]):
+            self.assertEqual(call[:2], ["/usr/bin/env", "-i"])
+            self.assertIn("DOCKER_CONFIG=" + str(audit), call)
+            for flag, value in (("--pull", "never"), ("--entrypoint", "/bin/true"), ("--network", "none"),
+                                ("--runtime", "runc"), ("--ipc", "private"), ("--cgroupns", "private"),
+                                ("--shm-size", "67108864"), ("--mount", "type=tmpfs,dst=" + spec.target)):
+                self.assertEqual(call[call.index(flag) + 1], value)
+            self.assertEqual([call[index + 1] for index, value in enumerate(call) if value == "-a"], ["stdout", "stderr"])
+            cleanup = json.loads((audit / ("probe-" + spec.service_name + ".cleanup.json")).read_text())
+            self.assertTrue(cleanup["cleanupConfirmed"])
+            self.assertFalse(cleanup["effectiveKernelPolicyProven"])
+        for call in self.docker.calls:
+            self.assertFalse(any(option in call for option in ("start", "run", "up", "--force", "--volumes", "--publish", "--volume")))
+            if "rm" in call:
+                self.assertTrue(REPAIR.CONTAINER_ID.fullmatch(call[-1]))
+
+    def test_poisoned_daemon_defaults_refuse_and_cleanup_owned_never_started_helper(self):
+        for field, value in (("Ulimits", [{"Name": "nofile", "Soft": 4096, "Hard": 4096}]),
+                             ("SecurityOpt", ["no-new-privileges"]), ("Memory", 536870912),
+                             ("OomKillDisable", True), ("FutureSecurityControl", None)):
+            self.docker = ProbeDockerFixture()
+            self.docker.poison = lambda record: record["HostConfig"].update({field: value})
+            with self.subTest(field=field), self.assertRaisesRegex(REPAIR.Refused, "unsupported resource/security/runtime"):
+                self.run_probe()
+            self.assertEqual(self.docker.helpers, {})
+            self.assertEqual(self.docker.events, [("probe-create", "postgres"), ("probe-remove", "postgres")])
+
+    def test_probe_normalization_never_weakens_original_native_profile(self):
+        self.run_probe()
+        for field, alternative in REPAIR.PROBE_NATIVE_SPELLINGS.items():
+            _, records = fixture()
+            records["postgres"]["HostConfig"][field] = copy.deepcopy(alternative)
+            with self.subTest(field=field), self.assertRaises(REPAIR.Refused):
+                REPAIR.require_native_runtime_settings(records)
+
+    def test_unknown_ownership_running_or_storage_surface_is_preserved_without_removal(self):
+        def wrong_label(record):
+            record["Config"]["Labels"][REPAIR.PROBE_LABEL] = "foreign"
+        def running(record):
+            record["State"].update(Status="running", Running=True)
+        def wrong_mount(record):
+            record["HostConfig"]["Mounts"] = [{"Type": "volume", "Source": "rybbit_postgres-data", "Target": "/data"}]
+        for change in (wrong_label, running, wrong_mount,
+                       lambda record: record.update(Image="sha256:" + "f" * 64),
+                       lambda record: record.update(Name="/postgres")):
+            self.docker = ProbeDockerFixture()
+            self.docker.poison = change
+            with self.subTest(change=change), self.assertRaisesRegex(REPAIR.Refused, "cleanup could not be proven"):
+                self.run_probe()
+            self.assertEqual(len(self.docker.helpers), 1)
+            self.assertFalse(any("rm" in call for call in self.docker.calls))
+            status = json.loads((self.outer / ("audit-" + str(self.counter)) / "probe-postgres.cleanup.json").read_text())
+            self.assertFalse(status["cleanupConfirmed"])
+
+    def test_incomplete_create_or_invalid_response_recovers_only_nonce_and_name_owned_helper(self):
+        for failure in ("before", "after", "response"):
+            self.docker = ProbeDockerFixture()
+            self.docker.create_failure = failure
+            with self.subTest(failure=failure), self.assertRaises(REPAIR.Refused):
+                self.run_probe()
+            self.assertEqual(self.docker.helpers, {})
+            lookup = next(call for call in self.docker.calls if "ps" in call)
+            self.assertTrue(any(value.startswith("label=" + REPAIR.PROBE_LABEL + "=") for value in lookup))
+            self.assertTrue(any(value.startswith("name=wotcv-runtime-logging-probe-") for value in lookup))
+            status = json.loads((self.outer / ("audit-" + str(self.counter)) / "probe-postgres.cleanup.json").read_text())
+            self.assertEqual(status["cleanupConfirmed"], failure != "before")
+            self.assertEqual(status["createOutcomeUncertain"], failure == "before")
+            self.assertEqual(status["operatorReviewRequired"], failure == "before")
+
+    def test_cleanup_rechecks_ownership_and_never_forces_running_or_changed_helpers(self):
+        for field in ("owner", "running"):
+            self.docker = ProbeDockerFixture()
+            def change(record, count):
+                if count == 2:
+                    if field == "owner":
+                        record["Config"]["Labels"][REPAIR.PROBE_LABEL] = "foreign"
+                    else:
+                        record["State"].update(Status="running", Running=True)
+            self.docker.inspect_hook = change
+            with self.subTest(field=field), self.assertRaisesRegex(REPAIR.Refused, "cleanup could not be proven"):
+                self.run_probe()
+            self.assertEqual(len(self.docker.helpers), 1)
+            self.assertFalse(any("rm" in call for call in self.docker.calls))
+
+    def test_uncertain_lookup_or_removal_fails_without_claiming_cleanup(self):
+        for failure in ("lookup", "remove"):
+            self.docker = ProbeDockerFixture()
+            self.docker.create_failure = "after" if failure == "lookup" else None
+            self.docker.lookup_failure = failure == "lookup"
+            self.docker.remove_failure = failure == "remove"
+            with self.subTest(failure=failure), self.assertRaisesRegex(REPAIR.Refused, "cleanup could not be proven"):
+                self.run_probe()
+            self.assertEqual(len(self.docker.helpers), 1)
+
 
 class RepairDataAndPlanTests(unittest.TestCase):
     def images(self, records):
-        return {name: {"Config": {key: copy.deepcopy(records[name]["Config"].get(key))
-                                   for key in ("Env", "Cmd", "Entrypoint", "User", "WorkingDir")}}
-                for name in REPAIR.TARGETS}
+        return images_for(records)
+
+    def test_exact_reviewed_native_defaults_are_accepted_without_mutating_runtime(self):
+        config, records = fixture()
+        before = copy.deepcopy(records)
+        REPAIR.require_matching_command_environment(config, records, self.images(records))
+        for rollback in (False, True):
+            pinned = REPAIR.pinned_compose(config, records, rollback=rollback)
+            for name in REPAIR.TARGETS:
+                self.assertEqual({key: pinned["services"][name][key] for key in REPAIR.PINNED_NATIVE_FIELDS}, REPAIR.PINNED_NATIVE_FIELDS)
+        self.assertEqual(records, before)
+
+    def test_resource_security_and_unknown_runtime_fields_refuse_candidate_and_rollback_pre_up(self):
+        changes = {"Memory": 536870912, "MemoryReservation": 104857600, "NanoCpus": 1000000000,
+                   "ShmSize": 1073741824, "ReadonlyRootfs": True, "Privileged": True,
+                   "CapAdd": ["NET_ADMIN"], "CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges"],
+                   "Ulimits": [{"Name": "nofile", "Hard": 4096, "Soft": 4096}],
+                   "Runtime": "custom", "IpcMode": "host", "CgroupnsMode": "host",
+                   "MaskedPaths": [], "ReadonlyPaths": [], "OomKillDisable": True,
+                   "Devices": [{"PathOnHost": "/dev/example"}], "UsernsMode": "host",
+                   "MemorySwappiness": 0, "Init": True, "FutureSecurityControl": None}
+        for name in REPAIR.TARGETS:
+            for field, value in changes.items():
+                config, records = fixture()
+                images = self.images(records)
+                records[name]["HostConfig"][field] = value
+                with self.subTest(service=name, field=field), self.assertRaisesRegex(REPAIR.Refused, "unsupported resource/security/runtime"):
+                    REPAIR.require_matching_command_environment(config, records, images)
+                for rollback in (False, True):
+                    with self.subTest(service=name, field=field, rollback=rollback), self.assertRaisesRegex(REPAIR.Refused, "unsupported resource/security/runtime"):
+                        REPAIR.pinned_compose(config, records, rollback=rollback)
+        config, records = fixture()
+        records["postgres"]["HostConfig"]["Memory"] = False
+        with self.assertRaises(REPAIR.Refused):
+            REPAIR.require_native_runtime_settings(records)
+        config, records = fixture()
+        del records["postgres"]["HostConfig"]["Memory"]
+        with self.assertRaises(REPAIR.Refused):
+            REPAIR.require_native_runtime_settings(records)
+
+    def test_unknown_or_nondefault_config_flags_and_image_port_volume_metadata_refuse(self):
+        changes = {"AttachStdin": True, "AttachStdout": False, "AttachStderr": False,
+                   "OpenStdin": True, "StdinOnce": True, "Tty": True, "StopTimeout": 40,
+                   "NetworkDisabled": True, "Shell": ["/bin/custom"], "FutureExecutionControl": False,
+                   "ExposedPorts": {"9999/tcp": {}}, "Volumes": {"/unrepresented": {}}}
+        for field, value in changes.items():
+            config, records = fixture()
+            images = self.images(records)
+            records["postgres"]["Config"][field] = value
+            with self.subTest(field=field), self.assertRaises(REPAIR.Refused):
+                REPAIR.require_matching_command_environment(config, records, images)
+        config, records = fixture()
+        for name, port in (("postgres", "5432/tcp"), ("redis", "6379/tcp")):
+            records[name]["Config"]["ExposedPorts"] = {port: {}}
+        records["postgres"]["Config"]["Volumes"] = {"/var/lib/postgresql/data": {}}
+        REPAIR.require_matching_command_environment(config, records, self.images(records))
 
     def test_container_name_drift_or_missing_name_refuses_before_candidate(self):
         for name in REPAIR.TARGETS:
@@ -449,7 +842,7 @@ class RepairDataAndPlanTests(unittest.TestCase):
         self.assertEqual(set(candidate["volumes"]), {"postgres-data", "redis-data"})
         for name in REPAIR.TARGETS:
             self.assertEqual(candidate["services"][name]["image"], records[name]["Image"])
-            self.assertEqual(rollback["services"][name]["logging"], {"driver": "json-file", "options": {}})
+            self.assertEqual(rollback["services"][name]["logging"], {"driver": "json-file"})
             self.assertNotIn("depends_on", candidate["services"][name])
         config["services"]["postgres"]["build"] = {"context": "."}
         with self.assertRaisesRegex(REPAIR.Refused, "Unsupported"):
@@ -457,9 +850,7 @@ class RepairDataAndPlanTests(unittest.TestCase):
 
     def test_rejects_environment_command_and_image_execution_drift(self):
         config, records = fixture()
-        images = {name: {"Config": {key: copy.deepcopy(records[name]["Config"].get(key))
-                                   for key in ("Env", "Cmd", "Entrypoint", "User", "WorkingDir")}}
-                  for name in REPAIR.TARGETS}
+        images = self.images(records)
         REPAIR.require_matching_command_environment(config, records, images)
         for field in ("Env", "Cmd", "Entrypoint", "User", "WorkingDir"):
             changed = copy.deepcopy(records)
@@ -529,6 +920,32 @@ class RepairDataAndPlanTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("docker"), "Docker Compose CLI required for config-only serialization regression")
 class RepairNativeComposeExportTests(unittest.TestCase):
+    def test_native_pinned_candidate_and_rollback_roundtrips_with_poisoned_dotenv(self):
+        docker = shutil.which("docker")
+        available = subprocess.run([docker, "compose", "version", "--short"], capture_output=True, timeout=15)
+        if available.returncode:
+            self.skipTest("Docker Compose CLI plugin unavailable")
+        config, records = fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            outer = Path(directory)
+            (outer / ".env").write_text("COMPOSE_REMOVE_ORPHANS=true\nCOMPOSE_PROFILES=*\nCOMPOSE_FILE=/poison.yml\n")
+            args = [docker, "compose", "--project-name", "rybbit", "--project-directory", directory,
+                    "--env-file", os.devnull, "-f", "-", "config", "--format", "json"]
+            env = dict(os.environ, **REPAIR.CLI_ENVIRONMENT)
+
+            def render(source):
+                result = subprocess.run(args, input=json.dumps(source).encode(), cwd=outer,
+                                        capture_output=True, env=env, timeout=20)
+                self.assertEqual(result.returncode, 0, "Config-only native profile roundtrip failed; no up/run/pull requested")
+                return REPAIR.decode_compose_export(result.stdout)
+
+            # Generate from the CLI's canonical export, exactly as plan() does.
+            canonical = render(config)
+            for rollback in (False, True):
+                pinned = REPAIR.pinned_compose(canonical, records, rollback=rollback)
+                with self.subTest(rollback=rollback):
+                    self.assertEqual(render(REPAIR.compose_literals(pinned)), pinned)
+
     def test_native_config_only_export_source_roundtrip_preserves_all_literal_dollars_and_keys(self):
         docker = shutil.which("docker")
         available = subprocess.run([docker, "compose", "version", "--short"], capture_output=True, timeout=15)
@@ -690,6 +1107,7 @@ class RepairApplyTests(unittest.TestCase):
         self.records["backend"]["State"].update({"Status": "exited", "Running": False})
         self.calls = []
         self.events = []
+        self.probe_docker = ProbeDockerFixture(self.events)
         self.fail_service = None
         self.config_drift = False
         self.pg = {"system_identifier": "123", "database": "analytics", "users": 2, "sites": 3, "aliases": 4, "alias": None}
@@ -713,15 +1131,17 @@ class RepairApplyTests(unittest.TestCase):
 
     def command(self, repo, args, **kwargs):
         self.calls.append(args)
-        if args[:3] == ["docker", "image", "inspect"]:
-            record = next(record for record in self.records.values() if record["Image"] == args[3])
-            return json.dumps([{ "Id": record["Image"], "Config": {key: record["Config"].get(key)
-                                for key in ("Env", "Cmd", "Entrypoint", "User", "WorkingDir")}}]).encode()
-        if args[:2] == ["docker", "inspect"]:
-            return json.dumps(list(self.records.values())).encode()
+        helper = self.probe_docker.command(args)
+        if helper is not None:
+            return helper
+        if args[:2] in (["docker", "version"], ["docker", "inspect"], ["docker", "image"]) or args == ["docker", "compose", "version", "--short"]:
+            return read_only_response(self.config, self.records, args)
         if "config" in args:
             if any("candidate.compose.json" in item for item in args):
                 value = REPAIR.pinned_compose(self.config, self.records, rollback=False)
+                return json.dumps(value).encode()
+            if any("rollback.compose.json" in item for item in args):
+                value = REPAIR.pinned_compose(self.config, self.records, rollback=True)
                 return json.dumps(value).encode()
             return json.dumps(self.config).encode()
         if "up" in args:
@@ -758,7 +1178,23 @@ class RepairApplyTests(unittest.TestCase):
         self.assertEqual(json.loads((audit / "success.json").read_text())["backendStarted"], False)
         self.assertTrue((audit / "rollback.compose.json").exists())
         self.assertTrue((audit / "recovery.json").exists())
-        self.assertEqual(self.events[:4], [("sync", audit.parent.parent), ("sync", audit), ("sync", audit.parent), ("up", "postgres")])
+        recovery = json.loads((audit / "recovery.json").read_text())["configurationRollbackOnly"]
+        self.assertEqual(recovery[:len(REPAIR.pinned_compose_command(audit / "rollback.compose.json"))],
+                         REPAIR.pinned_compose_command(audit / "rollback.compose.json"))
+        for call in (*mutations, recovery):
+            self.assertEqual(call[:2], ["/usr/bin/env", "-i"])
+            self.assertIn("COMPOSE_REMOVE_ORPHANS=false", call)
+            self.assertIn("COMPOSE_IGNORE_ORPHANS=true", call)
+            self.assertEqual(call[call.index("--env-file") + 1], "/dev/null")
+            self.assertIn("--no-build", call)
+            self.assertEqual(call[call.index("--pull") + 1], "never")
+            self.assertNotIn("--remove-orphans", call)
+        self.assertEqual(self.events[:3], [("sync", audit.parent.parent), ("sync", audit), ("sync", audit.parent)])
+        lifecycle = [event for event in self.events if event[0] in ("probe-create", "probe-remove", "up")]
+        self.assertEqual(lifecycle, [("probe-create", "postgres"), ("probe-remove", "postgres"),
+                                     ("probe-create", "redis"), ("probe-remove", "redis"),
+                                     ("up", "postgres"), ("up", "redis")])
+        self.assertEqual(self.probe_docker.helpers, {})
         self.assertEqual(self.events[-2:], [("sync", audit), ("sync", audit.parent)])
 
     def test_directory_sync_failure_prevents_any_container_replacement(self):
@@ -804,6 +1240,89 @@ class RepairApplyTests(unittest.TestCase):
         self.assertFalse((self.outer / "audit").exists())
         self.assertFalse(any("up" in call for call in self.calls))
 
+    def test_runtime_resource_security_and_execution_drift_refuses_before_any_recreation_or_audit(self):
+        for section, field, value in (("HostConfig", "Memory", 536870912), ("HostConfig", "ShmSize", 1073741824),
+                                      ("HostConfig", "SecurityOpt", ["no-new-privileges"]),
+                                      ("HostConfig", "Privileged", True), ("Config", "Tty", True)):
+            self.config, self.records = fixture()
+            self.records["backend"]["State"].update({"Status": "exited", "Running": False})
+            self.records["postgres"][section][field] = value
+            self.calls = []
+            with self.subTest(section=section, field=field), self.assertRaisesRegex(REPAIR.Refused, "unsupported"):
+                self.run_apply()
+            self.assertFalse(any("up" in call for call in self.calls))
+            self.assertFalse((self.outer / "audit").exists())
+
+    def test_daemon_default_poisoning_refuses_before_any_database_recreation(self):
+        for service in REPAIR.TARGETS:
+            self.probe_docker = ProbeDockerFixture(self.events)
+            def poison(record):
+                if record["Name"].endswith("-" + service):
+                    record["HostConfig"]["Ulimits"] = [{"Name": "nofile", "Soft": 4096, "Hard": 4096}]
+            self.probe_docker.poison = poison
+            self.calls = []
+            with self.subTest(service=service), self.assertRaisesRegex(REPAIR.Refused, "unsupported resource/security/runtime"):
+                self.run_apply()
+            self.assertFalse(any("up" in call for call in self.calls))
+            self.assertEqual(self.probe_docker.helpers, {})
+            self.assertEqual(self.records["backend"]["State"]["Status"], "exited")
+
+    def test_gate_loss_at_first_probe_refuses_without_claiming_maintenance_or_backend_state(self):
+        checks = 0
+        def gate(owner):
+            nonlocal checks
+            checks += 1
+            if checks == 3:
+                raise REPAIR.Refused("Synthetic gate loss at first daemon probe")
+        errors = io.StringIO()
+        with patch.object(REPAIR, "require_gate", side_effect=gate), patch.object(REPAIR.sys, "stderr", errors), \
+                self.assertRaisesRegex(REPAIR.Refused, "gate loss at first daemon probe"):
+            self.run_apply()
+        self.assertEqual(checks, 3)
+        self.assertFalse(any("up" in call or "create" in call for call in self.calls))
+        self.assertEqual(self.probe_docker.helpers, {})
+        audit = next((self.outer / "audit").iterdir())
+        failure = json.loads((audit / "failure.json").read_text())
+        self.assertFalse(failure["maintenanceRemovalAttempted"])
+        self.assertFalse(failure["backendStartAttempted"])
+        self.assertTrue(failure["maintenanceStatusUnconfirmed"])
+        self.assertTrue(failure["backendStatusUnconfirmed"])
+        self.assertNotIn("maintenanceLeftActive", failure)
+        self.assertNotIn("backendStarted", failure)
+        self.assertIn("maintenance/backend status is unconfirmed", errors.getvalue())
+        self.assertNotIn("maintenance remains active", errors.getvalue())
+        self.assertNotIn("backend remains stopped", errors.getvalue().lower())
+
+    def test_resource_drift_between_replacements_prevents_redis_recreation(self):
+        native = self.command
+
+        def response(repo, args, **kwargs):
+            result = native(repo, args, **kwargs)
+            if "up" in args and args[-1] == "postgres":
+                self.records["redis"]["HostConfig"]["Memory"] = 536870912
+            return result
+
+        with patch.object(REPAIR, "command", side_effect=response), self.assertRaisesRegex(REPAIR.Refused, "unsupported resource/security/runtime"):
+            self.run_apply()
+        self.assertEqual([call[-1] for call in self.calls if "up" in call], ["postgres"])
+        self.assertEqual(self.records["redis"]["HostConfig"]["Memory"], 536870912)
+        self.assertEqual(self.records["backend"]["State"]["Status"], "exited")
+
+    def test_rollback_export_source_change_prevents_any_replacement(self):
+        native = self.command
+
+        def response(repo, args, **kwargs):
+            result = native(repo, args, **kwargs)
+            if "config" in args and any("rollback.compose.json" in item for item in args):
+                changed = json.loads(result)
+                changed["services"]["postgres"]["runtime"] = "changed"
+                return json.dumps(changed).encode()
+            return result
+
+        with patch.object(REPAIR, "command", side_effect=response), self.assertRaisesRegex(REPAIR.Refused, "Rollback Compose export/source roundtrip"):
+            self.run_apply()
+        self.assertFalse(any("up" in call for call in self.calls))
+
     def test_running_backend_other_service_drift_gate_or_backup_failure_prevents_recreation(self):
         for reason in ("backend", "unclean", "other", "gate", "backup"):
             with self.subTest(reason=reason):
@@ -838,7 +1357,9 @@ class RepairApplyTests(unittest.TestCase):
                 audit = sorted((self.outer / "audit").iterdir())[-1]
                 failure = json.loads((audit / "failure.json").read_text())
                 self.assertFalse(failure["automaticDataOrConfigurationRestore"])
-                self.assertTrue(failure["maintenanceLeftActive"])
+                self.assertFalse(failure["maintenanceRemovalAttempted"])
+                self.assertTrue(failure["maintenanceStatusUnconfirmed"])
+                self.assertFalse(failure["backendStartAttempted"])
 
     def test_data_loss_failure_does_not_attempt_database_restore_or_start_backend(self):
         with patch.object(REPAIR, "compare_data", side_effect=REPAIR.Refused("Synthetic key loss")), self.assertRaises(REPAIR.Refused):

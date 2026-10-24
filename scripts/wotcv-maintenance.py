@@ -176,6 +176,50 @@ def gate_lock():
         os.close(descriptor)
 
 
+def create_flag(value):
+    """Create an owned flag exclusively; never overwrite or clean up a rival."""
+    uid, gid = deployment_identity()
+    payload = json.dumps(value).encode() + b"\n"
+    descriptor = os.open(DIRECTORY / "active", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(descriptor, "wb") as stream:
+        if os.geteuid() == 0:
+            os.fchown(stream.fileno(), uid, gid)
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def refuse_failed_leave(existing):
+    # Unlink takes effect before its directory durability barrier. Best-effort
+    # restoration closes that window again, but must never replace a flag that
+    # appeared meanwhile. Call only while holding gate_lock; leave a partial
+    # restored file in place for manual recovery rather than silently removing it.
+    restored = durable = False
+    try:
+        create_flag(existing)
+        restored = True
+        sync_directory(DIRECTORY)
+        durable = True
+    except (OSError, ValueError, Refused):
+        pass
+    try:
+        current = read_flag()
+    except (OSError, ValueError, Refused):
+        state = "maintenance flag state is unknown; traffic gating and durability are unconfirmed"
+    else:
+        if current is None:
+            state = "maintenance flag is inactive; traffic may be open and removal durability is unconfirmed"
+        elif current != existing:
+            state = "a replacement maintenance flag is active and was preserved; its ownership and durability need verification"
+        elif restored and durable:
+            state = "the owned maintenance flag was restored and directory-synced; live origin gating is not confirmed"
+        else:
+            state = "the owned maintenance flag is currently active; durability and live origin gating are not confirmed"
+    raise Refused("Maintenance leave failed; " + state +
+                  ". Verify status and the owner before recovery; re-enter the owned gate and repeat readiness checks before leave. "
+                  "Do not remove a flag blindly.") from None
+
+
 def manage(action: str, owner: str | None = None):
     require_installed()
     if action == "status":
@@ -188,21 +232,23 @@ def manage(action: str, owner: str | None = None):
         if existing and existing["owner"] != owner:
             raise Refused("Maintenance belongs to another operation; refusing to adopt or remove it")
         if action == "enter" and not existing:
-            uid, gid = deployment_identity()
-            payload = json.dumps({"version": 1, "owner": owner,
-                                  "createdAt": datetime.now(timezone.utc).isoformat()}).encode() + b"\n"
-            descriptor = os.open(DIRECTORY / "active", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-            with os.fdopen(descriptor, "wb") as stream:
-                if os.geteuid() == 0:
-                    os.fchown(stream.fileno(), uid, gid)
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
+            create_flag({"version": 1, "owner": owner,
+                         "createdAt": datetime.now(timezone.utc).isoformat()})
         elif action == "leave":
             if not existing:
                 raise Refused("Maintenance is not active; refusing an unowned leave")
-            (DIRECTORY / "active").unlink()
-            sync_directory(DIRECTORY)
+            # All cooperating operations hold gate_lock. Recheck immediately
+            # before the destructive step as an additional guard against manual
+            # changes; this is not exclusion against an admin bypassing the lock.
+            if read_flag() != existing:
+                raise Refused("Maintenance flag changed before leave; no removal attempted. Verify status and owner before recovery")
+            try:
+                (DIRECTORY / "active").unlink()
+                sync_directory(DIRECTORY)
+                if read_flag() is not None:
+                    raise Refused("Maintenance flag appeared during leave and was preserved; verify status and owner before recovery")
+            except OSError:
+                refuse_failed_leave(existing)
         if action == "enter":
             # Retry this barrier even for an existing owned flag: a previous
             # enter may have stopped after file fsync but before directory fsync.
