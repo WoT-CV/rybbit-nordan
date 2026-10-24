@@ -106,13 +106,13 @@ REPRESENTED_CONFIG_FIELDS = {
     "Image", "Labels", "StopSignal", "User", "Volumes", "WorkingDir",
 }
 PROBE_LABEL = "io.wotcv.runtime-logging-probe"
-# Observed `docker create` spellings on the reviewed Engine/CLI, unlike the
-# Compose-created production containers. Normalize ONLY these probe-copy
-# alternatives; never weaken the original profile or post-recreate comparison.
+# Additional `docker create` spellings on the reviewed Engine/CLI. Normalize
+# ONLY these probe-copy alternatives; canonical_host_config separately handles
+# the three observed empty-DNS spellings for production and probe records.
 PROBE_NATIVE_SPELLINGS = {
     "BlkioDeviceReadBps": [], "BlkioDeviceReadIOps": [], "BlkioDeviceWriteBps": [],
     "BlkioDeviceWriteIOps": [], "BlkioWeightDevice": [], "Devices": [],
-    "Dns": None, "ExtraHosts": None, "OomKillDisable": False,
+    "ExtraHosts": None, "OomKillDisable": False,
 }
 PG_SNAPSHOT = '''SELECT json_build_object(
  'system_identifier', (SELECT system_identifier::text FROM pg_control_system()),
@@ -226,8 +226,24 @@ def require_native_cli(repo: Path) -> None:
         raise Refused("Database logging repair requires the reviewed native Docker/Compose versions")
 
 
+def canonical_host_config(value: dict) -> dict:
+    """Normalize only proven empty-DNS spellings, retaining absent fields.
+
+    On the reviewed native Engine/Compose, database recreation changed these
+    three explicitly empty DNS fields from [] to null. Both mean no requested
+    override. No other null/empty, missing-field or security/resource setting
+    is interchangeable; keep all of those visible to the strict guards.
+    """
+    result = copy.deepcopy(value)
+    for field in ("Dns", "DnsOptions", "DnsSearch"):
+        if field in result and result[field] is None:
+            result[field] = []
+    return result
+
+
 def require_native_runtime_record(record: dict, *, probe=False) -> None:
-    native = {key: value for key, value in record["HostConfig"].items() if key not in REPRESENTED_HOST_FIELDS}
+    native = {key: value for key, value in canonical_host_config(record["HostConfig"]).items()
+              if key not in REPRESENTED_HOST_FIELDS}
     if probe:
         native = copy.deepcopy(native)
         for field, alternative in PROBE_NATIVE_SPELLINGS.items():
@@ -708,7 +724,9 @@ def preserved_config(record: dict) -> dict:
     if config.get("Hostname") == record["Id"][:12]:
         config.pop("Hostname")
     config["Labels"] = non_compose_labels(config.get("Labels"))
-    host = copy.deepcopy(record["HostConfig"])
+    if "Env" in config:
+        config["Env"] = [key + "=" + value for key, value in sorted(unique_environment(config["Env"]).items())]
+    host = canonical_host_config(record["HostConfig"])
     host.pop("LogConfig", None)
     networks = {name: {key: value.get(key) for key in ("NetworkID", "Aliases", "IPAMConfig")}
                 for name, value in record["NetworkSettings"]["Networks"].items()}
@@ -766,6 +784,21 @@ def non_compose_labels(labels) -> dict:
     return {key: value for key, value in labels.items() if not key.startswith("com.docker.compose.")}
 
 
+def unique_environment(value) -> dict[str, str]:
+    """Parse literal inspect entries without losing duplicate-key semantics."""
+    if not isinstance(value, list):
+        raise Refused("Database environment is malformed")
+    result = {}
+    for entry in value:
+        if not isinstance(entry, str) or "=" not in entry or "\0" in entry:
+            raise Refused("Database environment is malformed")
+        key, setting = entry.split("=", 1)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or key in result:
+            raise Refused("Database environment has malformed or duplicate variable names")
+        result[key] = setting
+    return result
+
+
 def canonical_healthcheck(value) -> dict:
     fields = {"Test": [], "Interval": 0, "Timeout": 0, "Retries": 0, "StartPeriod": 0, "StartInterval": 0}
     if value is None:
@@ -806,9 +839,9 @@ def require_matching_command_environment(config: dict, records: dict, image_conf
         desired = config["services"][name]
         actual = records[name]["Config"]
         image = image_configs[name]["Config"]
-        env = dict(entry.split("=", 1) for entry in image.get("Env", []))
+        env = unique_environment(image.get("Env", []))
         env.update(desired.get("environment", {}))
-        if dict(entry.split("=", 1) for entry in actual.get("Env", [])) != env:
+        if unique_environment(actual.get("Env", [])) != env:
             raise Refused("Database environment drift would change more than logging")
         # Rendered Compose includes explicit nulls: null inherits the image,
         # whereas []/'' clears an instruction. A non-null entrypoint also
@@ -921,9 +954,34 @@ def require_apply_authority(repo: Path, ack: str, backup_manifest: Path | None) 
         raise Refused("--apply requires deployment-user repository ownership, acknowledgment and backup manifest")
 
 
+def historical_recovery_evidence(guard, records: dict, phase: str, owner: str):
+    """Run a trusted Python caller's historical proof under maintenance.
+
+    This is intentionally not a CLI plug-in mechanism. The caller owns the
+    original protected-audit proof; the normal repair keeps owning lifecycle,
+    locks, fresh-backup validation and fail-closed audit writes. Give the guard
+    a copy so that it cannot rewrite the repair's comparison baseline.
+    """
+    require_gate(owner)
+    backend = records["backend"]["State"]
+    if (backend.get("Status") != "exited" or backend.get("ExitCode") != 0
+            or backend.get("Running") is not False):
+        raise Refused("Historical recovery requires the backend to remain cleanly stopped")
+    evidence = guard(copy.deepcopy(records), phase)
+    require_gate(owner)
+    try:
+        # Freeze a JSON-safe copy now; do not retain a caller-owned mutable
+        # evidence object until the protected audit is written later.
+        return json.loads(json.dumps(evidence, allow_nan=False))
+    except (TypeError, ValueError, OverflowError):
+        raise Refused("Historical recovery guard returned evidence that is not JSON-safe") from None
+
+
 def reconcile(repo: Path, *, apply=False, owner="", ack="", backup_manifest: Path | None = None,
-              audit_root=Path("/var/backups/wotcv-runtime-logging")) -> Path | None:
+              audit_root=Path("/var/backups/wotcv-runtime-logging"), recovery_guard=None) -> Path | None:
     repo = repo.resolve(strict=True)
+    if recovery_guard is not None and (not apply or not callable(recovery_guard)):
+        raise Refused("Historical recovery requires apply and a trusted Python guard")
     if not apply:
         _, _, drift = plan(repo)
         if drift:
@@ -948,9 +1006,14 @@ def reconcile(repo: Path, *, apply=False, owner="", ack="", backup_manifest: Pat
             raise Refused("Cleanly stop backend (exit 0) under maintenance before backup/repair; it will NEVER be started here")
         if any(name not in TARGETS for name in drift):
             raise Refused("Logging drift exists outside PostgreSQL/Redis; this narrow repair refuses it")
+        if recovery_guard is not None and drift != ("redis",):
+            raise Refused("Historical recovery requires exactly Redis logging drift; no containers recreated")
         if not drift:
             print("ALREADY CURRENT: no containers changed; backend remains stopped and maintenance active")
             return None
+        historical_before = None
+        if recovery_guard is not None:
+            historical_before = historical_recovery_evidence(recovery_guard, records, "preflight", owner)
         pg_before = postgres_snapshot(repo, records["postgres"]["Id"])
         redis_before = redis_snapshot(repo, records["redis"])
         backup = verify_backup(repo, backup_manifest, records, pg_before)
@@ -968,6 +1031,8 @@ def reconcile(repo: Path, *, apply=False, owner="", ack="", backup_manifest: Pat
                                 ("rollback.compose.json", compose_literals(rollback)), ("postgres.before.json", pg_before),
                                 ("redis.before.json", redis_before), ("backup-evidence.json", json.loads(backup))):
             write_json(audit / filename, value)
+        if recovery_guard is not None:
+            write_json(audit / "historical-recovery.before.json", historical_before)
         write_json(audit / "recovery.json", {
             "maintenanceOwner": owner, "maintenanceMustRemainActive": True, "backendMustRemainStopped": True,
             "configurationRollbackOnly": [*pinned_compose_command(audit / "rollback.compose.json"),
@@ -1014,6 +1079,10 @@ def reconcile(repo: Path, *, apply=False, owner="", ack="", backup_manifest: Pat
                 if (current[name]["Id"] != records[name]["Id"]
                         or preserved_config(current[name]) != preserved_config(records[name])):
                     raise Refused("Database configuration changed immediately before replacement; nothing further recreated")
+                if recovery_guard is not None:
+                    evidence = historical_recovery_evidence(recovery_guard, current, "before-redis", owner)
+                    write_json(audit / "historical-recovery.before-redis.json", evidence)
+                    sync_directory(audit)
                 command(repo, [*pinned_compose_command(audit / "candidate.compose.json"),
                     "up", "-d", "--no-deps", "--no-build", "--pull", "never",
                     "--force-recreate", "--wait", "--wait-timeout", "120", name], timeout=150)
@@ -1035,6 +1104,9 @@ def reconcile(repo: Path, *, apply=False, owner="", ack="", backup_manifest: Pat
             compare_data(pg_before, pg_after, redis_before, redis_after)
             if "postgres" in drift:
                 verify_identity(repo, after, pg_before["alias"])
+            if recovery_guard is not None:
+                evidence = historical_recovery_evidence(recovery_guard, after, "after", owner)
+                write_json(audit / "historical-recovery.after.json", evidence)
             require_gate(owner)
             for filename, value in (("runtime.after.json", after), ("postgres.after.json", pg_after),
                                     ("redis.after.json", redis_after), ("success.json", {"recreated": drift,

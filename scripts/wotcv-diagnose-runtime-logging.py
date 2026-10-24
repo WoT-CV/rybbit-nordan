@@ -74,6 +74,19 @@ def unique_environment(record):
     return result
 
 
+def diagnostic_preserved_config(record):
+    # The runtime guard now canonicalizes the proven representations. Keep the
+    # diagnostic's raw paths truthful without undoing lifecycle/label filtering.
+    value = RUNTIME.preserved_config(record)
+    value["config"]["Env"] = copy.deepcopy(record["Config"].get("Env"))
+    for field in ("Dns", "DnsOptions", "DnsSearch"):
+        if field in record["HostConfig"]:
+            value["host"][field] = copy.deepcopy(record["HostConfig"][field])
+        else:
+            value["host"].pop(field, None)
+    return value
+
+
 def require_root():
     if os.name != "posix" or os.geteuid() != 0:
         raise RUNTIME.Refused("Protected logging diagnosis requires Linux root")
@@ -96,8 +109,8 @@ def diagnose(repo: Path, audit: Path, owner: str):
     backend = current["backend"]["State"]
     if backend.get("Status") != "exited" or backend.get("Running") is not False or backend.get("ExitCode") != 0:
         raise RUNTIME.Refused("Backend must remain cleanly stopped for diagnosis")
-    before = RUNTIME.preserved_config(original["postgres"])
-    after = RUNTIME.preserved_config(current["postgres"])
+    before = diagnostic_preserved_config(original["postgres"])
+    after = diagnostic_preserved_config(current["postgres"])
     projected = copy.deepcopy(current)
     dns = []
     for field in ("Dns", "DnsOptions", "DnsSearch"):
@@ -108,7 +121,7 @@ def diagnose(repo: Path, audit: Path, owner: str):
             dns.append(field)
     env_before = unique_environment(original["postgres"])
     env_after = unique_environment(current["postgres"])
-    remaining = changed_paths(before, RUNTIME.preserved_config(projected["postgres"]))
+    remaining = changed_paths(before, diagnostic_preserved_config(projected["postgres"]))
     # This extra projection is diagnostic ONLY, not a relaxed production guard.
     env_projection = copy.deepcopy(projected["postgres"])
     if env_before == env_after:
@@ -135,7 +148,7 @@ def diagnose(repo: Path, audit: Path, owner: str):
         "emptyDnsListToNullFields": dns,
         "remainingPathsAfterDnsProjection": remaining,
         "postgresUniqueEnvironmentMappingsEqual": env_before == env_after,
-        "remainingPathsAfterDnsAndEnvOrderProjection": changed_paths(before, RUNTIME.preserved_config(env_projection)),
+        "remainingPathsAfterDnsAndEnvOrderProjection": changed_paths(before, diagnostic_preserved_config(env_projection)),
         "unexpectedOtherServiceChanges": other_changes,
         "originalDataInvariantsPreserved": data_preserved,
         "postgresCountsExactlyEqual": all(pg_before[key] == pg_after[key] for key in ("users", "sites", "aliases")),

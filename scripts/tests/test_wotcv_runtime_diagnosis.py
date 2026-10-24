@@ -57,6 +57,8 @@ class RuntimeDiagnosisTests(unittest.TestCase):
         self.assertTrue(result["diagnosisCompleted"])
         self.assertTrue(result["originalDataInvariantsPreserved"])
         self.assertTrue(result["postgresUniqueEnvironmentMappingsEqual"])
+        self.assertIn("/host/Dns", result["rawPostgresChangedPaths"])
+        self.assertTrue(any(path.startswith("/config/Env/") for path in result["rawPostgresChangedPaths"]))
         self.assertEqual(result["remainingPathsAfterDnsAndEnvOrderProjection"], [])
         self.assertEqual(result["unexpectedOtherServiceChanges"], [])
         self.assertFalse(result["resumeAuthorized"])

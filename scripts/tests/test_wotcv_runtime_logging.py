@@ -1,7 +1,7 @@
 """Hermetic runtime logging guard and narrowly scoped maintenance tests."""
 
 import copy
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
@@ -595,6 +595,93 @@ class RepairDataAndPlanTests(unittest.TestCase):
                 self.assertEqual({key: pinned["services"][name][key] for key in REPAIR.PINNED_NATIVE_FIELDS}, REPAIR.PINNED_NATIVE_FIELDS)
         self.assertEqual(records, before)
 
+    def test_only_observed_present_empty_dns_fields_are_canonicalized_without_mutation(self):
+        config, original = fixture()
+        images = self.images(original)
+        for fields in (("Dns",), ("DnsOptions",), ("DnsSearch",), ("Dns", "DnsOptions", "DnsSearch")):
+            records = copy.deepcopy(original)
+            for field in fields:
+                records["postgres"]["HostConfig"][field] = None
+            before = copy.deepcopy(records)
+            with self.subTest(fields=fields):
+                REPAIR.require_matching_command_environment(config, records, images)
+                self.assertEqual(REPAIR.preserved_config(original["postgres"]), REPAIR.preserved_config(records["postgres"]))
+                self.assertEqual(records, before)
+
+    def test_dns_canonicalization_does_not_hide_missing_malformed_or_nonempty_settings(self):
+        for field in ("Dns", "DnsOptions", "DnsSearch"):
+            for kind, value in (("missing", None), ("nonempty", ["changed"]), ("string", ""),
+                                ("boolean", False), ("number", 0), ("map", {})):
+                _, records = fixture()
+                original = copy.deepcopy(records["postgres"])
+                if kind == "missing":
+                    del records["postgres"]["HostConfig"][field]
+                else:
+                    records["postgres"]["HostConfig"][field] = value
+                with self.subTest(field=field, kind=kind), self.assertRaises(REPAIR.Refused):
+                    REPAIR.require_native_runtime_settings(records)
+                self.assertNotEqual(REPAIR.preserved_config(original), REPAIR.preserved_config(records["postgres"]))
+        for field, value in (("Devices", []), ("ExtraHosts", None), ("Memory", None), ("SecurityOpt", [])):
+            _, records = fixture()
+            records["postgres"]["HostConfig"][field] = value
+            with self.subTest(field=field), self.assertRaises(REPAIR.Refused):
+                REPAIR.require_native_runtime_settings(records)
+
+    def test_unique_environment_order_is_benign_and_literal_values_are_unchanged(self):
+        config, original = fixture()
+        original["postgres"]["Config"]["Env"] += ["PATH=/literal/path", "LITERAL=one$two$$three=tail", "EMPTY="]
+        records = copy.deepcopy(original)
+        records["postgres"]["Config"]["Env"].reverse()
+        before = copy.deepcopy(records)
+        REPAIR.require_matching_command_environment(config, records, self.images(original))
+        self.assertEqual(REPAIR.preserved_config(original["postgres"]), REPAIR.preserved_config(records["postgres"]))
+        self.assertEqual(records, before)
+        self.assertEqual(REPAIR.unique_environment(records["postgres"]["Config"]["Env"])["LITERAL"], "one$two$$three=tail")
+        # This repair does not canonicalize other ordered execution metadata.
+        for field in ("Cmd", "Entrypoint"):
+            changed = copy.deepcopy(original["postgres"])
+            changed["Config"][field] = ["second", "first"]
+            baseline = copy.deepcopy(changed)
+            baseline["Config"][field].reverse()
+            with self.subTest(field=field):
+                self.assertNotEqual(REPAIR.preserved_config(baseline), REPAIR.preserved_config(changed))
+
+    def test_environment_parser_rejects_duplicates_and_malformed_entries_before_projection(self):
+        invalid = [None, {}, "KEY=value", [None], ["MISSING_EQUALS"], ["=empty"], ["1BAD=value"],
+                   ["BAD-NAME=value"], ["HAS SPACE=value"], ["BAD\nNAME=value"], ["KEY=bad\0value"],
+                   ["TEST=do-not-print-this", "TEST=do-not-print-this"], ["TEST=first", "TEST=second"]]
+        for value in invalid:
+            config, records = fixture()
+            images = self.images(records)
+            records["postgres"]["Config"]["Env"] = value
+            with self.subTest(value=value):
+                with self.assertRaises(REPAIR.Refused):
+                    REPAIR.unique_environment(value)
+                with self.assertRaises(REPAIR.Refused):
+                    REPAIR.preserved_config(records["postgres"])
+                with self.assertRaises(REPAIR.Refused):
+                    REPAIR.require_matching_command_environment(config, records, images)
+        config, records = fixture()
+        images = self.images(records)
+        images["postgres"]["Config"]["Env"] += ["TEST=conflict"]
+        with self.assertRaises(REPAIR.Refused):
+            REPAIR.require_matching_command_environment(config, records, images)
+
+    def test_environment_canonicalization_retains_value_addition_and_removal_drift(self):
+        config, original = fixture()
+        original["postgres"]["Config"]["Env"] += ["LITERAL=one$two$$three=tail"]
+        images = self.images(original)
+        for env in (["TEST=changed", "LITERAL=one$two$$three=tail"],
+                    original["postgres"]["Config"]["Env"] + ["ADDED=value"],
+                    ["TEST=do-not-print-this"],
+                    ["TEST=do-not-print-this", "LITERAL=one$two$three=tail"]):
+            records = copy.deepcopy(original)
+            records["postgres"]["Config"]["Env"] = env
+            with self.subTest(env=env):
+                self.assertNotEqual(REPAIR.preserved_config(original["postgres"]), REPAIR.preserved_config(records["postgres"]))
+                with self.assertRaisesRegex(REPAIR.Refused, "environment drift"):
+                    REPAIR.require_matching_command_environment(config, records, images)
+
     def test_resource_security_and_unknown_runtime_fields_refuse_candidate_and_rollback_pre_up(self):
         changes = {"Memory": 536870912, "MemoryReservation": 104857600, "NanoCpus": 1000000000,
                    "ShmSize": 1073741824, "ReadonlyRootfs": True, "Privileged": True,
@@ -1173,6 +1260,7 @@ class RepairApplyTests(unittest.TestCase):
         self.probe_docker = ProbeDockerFixture(self.events)
         self.fail_service = None
         self.config_drift = False
+        self.native_representations = False
         self.pg = {"system_identifier": "123", "database": "analytics", "users": 2, "sites": 3, "aliases": 4, "alias": None}
         self.redis = {"timestamp_ms": 1000, "keys": {"a": {"hash": "v", "expires_at_ms": None}}}
         for name, replacement in (
@@ -1217,14 +1305,18 @@ class RepairApplyTests(unittest.TestCase):
             self.records[name]["HostConfig"]["LogConfig"] = copy.deepcopy(EXPECTED_RUNTIME_LOGGING)
             self.records[name]["State"]["StartedAt"] = "2026-10-24T12:00:00Z"
             self.records[name]["NetworkSettings"]["Networks"]["rybbit_default"]["IPAddress"] = "172.1.0.9"
+            if self.native_representations:
+                for field in ("Dns", "DnsOptions", "DnsSearch"):
+                    self.records[name]["HostConfig"][field] = None
+                self.records[name]["Config"]["Env"].reverse()
             if self.config_drift:
                 self.records[name]["Mounts"][0]["Name"] = "different-data"
             return b""
         raise AssertionError(args)
 
-    def run_apply(self):
+    def run_apply(self, **kwargs):
         return REPAIR.reconcile(self.repo, apply=True, owner="test-token-123", ack=REPAIR.ACK,
-                                backup_manifest=self.outer / "manifest.json", audit_root=self.outer / "audit")
+                                backup_manifest=self.outer / "manifest.json", audit_root=self.outer / "audit", **kwargs)
 
     def test_apply_recreates_only_drifted_databases_and_leaves_backend_stopped_gate_active(self):
         before = copy.deepcopy(self.records)
@@ -1259,6 +1351,159 @@ class RepairApplyTests(unittest.TestCase):
                                      ("up", "postgres"), ("up", "redis")])
         self.assertEqual(self.probe_docker.helpers, {})
         self.assertEqual(self.events[-2:], [("sync", audit), ("sync", audit.parent)])
+
+    def test_apply_accepts_only_observed_dns_spelling_and_unique_environment_reordering(self):
+        self.native_representations = True
+        for name in REPAIR.TARGETS:
+            self.records[name]["Config"]["Env"] += ["PATH=/literal/path", "LITERAL=one$two$$three=tail"]
+        before = copy.deepcopy(self.records)
+        audit = self.run_apply()
+        self.assertEqual([call[-1] for call in self.calls if "up" in call], ["postgres", "redis"])
+        for name in REPAIR.TARGETS:
+            self.assertEqual(self.records[name]["Config"]["Env"], list(reversed(before[name]["Config"]["Env"])))
+            self.assertEqual(REPAIR.preserved_config(before[name]), REPAIR.preserved_config(self.records[name]))
+            self.assertTrue(all(self.records[name]["HostConfig"][field] is None for field in ("Dns", "DnsOptions", "DnsSearch")))
+        self.assertTrue((audit / "success.json").exists())
+        self.assertEqual(self.records["backend"], before["backend"])
+
+    def test_historical_guard_runs_under_four_locks_in_order_and_archives_json_evidence(self):
+        self.records["postgres"]["HostConfig"]["LogConfig"] = copy.deepcopy(EXPECTED_RUNTIME_LOGGING)
+        self.native_representations = True
+        self.records["redis"]["Config"]["Env"] += ["PATH=/literal/path"]
+        active = set()
+        phases = []
+
+        @contextmanager
+        def lock(path, owner):
+            active.add(path)
+            try:
+                yield
+            finally:
+                active.remove(path)
+
+        def guard(records, phase):
+            self.assertEqual(len(active), 4)
+            self.assertEqual(records["backend"]["State"]["Status"], "exited")
+            self.assertIs(records["backend"]["State"]["Running"], False)
+            phases.append(phase)
+            replacements = [call[-1] for call in self.calls if "up" in call]
+            self.assertEqual(replacements, ["redis"] if phase == "after" else [])
+            records["postgres"]["Config"]["Env"] = ["MUTATED=must-not-reach-baseline"]
+            return {"phase": phase, "historicalProof": True, "backendStarted": False}
+
+        with patch.object(REPAIR, "lock_file", side_effect=lock):
+            audit = self.run_apply(recovery_guard=guard)
+        self.assertEqual(phases, ["preflight", "before-redis", "after"])
+        self.assertEqual(active, set())
+        for suffix, phase in (("before", "preflight"), ("before-redis", "before-redis"), ("after", "after")):
+            evidence = json.loads((audit / ("historical-recovery." + suffix + ".json")).read_text())
+            self.assertEqual(evidence, {"phase": phase, "historicalProof": True, "backendStarted": False})
+        self.assertTrue((audit / "success.json").exists())
+        self.assertNotIn("MUTATED=must-not-reach-baseline", self.records["postgres"]["Config"]["Env"])
+
+    def test_historical_guard_refuses_any_drift_other_than_exactly_redis_including_none(self):
+        baseline = copy.deepcopy(self.records)
+        for drift in ((), ("postgres",), ("postgres", "redis"), ("client",), ("redis", "client")):
+            self.records = copy.deepcopy(baseline)
+            self.calls = []
+            for name, record in self.records.items():
+                record["HostConfig"]["LogConfig"] = copy.deepcopy(EXPECTED_RUNTIME_LOGGING)
+                if name in drift:
+                    record["HostConfig"]["LogConfig"]["Config"] = {}
+            guard = unittest.mock.Mock(return_value={"proof": True})
+            with self.subTest(drift=drift), self.assertRaises(REPAIR.Refused):
+                self.run_apply(recovery_guard=guard)
+            guard.assert_not_called()
+            self.assertFalse(any("up" in call or "create" in call for call in self.calls))
+            self.assertFalse((self.outer / "audit").exists())
+
+    def test_historical_guard_requires_apply_and_callable_before_any_native_check(self):
+        for apply, guard in ((False, lambda *args: {}), (True, "not-a-callable")):
+            with self.subTest(apply=apply), self.assertRaisesRegex(REPAIR.Refused, "requires apply"):
+                REPAIR.reconcile(self.repo, apply=apply, recovery_guard=guard)
+            self.assertEqual(self.calls, [])
+
+    def test_historical_guard_failure_never_skips_to_success_or_starts_backend(self):
+        baseline = copy.deepcopy(self.records)
+        for failed_phase in ("preflight", "before-redis", "after"):
+            self.records = copy.deepcopy(baseline)
+            self.records["postgres"]["HostConfig"]["LogConfig"] = copy.deepcopy(EXPECTED_RUNTIME_LOGGING)
+            self.calls = []
+            previous_audits = set((self.outer / "audit").iterdir()) if (self.outer / "audit").exists() else set()
+
+            def guard(records, phase):
+                if phase == failed_phase:
+                    raise REPAIR.Refused("Synthetic historical proof failure")
+                return {"phase": phase, "verified": True}
+
+            with self.subTest(phase=failed_phase), self.assertRaisesRegex(REPAIR.Refused, "historical proof failure"):
+                self.run_apply(recovery_guard=guard)
+            replacements = [call[-1] for call in self.calls if "up" in call]
+            self.assertEqual(replacements, ["redis"] if failed_phase == "after" else [])
+            self.assertEqual(self.records["backend"], baseline["backend"])
+            audits = set((self.outer / "audit").iterdir()) if (self.outer / "audit").exists() else set()
+            if failed_phase == "preflight":
+                self.assertEqual(audits, previous_audits)
+            else:
+                audit, = audits - previous_audits
+                self.assertTrue((audit / "failure.json").exists())
+                self.assertFalse((audit / "success.json").exists())
+
+    def test_historical_guard_rejects_non_json_evidence_before_backup_or_replacement(self):
+        self.records["postgres"]["HostConfig"]["LogConfig"] = copy.deepcopy(EXPECTED_RUNTIME_LOGGING)
+        for evidence in ({"invalid": object()}, {"invalid": float("nan")}, {"invalid": float("inf")}):
+            with self.subTest(evidence=evidence), patch.object(REPAIR, "verify_backup") as backup, \
+                    self.assertRaisesRegex(REPAIR.Refused, "not JSON-safe"):
+                self.run_apply(recovery_guard=lambda *args: evidence)
+            backup.assert_not_called()
+        self.assertFalse(any("up" in call or "create" in call for call in self.calls))
+        self.assertFalse((self.outer / "audit").exists())
+
+    def test_historical_guard_detects_running_backend_and_gate_loss_without_replacement(self):
+        self.records["postgres"]["HostConfig"]["LogConfig"] = copy.deepcopy(EXPECTED_RUNTIME_LOGGING)
+        self.records["backend"]["State"]["Running"] = True
+        guard = unittest.mock.Mock(return_value={"proof": True})
+        with self.assertRaises(REPAIR.Refused):
+            self.run_apply(recovery_guard=guard)
+        guard.assert_not_called()
+        self.records["backend"]["State"]["Running"] = False
+        gate_lost = False
+
+        def lose_gate(records, phase):
+            nonlocal gate_lost
+            gate_lost = True
+            return {"proof": True}
+
+        def gate(owner):
+            if gate_lost:
+                raise REPAIR.Refused("Synthetic gate loss")
+
+        with patch.object(REPAIR, "require_gate", side_effect=gate), self.assertRaisesRegex(REPAIR.Refused, "gate loss"):
+            self.run_apply(recovery_guard=lose_gate)
+        self.assertFalse(any("up" in call or "create" in call for call in self.calls))
+
+    def test_historical_guard_refuses_success_if_backend_is_running_after_redis_replacement(self):
+        self.records["postgres"]["HostConfig"]["LogConfig"] = copy.deepcopy(EXPECTED_RUNTIME_LOGGING)
+        native = self.command
+        phases = []
+
+        def response(repo, args, **kwargs):
+            result = native(repo, args, **kwargs)
+            if "up" in args:
+                self.records["backend"]["State"].update({"Status": "running", "Running": True})
+            return result
+
+        def guard(records, phase):
+            phases.append(phase)
+            return {"phase": phase}
+
+        with patch.object(REPAIR, "command", side_effect=response), self.assertRaisesRegex(REPAIR.Refused, "cleanly stopped"):
+            self.run_apply(recovery_guard=guard)
+        self.assertEqual(phases, ["preflight", "before-redis"])
+        self.assertEqual([call[-1] for call in self.calls if "up" in call], ["redis"])
+        audit, = (self.outer / "audit").iterdir()
+        self.assertTrue((audit / "failure.json").exists())
+        self.assertFalse((audit / "success.json").exists())
 
     def test_directory_sync_failure_prevents_any_container_replacement(self):
         for fail_at, existing in ((1, False), (2, False), (3, False), (1, True), (2, True), (3, True)):
