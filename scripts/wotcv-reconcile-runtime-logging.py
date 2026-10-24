@@ -138,6 +138,20 @@ for _, key in ipairs(scan[2]) do
       for _, field in ipairs(fields) do
         table.insert(value, field); table.insert(value, redis.call('HGET', key, field))
       end
+    elseif kind == 'stream' then
+      -- DUMP includes stream/group/pending state, unlike XRANGE alone. Keep
+      -- binary payload inside Redis; export only its digest and compare under
+      -- the same pinned image. Expiry is checked independently via PTTL.
+      -- Serialization is deliberately strict, not promised canonical: an
+      -- equivalent reload may refuse and needs review, never skipped fields.
+      local serialized = redis.call('DUMP', key)
+      if type(serialized) ~= 'string' then
+        return redis.error_reply('Maintenance stream serialization is invalid')
+      end
+      if #serialized > 1048576 then
+        return redis.error_reply('Maintenance serialized key size bound exceeded')
+      end
+      value = redis.sha1hex(serialized)
     else return redis.error_reply('Unsupported maintenance key type') end
     table.insert(out, {redis.sha1hex(key), redis.sha1hex(cjson.encode({kind, value})), redis.call('PTTL', key)})
   end
@@ -616,9 +630,23 @@ def redis_command(repo: Path, record: dict, *args: str):
     password = cmd[cmd.index("--requirepass") + 1]
     if not isinstance(password, str) or not password or any(c in password for c in "\r\n\x00"):
         raise Refused("Redis password cannot be safely supplied through the private input channel")
-    return json.loads(command(repo, ["docker", "exec", "-i", record["Id"], "sh", "-ec",
-        'IFS= read -r REDISCLI_AUTH; export REDISCLI_AUTH; exec redis-cli --no-auth-warning --json "$@"',
-        "sh", *args], data=(password + "\n").encode()))
+    # redis-cli formats INFO as section text even under --json. Select raw
+    # explicitly for these two known replies; never hide a malformed structured
+    # response behind a generic JSON-to-text fallback.
+    info_headers = {("INFO", "persistence"): "# Persistence", ("INFO", "keyspace"): "# Keyspace"}
+    header = info_headers.get(args)
+    raw = command(repo, ["docker", "exec", "-i", record["Id"], "sh", "-ec",
+        'IFS= read -r REDISCLI_AUTH; export REDISCLI_AUTH; exec redis-cli --no-auth-warning -e "$@"',
+        "sh", "--raw" if header else "--json", *args], data=(password + "\n").encode())
+    if header:
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise Refused("Redis INFO response is not valid UTF-8") from error
+        if not text.startswith((header + "\r\n", header + "\n")):
+            raise Refused("Redis INFO response has an invalid section header")
+        return text
+    return json.loads(raw)
 
 
 def redis_snapshot(repo: Path, record: dict) -> dict:

@@ -903,6 +903,58 @@ class RepairDataAndPlanTests(unittest.TestCase):
             with self.subTest(pg=after_pg, redis=after_redis), self.assertRaises(REPAIR.Refused):
                 REPAIR.compare_data(pg, after_pg, redis, after_redis)
 
+    def test_redis_info_uses_explicit_raw_and_stdin_only_authentication(self):
+        _, records = fixture()
+        record = records["redis"]
+        password = record["Config"]["Cmd"][record["Config"]["Cmd"].index("--requirepass") + 1]
+        for section, header in (("persistence", "# Persistence"), ("keyspace", "# Keyspace")):
+            for newline in ("\r\n", "\n"):
+                value = header + newline + newline
+                with self.subTest(section=section, newline=newline), \
+                        patch.object(REPAIR, "command", return_value=value.encode()) as native:
+                    self.assertEqual(REPAIR.redis_command(Path("."), record, "INFO", section), value)
+                args = native.call_args.args[1]
+                self.assertEqual(args[-3:], ["--raw", "INFO", section])
+                self.assertNotIn("--json", args)
+                self.assertIn('redis-cli --no-auth-warning -e "$@"', args[6])
+                self.assertNotIn(password, " ".join(args))
+                self.assertEqual(native.call_args.kwargs["data"], (password + "\n").encode())
+
+    def test_redis_structured_replies_stay_json_without_raw_fallback(self):
+        _, records = fixture()
+        cases = ((('CONFIG', 'GET', 'appendonly'), b'{"appendonly":"yes"}', {"appendonly": "yes"}),
+                 (('CONFIG', 'GET', 'appendonly'), b'["appendonly","yes"]', ["appendonly", "yes"]),
+                 (('DBSIZE',), b'1\n', 1), (('EVAL_RO', 'return {}', '0'), b'["0",[]]', ["0", []]))
+        for arguments, raw, expected in cases:
+            with self.subTest(arguments=arguments), patch.object(REPAIR, "command", return_value=raw) as native:
+                self.assertEqual(REPAIR.redis_command(Path("."), records["redis"], *arguments), expected)
+                self.assertIn("--json", native.call_args.args[1])
+                self.assertNotIn("--raw", native.call_args.args[1])
+        with patch.object(REPAIR, "command", return_value=b'not-json'), self.assertRaises(json.JSONDecodeError):
+            REPAIR.redis_command(Path("."), records["redis"], "DBSIZE")
+
+    def test_redis_info_refuses_wrong_sections_errors_and_invalid_encoding(self):
+        _, records = fixture()
+        for raw in (b'', b'ERR not allowed\n', b'# Keyspace\r\n', b'# Persistence\r\n\xff'):
+            with self.subTest(raw=raw), patch.object(REPAIR, "command", return_value=raw), \
+                    self.assertRaises(REPAIR.Refused):
+                REPAIR.redis_command(Path("."), records["redis"], "INFO", "persistence")
+
+    def test_redis_snapshot_decodes_native_info_text_and_json_at_the_command_boundary(self):
+        _, records = fixture()
+        settings = {"appendonly": "yes", "appendfsync": "everysec", "dir": "/data", "appenddirname": "appendonlydir"}
+        persistence = b"# Persistence\r\nloading:0\r\naof_enabled:1\r\naof_rewrite_in_progress:0\r\naof_last_write_status:ok\r\naof_last_bgrewrite_status:ok\r\n"
+        responses = [json.dumps(settings).encode(), persistence, b"# Keyspace\r\ndb0:keys=1,expires=0\r\n", b"1\n",
+                     json.dumps(["0", [["a" * 40, "b" * 40, -1]]]).encode()]
+        with patch.object(REPAIR, "command", side_effect=responses) as native:
+            snapshot = REPAIR.redis_snapshot(Path("."), records["redis"])
+        self.assertEqual(snapshot["keys"], {"a" * 40: {"hash": "b" * 40, "expires_at_ms": None}})
+        self.assertEqual(snapshot["aof"], settings)
+        self.assertEqual(native.call_count, 5)
+        self.assertEqual([call.args[1][-3:] for call in native.call_args_list[1:3]],
+                         [["--raw", "INFO", "persistence"], ["--raw", "INFO", "keyspace"]])
+        self.assertIn("EVAL_RO", native.call_args_list[-1].args[1])
+
     def test_redis_snapshot_uses_readonly_lua_and_validates_aof_and_other_databases(self):
         _, records = fixture()
         persistence = "loading:0\naof_enabled:1\naof_rewrite_in_progress:0\naof_last_write_status:ok\naof_last_bgrewrite_status:ok\n"
@@ -916,6 +968,17 @@ class RepairDataAndPlanTests(unittest.TestCase):
                         [settings, persistence, "db1:keys=1\n"], [settings, persistence, "", 100001]):
             with self.subTest(changes=changes), patch.object(REPAIR, "redis_command", side_effect=changes), self.assertRaises(REPAIR.Refused):
                 REPAIR.redis_snapshot(Path("."), records["redis"])
+
+    def test_redis_stream_snapshot_hashes_full_serialization_without_exporting_payload_or_raising_bounds(self):
+        script = REPAIR.REDIS_SNAPSHOT
+        self.assertIn("elseif kind == 'stream' then", script)
+        self.assertIn("redis.call('DUMP', key)", script)
+        self.assertIn("if #serialized > 1048576 then", script)
+        self.assertIn("value = redis.sha1hex(serialized)", script)
+        self.assertIn("redis.sha1hex(cjson.encode({kind, value}))", script)
+        self.assertIn("redis.call('PTTL', key)", script)
+        for mutation in ("RESTORE", "DEL", "XADD", "XREADGROUP", "XACK", "XGROUP"):
+            self.assertNotIn("redis.call('" + mutation + "'", script)
 
 
 @unittest.skipUnless(shutil.which("docker"), "Docker Compose CLI required for config-only serialization regression")
