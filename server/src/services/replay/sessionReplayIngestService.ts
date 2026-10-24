@@ -8,6 +8,7 @@ import { sessionsService } from "../sessions/sessionsService.js";
 import { userIdService } from "../userId/userIdService.js";
 import { r2Storage } from "../storage/r2StorageService.js";
 import { siteConfig } from "../../lib/siteConfig.js";
+import { chargeReplaySessionBudget } from "./replaySessionBudget.js";
 
 const logger = createServiceLogger("session-replay-ingest");
 
@@ -21,11 +22,32 @@ type BatchStats = {
   screenHeight: number;
 };
 
+export type RecordEventsResult = {
+  /** The session is over its replay size cap; nothing from this batch was stored. */
+  capped: boolean;
+};
+
 export interface RequestMetadata {
   userAgent: string;
   ipAddress: string;
   origin: string;
   referrer: string;
+}
+
+/**
+ * Earliest and latest timestamp in a non-empty batch. A loop rather than
+ * Math.min(...spread): spreading a large batch can exceed the engine's argument
+ * limit and throw. Timestamps are finite here (correctReplayClockSkew sanitizes
+ * them), so plain comparisons match Math.min/Math.max.
+ */
+function timestampRange(events: { timestamp: number }[]): { startMs: number; endMs: number } {
+  let startMs = events[0].timestamp;
+  let endMs = startMs;
+  for (const { timestamp } of events) {
+    if (timestamp < startMs) startMs = timestamp;
+    if (timestamp > endMs) endMs = timestamp;
+  }
+  return { startMs, endMs };
 }
 
 /**
@@ -37,7 +59,7 @@ export class SessionReplayIngestService {
     siteId: number,
     request: RecordSessionReplayRequest,
     requestMeta?: RequestMetadata
-  ): Promise<void> {
+  ): Promise<RecordEventsResult> {
     const { userId: clientUserId, events: rawEvents, metadata } = request;
 
     // Device clocks, not ours. Correct the whole batch onto server time before
@@ -70,17 +92,25 @@ export class SessionReplayIngestService {
       siteId,
     });
 
+    // Serialize once: the sizes gate the batch before anything is written, and
+    // the same strings are what ClickHouse stores.
+    const serializedEvents = events.map(event => JSON.stringify(event.data));
+    const batchBytes = serializedEvents.reduce((total, data) => total + data.length, 0);
+
+    // Checked before the R2 upload and both inserts, so a runaway session costs
+    // one Redis call per batch once it's capped.
+    const budget = await chargeReplaySessionBudget(siteId, sessionId, batchBytes);
+    if (!budget.accepted) {
+      return { capped: true };
+    }
+
     // Check if R2 storage is enabled for cloud deployments
     let r2BatchKey: string | null = null;
-    let eventDataArray: any[] = [];
 
     if (r2Storage.isEnabled()) {
-      // Extract event data for R2 storage
-      eventDataArray = events.map(event => event.data);
-
       try {
-        // Store event data batch in R2
-        r2BatchKey = await r2Storage.storeBatch(siteId, sessionId, eventDataArray);
+        // Store event data batch in R2, reusing the strings serialized above
+        r2BatchKey = await r2Storage.storeBatch(siteId, sessionId, serializedEvents);
       } catch (error) {
         console.error("Failed to store in R2, falling back to ClickHouse:", error);
         r2BatchKey = null;
@@ -89,7 +119,7 @@ export class SessionReplayIngestService {
 
     // Prepare events for batch insert
     const eventsToInsert = events.map((event, index) => {
-      const serializedData = JSON.stringify(event.data);
+      const serializedData = serializedEvents[index];
 
       if (r2BatchKey) {
         // R2 storage: store metadata only in ClickHouse
@@ -144,10 +174,11 @@ export class SessionReplayIngestService {
       // An events-free batch still carries metadata worth recording, but it has
       // no timestamps to bound it — anchor those on server time rather than
       // letting Math.min of nothing produce an epoch-dated row.
-      const timestamps = events.length > 0 ? events.map(event => event.timestamp) : [Date.now()];
+      const nowMs = Date.now();
+      const { startMs, endMs } = events.length > 0 ? timestampRange(events) : { startMs: nowMs, endMs: nowMs };
       const batchStats: BatchStats = {
-        startTime: new Date(Math.min(...timestamps)),
-        endTime: new Date(Math.max(...timestamps)),
+        startTime: new Date(startMs),
+        endTime: new Date(endMs),
         eventCount: eventsToInsert.length,
         compressedSizeBytes: eventsToInsert.reduce((total, event) => total + event.event_size_bytes, 0),
         screenWidth: metadata.viewportWidth || 0,
@@ -164,6 +195,8 @@ export class SessionReplayIngestService {
         requestMeta
       );
     }
+
+    return { capped: false };
   }
 
   private async updateSessionMetadata(

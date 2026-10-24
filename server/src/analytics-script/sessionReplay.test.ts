@@ -73,3 +73,43 @@ describe("SessionReplayRecorder identity", () => {
     });
   });
 });
+
+describe("SessionReplayRecorder size cap", () => {
+  let emit: (event: unknown) => void;
+  let stopRrweb: ReturnType<typeof vi.fn>;
+  let recorder: SessionReplayRecorder;
+  let sendBatch: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    stopRrweb = vi.fn();
+    window.rrweb = {
+      record: vi.fn(options => {
+        emit = options.emit;
+        return stopRrweb;
+      }),
+    };
+
+    sendBatch = vi.fn().mockResolvedValue({ success: true, stopRecording: true });
+    recorder = new SessionReplayRecorder(config, "visitor", sendBatch);
+    await recorder.initialize();
+  });
+
+  afterEach(() => {
+    recorder.cleanup();
+    delete window.rrweb;
+  });
+
+  it("stops recording for the page when the server reports the cap", async () => {
+    emit({ type: 2, data: {}, timestamp: 1_700_000_000_000 });
+    recorder.onPageChange();
+
+    await vi.waitFor(() => expect(recorder.isActive()).toBe(false));
+    expect(stopRrweb).toHaveBeenCalledOnce();
+
+    // Neither a later restart nor cleanup sends anything more.
+    recorder.startRecording();
+    expect(recorder.isActive()).toBe(false);
+    recorder.cleanup();
+    expect(sendBatch).toHaveBeenCalledOnce();
+  });
+});

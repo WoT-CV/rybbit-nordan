@@ -1,6 +1,7 @@
 import { Redis } from "ioredis";
 import { createServiceLogger } from "../../lib/logger/logger.js";
 import { API_RATE_LIMIT_LUA } from "./apiRateLimitLua.js";
+import { REPLAY_BUDGET_LUA } from "./replayBudgetLua.js";
 import { STICKY_RESOLVE_LUA } from "./stickyResolveLua.js";
 
 const logger = createServiceLogger("redis");
@@ -157,6 +158,39 @@ export function stickyResolve(input: StickyResolveInput): Promise<[string, Stick
     input.aliasKeyPrefix,
     input.maxCandidates
   );
+}
+
+// Dedicated connection for the per-session replay byte budget. Every replay
+// batch runs this script, so it gets its own connection for the same reason as
+// `sessionRedis`.
+export const replayBudgetRedis = createRedisClient("replay-budget");
+
+replayBudgetRedis.defineCommand("replayBudgetCharge", {
+  numberOfKeys: 1,
+  lua: REPLAY_BUDGET_LUA,
+});
+
+interface ReplayBudgetRedis extends Redis {
+  replayBudgetCharge(key: string, bytes: number, capBytes: number, ttlMs: number): Promise<[number, number]>;
+}
+
+/**
+ * Charge `bytes` against a session's replay budget. Accepted while the session
+ * is under `capBytes`; the TTL slides on every call. Atomic across all workers.
+ */
+export async function replayBudgetCharge(
+  key: string,
+  bytes: number,
+  capBytes: number,
+  ttlMs: number
+): Promise<{ accepted: boolean; usedBytes: number }> {
+  const [accepted, usedBytes] = await (replayBudgetRedis as ReplayBudgetRedis).replayBudgetCharge(
+    key,
+    bytes,
+    capBytes,
+    ttlMs
+  );
+  return { accepted: accepted === 1, usedBytes };
 }
 
 // Dedicated connection for API-key rate limiting, isolated for the same reason

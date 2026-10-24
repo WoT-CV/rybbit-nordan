@@ -305,6 +305,9 @@
   var SessionReplayRecorder = class {
     constructor(config, userId, sendBatch) {
       this.isRecording = false;
+      // Set once the server reports the session is over its size cap; recording
+      // stays off for the rest of this page.
+      this.capped = false;
       this.eventBuffer = [];
       this.config = config;
       this.userId = userId;
@@ -338,7 +341,7 @@
       });
     }
     startRecording() {
-      if (this.isRecording || !window.rrweb || !this.config.enableSessionReplay) {
+      if (this.capped || this.isRecording || !window.rrweb || !this.config.enableSessionReplay) {
         return;
       }
       try {
@@ -465,10 +468,24 @@
         }
       };
       try {
-        await this.sendBatch(batch);
+        const result = await this.sendBatch(batch);
+        if (result?.stopRecording) {
+          this.stopForSizeCap();
+        }
       } catch (error) {
         this.eventBuffer.unshift(...events);
       }
+    }
+    // Unlike stopRecording, drops what's buffered: the server refuses it anyway.
+    stopForSizeCap() {
+      this.capped = true;
+      if (this.stopRecordingFn) {
+        this.stopRecordingFn();
+        this.stopRecordingFn = void 0;
+      }
+      this.isRecording = false;
+      this.clearBatchTimer();
+      this.eventBuffer = [];
     }
     // Update user ID when it changes
     updateUserId(userId) {
@@ -787,8 +804,9 @@
       }
     }
     async sendSessionReplayBatch(batch) {
+      let response;
       try {
-        await fetch(`${this.config.analyticsHost}/session-replay/record/${this.config.siteId}`, {
+        response = await fetch(`${this.config.analyticsHost}/session-replay/record/${this.config.siteId}`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json"
@@ -801,6 +819,11 @@
       } catch (error) {
         console.error("Failed to send session replay batch:", error);
         throw error;
+      }
+      try {
+        return await response.json();
+      } catch {
+        return;
       }
     }
     createBasePayload() {
@@ -1364,6 +1387,7 @@
   };
 
   // webVitals.ts
+  var SEND_DELAY_MS = 2e4;
   var WebVitalsCollector = class {
     constructor(onReady) {
       this.data = {
@@ -1380,21 +1404,18 @@
     }
     initialize() {
       try {
-        x(this.collectMetric.bind(this));
-        L(this.collectMetric.bind(this));
-        S(this.collectMetric.bind(this));
+        x(this.collectMetric.bind(this), { reportAllChanges: true });
+        L(this.collectMetric.bind(this), { reportAllChanges: true });
+        S(this.collectMetric.bind(this), { reportAllChanges: true });
         E(this.collectMetric.bind(this));
         $(this.collectMetric.bind(this));
-        this.timeout = setTimeout(() => {
-          if (!this.sent) {
-            this.sendData();
-          }
-        }, 2e4);
-        window.addEventListener("beforeunload", () => {
-          if (!this.sent) {
+        this.timeout = setTimeout(() => this.sendData(), SEND_DELAY_MS);
+        document.addEventListener("visibilitychange", () => {
+          if (document.visibilityState === "hidden") {
             this.sendData();
           }
         });
+        window.addEventListener("pagehide", () => this.sendData());
       } catch (e2) {
         console.warn("Error initializing web vitals tracking:", e2);
       }
@@ -1403,10 +1424,6 @@
       if (this.sent) return;
       const metricName = metric.name.toLowerCase();
       this.data[metricName] = metric.value;
-      const allCollected = Object.values(this.data).every((value) => value !== null);
-      if (allCollected) {
-        this.sendData();
-      }
     }
     sendData() {
       if (this.sent) return;

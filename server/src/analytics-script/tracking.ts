@@ -4,6 +4,7 @@ import {
   TrackingPayload,
   WebVitalsData,
   SessionReplayBatch,
+  SessionReplayBatchResult,
   ButtonClickProperties,
   CopyProperties,
   FormSubmitProperties,
@@ -130,9 +131,10 @@ export class Tracker {
     }
   }
 
-  private async sendSessionReplayBatch(batch: SessionReplayBatch): Promise<void> {
+  private async sendSessionReplayBatch(batch: SessionReplayBatch): Promise<SessionReplayBatchResult | void> {
+    let response: Response;
     try {
-      await fetch(`${this.config.analyticsHost}/session-replay/record/${this.config.siteId}`, {
+      response = await fetch(`${this.config.analyticsHost}/session-replay/record/${this.config.siteId}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -144,6 +146,13 @@ export class Tracker {
     } catch (error) {
       console.error("Failed to send session replay batch:", error);
       throw error;
+    }
+
+    // Some skip responses are plain text; only a JSON body can carry a stop signal.
+    try {
+      return (await response.json()) as SessionReplayBatchResult;
+    } catch {
+      return;
     }
   }
 
