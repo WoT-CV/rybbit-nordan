@@ -7,7 +7,7 @@ import { useMemo, useState } from "react";
 import { useCurrentSite } from "../../../../api/admin/hooks/useSites";
 import { useGetSessionsInfinite } from "../../../../api/analytics/hooks/useGetUserSessions";
 import { GetSessionsResponse } from "../../../../api/analytics/endpoints";
-import { Avatar, generateName } from "../../../../components/Avatar";
+import { Avatar } from "../../../../components/Avatar";
 import { Channel } from "../../../../components/Channel";
 import { EventTypeIcon } from "../../../../components/EventIcons";
 import { SessionCard as FullSessionCard } from "../../../../components/Sessions/SessionCard";
@@ -23,7 +23,7 @@ import { Dialog, DialogContent, DialogTitle } from "../../../../components/ui/di
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../../components/ui/tooltip";
 import { useDateTimeFormat } from "../../../../hooks/useDateTimeFormat";
 import { formatShortDuration } from "../../../../lib/dateTimeUtils";
-import { cn, formatter, truncateString } from "../../../../lib/utils";
+import { cn, formatter, getUserDisplayName, truncateString } from "../../../../lib/utils";
 
 function SessionCardSkeleton() {
   return (
@@ -67,7 +67,7 @@ function SessionCard({ session, onClick }: { session: GetSessionsResponse[number
   const duration = formatShortDuration(totalSeconds);
   const siteId = useCurrentSite();
 
-  const name = generateName(session.user_id);
+  const name = getUserDisplayName(session);
 
   return (
     <div
@@ -76,7 +76,7 @@ function SessionCard({ session, onClick }: { session: GetSessionsResponse[number
     >
       <div className="flex justify-between border-b border-neutral-700 pb-2">
         <div className="text-sm text-neutral-100 flex items-center gap-1.5">
-          <Avatar id={session.user_id} size={16} />
+          <Avatar id={session.user_id} traits={session.traits} size={16} />
           <span className="text-xs text-neutral-200 max-w-32 truncate hover:underline">{name}</span>
         </div>
         <div className="flex space-x-2 items-center pr-2">

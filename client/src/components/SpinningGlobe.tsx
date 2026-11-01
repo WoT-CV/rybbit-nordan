@@ -9,7 +9,7 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { GetSessionsResponse } from "../api/analytics/endpoints";
 import { useConfigs } from "../lib/configs";
-import { frogAvatarSVG } from "../lib/frogAvatar";
+import { setGlobeAvatar } from "../app/[site]/globe/utils/globeIdentity";
 import "../app/[site]/globe/globe.css";
 
 // Constants
@@ -358,6 +358,7 @@ export function SpinningGlobe() {
     const mapInstance = mapRef.current;
     const markersMap = markersMapRef.current;
     const shouldShowClusters = sessions.length > CLUSTERING_THRESHOLD;
+    let disposed = false;
 
     // Update GeoJSON data
     const updateGeoJSONData = () => {
@@ -440,6 +441,7 @@ export function SpinningGlobe() {
 
         await Promise.all(promises);
       }
+      if (disposed) return;
 
       // Build set of current session IDs
       const currentSessionIds = new Set(
@@ -459,15 +461,17 @@ export function SpinningGlobe() {
       });
       toRemove.forEach(id => markersMap.delete(id));
 
-      // Create or update markers
+      const sessionsById = new Map(sessions.map(session => [session.session_id, session]));
+      // Mapbox feature properties cannot preserve nested traits.
       unclusteredFeatures.forEach(feature => {
-        const session = feature.properties as GetSessionsResponse[number];
-        if (!session?.session_id) return;
+        const session = sessionsById.get(feature.properties?.session_id);
+        if (!session) return;
 
         const existing = markersMap.get(session.session_id);
         const [lng, lat] = feature.geometry.coordinates;
 
         if (existing) {
+          setGlobeAvatar(existing.element, session, 32);
           const currentLngLat = existing.marker.getLngLat();
           if (currentLngLat.lng !== lng || currentLngLat.lat !== lat) {
             existing.marker.setLngLat([lng, lat]);
@@ -478,7 +482,7 @@ export function SpinningGlobe() {
           avatarContainer.className = "timeline-avatar-marker";
           avatarContainer.style.cssText =
             "cursor: pointer; width: 32px; height: 32px; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.55));";
-          avatarContainer.innerHTML = frogAvatarSVG(session.user_id, 32);
+          setGlobeAvatar(avatarContainer, session, 32);
 
           const marker = new mapboxgl.Marker({
             element: avatarContainer,
@@ -511,6 +515,7 @@ export function SpinningGlobe() {
     mapInstance.on("sourcedata", throttledUpdate);
 
     return () => {
+      disposed = true;
       throttledUpdate.cancel();
       mapInstance.off("zoom", throttledUpdate);
       mapInstance.off("move", throttledUpdate);

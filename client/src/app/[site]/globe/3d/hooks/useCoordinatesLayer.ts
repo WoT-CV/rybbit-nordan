@@ -4,7 +4,7 @@ import mapboxgl from "mapbox-gl";
 import { useEffect, useRef } from "react";
 import { useGetSessionLocations } from "../../../../../api/analytics/hooks/useGetSessionLocations";
 import { addFilter, removeFilter, useStore } from "../../../../../lib/store";
-import { renderCountryFlag } from "../../utils/renderCountryFlag";
+import { hydrateGlobeAvatars, locationIdentityKey, locationTooltipHTML } from "../../utils/globeIdentity";
 
 const getSizeMultiplier = (total: number) => {
   if (total <= 50) return 3; // Large dots
@@ -32,6 +32,7 @@ export function useCoordinatesLayer({
   useEffect(() => {
     if (!map.current || !liveSessionLocations || !mapLoaded) return;
     const mapInstance = map.current;
+    const locationsByKey = new Map(liveSessionLocations.map(location => [locationIdentityKey(location), location]));
 
     // Initialize popup once
     if (!popupRef.current) {
@@ -78,6 +79,7 @@ export function useCoordinatesLayer({
               coordinates: [roundedLon, roundedLat],
             },
             properties: {
+              locationKey: locationIdentityKey(location),
               count: location.count,
               city: location.city,
               country: location.country,
@@ -240,27 +242,17 @@ export function useCoordinatesLayer({
       if (!e.features || e.features.length === 0 || !popupRef.current) return;
 
       const feature = e.features[0];
-      const city = feature.properties?.city || "Unknown";
-      const count = feature.properties?.count || 0;
-
-      const countryCode = feature.properties?.country?.length === 2 ? feature.properties?.country : "";
-      const flagSVG = renderCountryFlag(countryCode);
+      const location = locationsByKey.get(feature.properties?.locationKey);
+      if (!location) {
+        popupRef.current.remove();
+        return;
+      }
 
       const coordinates = e.lngLat;
-      const html = `
-            <div class="bg-neutral-850 border border-neutral-750 rounded-lg p-2" style="pointer-events: none;">
-              <div class="flex items-center gap-2 mb-1">
-                ${flagSVG}
-                <span class="text-sm font-medium text-white">${city}</span>
-              </div>
-              <div class="text-sm">
-                <span class="font-bold text-accent-400">${count.toLocaleString()}</span>
-                <span class="text-neutral-300"> sessions</span>
-              </div>
-            </div>
-          `;
+      const html = locationTooltipHTML(location);
 
       popupRef.current.setLngLat(coordinates).setHTML(html).addTo(mapInstance);
+      hydrateGlobeAvatars(popupRef.current.getElement());
     };
 
     const handleMouseLeave = () => {

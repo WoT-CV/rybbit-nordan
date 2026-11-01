@@ -195,7 +195,7 @@ export function UserRow({
       <td className={cn("py-1.5 pl-3 pr-2 align-middle", indented && "pl-9")}>
         <div className="flex min-w-0 items-center gap-2.5">
           <div className="shrink-0">
-            <Avatar size={24} id={linkId} lastActiveTime={DateTime.fromSQL(user.last_seen, { zone: "utc" })} />
+            <Avatar size={24} id={linkId} traits={user.traits} lastActiveTime={DateTime.fromSQL(user.last_seen, { zone: "utc" })} />
           </div>
           <div className="min-w-0">
             <div className="flex items-center gap-1.5">

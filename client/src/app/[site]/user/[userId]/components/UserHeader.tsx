@@ -113,7 +113,7 @@ export function UserHeader({ userId, displayName, data, isLoading, latestReplayS
   return (
     <header className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
       <div className="flex min-w-0 items-center gap-3.5">
-        <Avatar size={52} id={userId} />
+        <Avatar size={52} id={userId} traits={data?.traits} />
         <div className="min-w-0">
           {isLoading ? (
             <>

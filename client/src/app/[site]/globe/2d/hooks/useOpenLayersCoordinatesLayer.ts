@@ -11,7 +11,7 @@ import { Circle, Fill, Stroke, Style } from "ol/style";
 import { fromLonLat } from "ol/proj";
 import { useGetSessionLocations } from "../../../../../api/analytics/hooks/useGetSessionLocations";
 import { addFilter, removeFilter, useStore } from "../../../../../lib/store";
-import { renderCountryFlag } from "../../utils/renderCountryFlag";
+import { locationTooltipHTML, setGlobeTooltip } from "../../utils/globeIdentity";
 
 const getSizeMultiplier = (total: number) => {
   if (total <= 50) return 3; // Large dots
@@ -62,6 +62,7 @@ export function useOpenLayersCoordinatesLayer({ mapInstanceRef, mapViewRef, mapV
       });
 
       feature.setProperties({
+        location,
         count: location.count,
         city: location.city,
         country: location.country,
@@ -184,10 +185,7 @@ export function useOpenLayersCoordinatesLayer({ mapInstanceRef, mapViewRef, mapV
         map.getTargetElement().style.cursor = "pointer";
 
         const feature = features[0] as Feature;
-        const city = feature.get("city") || "Unknown";
-        const count = feature.get("count") || 0;
-        const countryCode = feature.get("country")?.length === 2 ? feature.get("country") : "";
-        const flagSVG = renderCountryFlag(countryCode);
+        const location = feature.get("location");
 
         // Create tooltip if it doesn't exist
         if (!tooltip) {
@@ -196,18 +194,7 @@ export function useOpenLayersCoordinatesLayer({ mapInstanceRef, mapViewRef, mapV
           document.body.appendChild(tooltip);
         }
 
-        tooltip.innerHTML = `
-          <div class="bg-neutral-850 border border-neutral-750 rounded-lg p-2 shadow-lg">
-            <div class="flex items-center gap-2 mb-1">
-              ${flagSVG}
-              <span class="text-sm font-medium text-white">${city}</span>
-            </div>
-            <div class="text-sm">
-              <span class="font-bold text-accent-400">${count.toLocaleString()}</span>
-              <span class="text-neutral-300"> sessions</span>
-            </div>
-          </div>
-        `;
+        setGlobeTooltip(tooltip, locationTooltipHTML(location));
 
         tooltip.style.cssText = `position: absolute; pointer-events: none; z-index: 10000; left: ${
           event.originalEvent.pageX + 10

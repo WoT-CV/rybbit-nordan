@@ -80,7 +80,7 @@ function SessionFacts({
 
       <dl className="mt-1.5">
         <Fact label={t("User")}>
-          <Avatar size={16} id={session.user_id} />
+          <Avatar size={16} id={session.user_id} traits={session.traits} />
           <Link href={userHref} className="truncate hover:underline">
             {getUserDisplayName(session)}
           </Link>

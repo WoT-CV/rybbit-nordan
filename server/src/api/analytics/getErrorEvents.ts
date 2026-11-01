@@ -8,6 +8,7 @@ import {
   runPaginatedQuery,
 } from "./utils/analyticsQuery.js";
 import { buildSessionAndRowFilterFragments, TARGET_EVENT_ROW_LEVEL_PARAMS } from "./utils/sessionFilters.js";
+import { enrichWithTraits } from "./utils/utils.js";
 
 interface GetErrorEventsRequest {
   Params: {
@@ -25,6 +26,8 @@ export type ErrorEvent = {
   timestamp: string;
   session_id: string;
   user_id: string | null;
+  identified_user_id: string;
+  traits: Record<string, unknown> | null;
   pathname: string | null;
   hostname: string | null;
   page_title: string | null;
@@ -91,6 +94,7 @@ export const buildErrorEventsQuery = (
         timestamp,
         session_id,
         user_id,
+        identified_user_id,
         pathname,
         hostname,
         page_title,
@@ -147,14 +151,14 @@ export const getErrorEvents = analyticsRoute<GetErrorEventsRequest>(
     const dataSpec = { query: buildErrorEventsQuery(req.query, siteId, false), params };
 
     if (req.query.page !== undefined) {
-      const result = await runPaginatedQuery<ErrorEvent>(dataSpec, {
+      const result = await runPaginatedQuery<Omit<ErrorEvent, "traits">>(dataSpec, {
         query: buildErrorEventsQuery(req.query, siteId, true),
         params,
       });
-      return res.send({ data: result });
+      return res.send({ data: { ...result, data: await enrichWithTraits(result.data, siteId) } });
     }
 
-    const items = await runAnalyticsQuery<ErrorEvent>(dataSpec);
-    return res.send({ data: items });
+    const items = await runAnalyticsQuery<Omit<ErrorEvent, "traits">>(dataSpec);
+    return res.send({ data: await enrichWithTraits(items, siteId) });
   }
 );

@@ -86,6 +86,7 @@ export function SessionCard({ session, onClick, userId, expandedByDefault, highl
                 <Avatar
                   size={24}
                   id={session.user_id}
+                  traits={session.traits}
                   lastActiveTime={DateTime.fromSQL(session.session_end, { zone: "utc" })}
                 />
                 <span className="text-xs text-neutral-600 dark:text-neutral-200 truncate max-w-[150px]">
@@ -190,6 +191,7 @@ export function SessionCard({ session, onClick, userId, expandedByDefault, highl
               <Avatar
                 size={24}
                 id={session.user_id}
+                traits={session.traits}
                 lastActiveTime={DateTime.fromSQL(session.session_end, { zone: "utc" })}
               />
               <span className="text-xs text-neutral-600 dark:text-neutral-200 w-24 truncate hover:underline">

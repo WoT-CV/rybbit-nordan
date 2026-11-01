@@ -244,3 +244,87 @@ na produkcji i brak zmian dependency pins.
   3 pliki / 37 testów PASS, server typecheck i ponowny build serwera PASS.
   Locale: dokładnie trzy nowe tłumaczenia w 12 językach; zachowano wszystkie
   wcześniejsze wartości i klucze. Usunięto wyłącznie własny format-only churn.
+
+## Etap 3 — analiza i plan przed implementacją
+
+### Ponowna analiza źródeł
+
+Producent wot-cv-fe nadal identyfikuje String(userId) i przekazuje username/name
+w formacie [TAG] nick, clanTag, customerId/customerName, avatarUrl, language,
+browserLanguage i theme. AvatarUrl to logo klanu. Nie wywołuje identify bez
+clanTag; nie zmieniamy teraz tej polityki i nie dopisujemy drugiego TAG.
+Natywny getUserDisplayName już daje właściwą kolejność nazw. Profiles w PG są
+aktualnym stanem traits, nie historycznym zdjęciem przynależności do klanu.
+
+Users, UserHeader, Sessions, Replay i Events mają już traits z natywnego
+enrichment. Dwa wyjątki wykryte w pełnym audycie: Goals deklaruje sessions type,
+ale nie wybiera identified_user_id ani nie wzbogaca traits; Errors nie wybiera
+ID/profilu w obu gałęziach paginacji. Koordynaty Globe są agregatami bez profilu.
+Timeline Globe ma pełne sesje, lecz przejście przez GeoJSON może zamienić traits
+w JSON-string; rzutowanie typu nie przywraca obiektu. Istniejące markery zmieniają
+pozycję, ale wymagają też odświeżenia profilu/closure po zmianie nicku/logo.
+
+People/Teams/AppSidebar to konta operatorów panelu, nie odwiedzający WoT-CV:
+nie podmieniamy ich avatarów na loga klanów. Zachowujemy deterministyczną żabę
+jako fallback. Nie zmieniamy identify, SQL alias resolution, usuwania profili,
+schematu PG/CH ani public/private permissions.
+
+### Szczegółowa kolejność implementacji
+
+1. Wspólny getUserAvatarUrl(traits: unknown): avatarUrl → logoUrl → imageUrl →
+   avatar_url → picture. Dopuszczalne wyłącznie absolutne HTTP(S), bez danych
+   logowania, maks. 2048 znaków także po normalizacji. Zły priorytetowy wpis
+   pozwala sprawdzić następny; null/array/niestring nie jest URL.
+2. Rozszerzyć Avatar o optional traits. Logo object-contain, brak referrera,
+   lazy load, błąd obrazu daje natywną żabę. Zmiana URL po błędzie znów pokazuje
+   obraz. Bez useEffect do synchronizacji stanu; online dot zachowuje zachowanie.
+3. Przekazać dostępne traits w UserRow/UserHeader, ledger/details/cards,
+   SessionInfoTab, ReplayCard/breadcrumbs i EventRow. SessionInfoTab używa
+   getUserDisplayName zamiast lokalnej, rozjeżdżającej się kopii resolvera.
+4. Dodać natywny identified_user_id i jeden batch enrichWithTraits w Goals oraz
+   Errors (flat i paginated). Zachować envelope, porządek, totalCount i site
+   scope. Podłączyć Avatar/name/profile link w istniejących UI tych funkcji.
+5. W locations zachować obecne grupowanie i count. Wybrać techniczne native ID,
+   wzbogacić jednym batchem wyłącznie count=1 i zwrócić sample object lub null.
+   Pola ID zachowują natywne nazwy, aby processResults nie zmienił "000123" w 123.
+6. Mały bezpieczny adapter DOM Globe zamiast kopiowania map: używać wspólnego
+   URL resolvera, escape tekstów/atrybutów, bez inline JS. GeoJSON odszukuje
+   oryginalną sesję po ID lub niesie płaskie display fields. Uaktualniać istniejący
+   marker po zmianie profilu. Grupie count>1 nie przypisywać jednej osoby/logo.
+7. Testy: walidacja URL/priorytet, error→nowyURL, online/fallback, dotknięte widoki,
+   oba Error envelopes, Goals i site isolation, count1/countN, GeoJSON round-trip,
+   marker refresh i złośliwy HTML. Potem typecheck/build, review niezależne,
+   poprawki, zapis wyników i osobny commit. Browser QA wspólna w etapie 6.
+
+Własność plików: główny agent — userAvatar.ts, Avatar i zwykłe widoki (bez
+Errors/Goals/Globe). Subagent — Globe/helper DOM, trzy endpointy enrichment,
+typy odpowiedzi oraz Errors/Goals UI i testy. Dokument pozostaje u głównego
+agenta; niezależny reviewer nie edytuje tych plików. Produkcja bez zmian.
+
+### Review i wyniki etapu 3
+
+- Traits i logo są przekazane przez wszystkie zaplanowane powierzchnie;
+  Errors/Goals/lokalizacje używają istniejącego site-scoped PG enrichment.
+  Bez nowych schematów, migracji i read-time alias modelu. Grupy na mapie nie
+  są przedstawiane jako jedna osoba. Aktualne traits nie udają historii klanu.
+- Review wyłapało i usunęło: stare image error po zmianie logo (osobny keyed
+  image), błędne obiekty w nazwie (małe wzmocnienie natywnego resolvera),
+  wyścig GeoJSON array-index po przestawieniu wyników (stabilny klucz lokacji),
+  oraz async map callback po cleanup (disposed guard). Są regresje tych przypadków.
+- Pierwszy client build wykrył granicę Server/Client po dodaniu useState do
+  Avatar. Komponent ma teraz jawne use client; niezmieniony generateName został
+  przeniesiony do czystego helpera, a Avatar zachowuje re-export. Utils importuje
+  czystą funkcję zamiast komponentu. Ponowny build klienta PASS.
+- Główny agent: 4 pliki / 37 testów core/avatar/name/SessionInfo PASS oraz jeden
+  celowany test UserRow. Pozostałe 11 przypadków UserRow nie było wtedy odpalane
+  z powodu znanego locale baseline; pełny plik wraca w etapie 6, bez nowych skip.
+- Zakres subagenta: backend 4 pliki / 22 testy PASS, klient 5 plików / 13 testów
+  PASS, oba typecheck PASS. Główny agent niezależnie wykonał oba buildy: PASS.
+  Realny lint delta w 65 dotkniętych/new TS/TSX (etapy 2+3) nie dodał errors;
+  odziedziczonych errors nie przedstawiamy jako zaliczonego pełnego lint.
+- Dwa niezależne review nie zostawiły blokad w źródłach po poprawkach.
+  Weryfikacja PG helpera obejmuje źródło site+ID i mockowany kontrakt handlera,
+  nie rzeczywistą bazę. Prawdziwy Mapbox/OpenLayers, obrazy oraz fizyczny iPhone
+  nie są zaliczone przez mocki. Pozostają acceptance etapu 6/wdrożenia.
+- Usunięto wyłącznie własny extraction churn: odtworzono semantycznie identyczne
+  locale i dwa usuwane baseline keys po weryfikacji wartości. Produkcja nietknięta.

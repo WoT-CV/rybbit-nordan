@@ -339,6 +339,7 @@ function UserHeader({ data, siteId }: { data: any; siteId: number }) {
       <div className="flex items-center gap-2 min-w-0">
         <Avatar
           id={data.metadata.user_id}
+          traits={data.metadata.traits}
           size={24}
           lastActiveTime={
             data.metadata.end_time

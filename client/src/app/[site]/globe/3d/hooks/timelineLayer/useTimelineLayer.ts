@@ -76,6 +76,7 @@ export function useTimelineLayer({
 
     const mapInstance = map.current;
     const markersMap = markersMapRef.current;
+    let disposed = false;
 
     // Hide layers and markers if not in timeline view
     if (mapView !== "timeline") {
@@ -107,7 +108,8 @@ export function useTimelineLayer({
         openTooltipSessionIdRef,
         map,
         setSelectedSession,
-        SPREAD_START_ZOOM
+        SPREAD_START_ZOOM,
+        () => !disposed
       );
     };
 
@@ -138,7 +140,10 @@ export function useTimelineLayer({
 
     // Cleanup function
     return () => {
+      disposed = true;
       clearAllMarkers(markersMap);
+      popupRef.current?.remove();
+      openTooltipSessionIdRef.current = null;
       throttledUpdateMarkers.cancel(); // Cancel any pending throttled calls
       mapInstance.off("zoom", handleZoomChange);
       mapInstance.off("zoom", throttledUpdateMarkers);

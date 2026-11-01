@@ -11,7 +11,7 @@ import VectorSource from "ol/source/Vector";
 import { Circle, Fill, Style, Text } from "ol/style";
 import { useEffect, useRef, useState } from "react";
 import type { GetSessionsResponse } from "../../../../../api/analytics/endpoints";
-import { frogAvatarSVG } from "../../../../../lib/frogAvatar";
+import { setGlobeAvatar, setGlobeTooltip } from "../../utils/globeIdentity";
 import { useActiveSessions, useTimelineStore } from "../../timelineStore";
 import { CLUSTER_MAX_ZOOM, CLUSTERING_THRESHOLD, MIN_CLUSTER_SIZE } from "../../utils/clusteringConstants";
 import { buildTooltipHTML } from "../../utils/timelineTooltipBuilder";
@@ -130,8 +130,23 @@ export function useOpenLayersTimelineLayer({ mapInstanceRef, mapViewRef, mapView
 
     const overlaysMap = overlaysMapRef.current;
 
+    if (openTooltipSessionIdRef.current && tooltipOverlayRef.current) {
+      const session = activeSessions.find(item => item.session_id === openTooltipSessionIdRef.current);
+      if (session) {
+        tooltipSessionRef.current = session;
+        setGlobeTooltip(tooltipOverlayRef.current.getElement()!, buildTooltipHTML(session, session.lon, session.lat));
+      } else {
+        tooltipOverlayRef.current.setPosition(undefined);
+        openTooltipSessionIdRef.current = null;
+        tooltipSessionRef.current = null;
+      }
+    }
+
     // Hide everything if not in timeline view
     if (mapView !== "timeline") {
+      tooltipOverlayRef.current?.setPosition(undefined);
+      openTooltipSessionIdRef.current = null;
+      tooltipSessionRef.current = null;
       // Clear overlays
       overlaysMap.forEach(({ overlay, cleanup }) => {
         cleanup();
@@ -148,6 +163,7 @@ export function useOpenLayersTimelineLayer({ mapInstanceRef, mapViewRef, mapView
     }
 
     let clusterMoveEndKey: EventsKey | EventsKey[] | null = null;
+    let disposed = false;
 
     // Determine if we should use clustering
     const shouldCluster = activeSessions.length > CLUSTERING_THRESHOLD && currentZoomRef.current < CLUSTER_MAX_ZOOM;
@@ -229,6 +245,7 @@ export function useOpenLayersTimelineLayer({ mapInstanceRef, mapViewRef, mapView
 
       // Function to update unclustered overlays
       const updateUnclusteredOverlays = () => {
+        if (disposed) return;
         // Get unclustered features (clusters with size < MIN_CLUSTER_SIZE) and create overlays for them
         const extent = map.getView().calculateExtent(map.getSize());
         const clusterFeatures = clusterSource.getFeaturesInExtent(extent);
@@ -280,8 +297,7 @@ export function useOpenLayersTimelineLayer({ mapInstanceRef, mapViewRef, mapView
             avatarContainer.className = "timeline-avatar-marker";
             avatarContainer.style.cssText = AVATAR_MARKER_STYLE;
 
-            const avatarSVG = frogAvatarSVG(session.user_id, 32);
-            avatarContainer.innerHTML = avatarSVG;
+            setGlobeAvatar(avatarContainer, session, 32);
 
             const handleAvatarClick = (e: MouseEvent) => {
               e.stopPropagation();
@@ -295,7 +311,7 @@ export function useOpenLayersTimelineLayer({ mapInstanceRef, mapViewRef, mapView
 
               if (tooltipOverlayRef.current) {
                 const html = buildTooltipHTML(session, session.lon, session.lat);
-                tooltipOverlayRef.current.getElement()!.innerHTML = html;
+                setGlobeTooltip(tooltipOverlayRef.current.getElement()!, html);
                 tooltipOverlayRef.current.setPosition(fromLonLat([session.lon, session.lat]));
                 openTooltipSessionIdRef.current = session.session_id;
                 tooltipSessionRef.current = session;
@@ -389,8 +405,7 @@ export function useOpenLayersTimelineLayer({ mapInstanceRef, mapViewRef, mapView
           avatarContainer.className = "timeline-avatar-marker";
           avatarContainer.style.cssText = AVATAR_MARKER_STYLE;
 
-          const avatarSVG = frogAvatarSVG(session.user_id, 32);
-          avatarContainer.innerHTML = avatarSVG;
+          setGlobeAvatar(avatarContainer, session, 32);
 
           // Add click handler for tooltip
           const handleAvatarClick = (e: MouseEvent) => {
@@ -407,7 +422,7 @@ export function useOpenLayersTimelineLayer({ mapInstanceRef, mapViewRef, mapView
             // Show tooltip for this session
             if (tooltipOverlayRef.current) {
               const html = buildTooltipHTML(session, session.lon, session.lat);
-              tooltipOverlayRef.current.getElement()!.innerHTML = html;
+              setGlobeTooltip(tooltipOverlayRef.current.getElement()!, html);
               tooltipOverlayRef.current.setPosition(fromLonLat([session.lon, session.lat]));
               openTooltipSessionIdRef.current = session.session_id;
               tooltipSessionRef.current = session;
@@ -485,6 +500,7 @@ export function useOpenLayersTimelineLayer({ mapInstanceRef, mapViewRef, mapView
 
     // Cleanup function
     return () => {
+      disposed = true;
       dispose(mapClickKey);
 
       if (clusterMoveEndKey) {

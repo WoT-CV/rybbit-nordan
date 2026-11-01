@@ -123,6 +123,7 @@ export function ReplayCard({ replay, onSelect }: { replay: SessionReplayListItem
         <Avatar
           size={18}
           id={replay.user_id}
+          traits={replay.traits}
           lastActiveTime={replay.end_time ? DateTime.fromSQL(replay.end_time, { zone: "utc" }) : undefined}
         />
         <span className="text-xs font-medium text-neutral-800 dark:text-neutral-200 truncate min-w-0">

@@ -1,7 +1,7 @@
 import { clsx, type ClassValue } from "clsx";
 import { Duration } from "luxon";
 import { twMerge } from "tailwind-merge";
-import { generateName } from "../components/Avatar";
+import { generateName } from "./generateName";
 import { userLocale } from "./dateTimeUtils";
 
 export function cn(...inputs: ClassValue[]) {
@@ -123,14 +123,12 @@ export function isValidDomain(domain: string): boolean {
 export function getUserDisplayName<
   T extends { identified_user_id?: string; traits?: Record<string, unknown> | null; user_id?: string },
 >(data: T) {
-  const traitsUsername = data?.traits?.username as string | undefined;
-  const traitsName = data?.traits?.name as string | undefined;
-  const traitsEmail = data?.traits?.email as string | undefined;
+  const profileName = [data?.traits?.username, data?.traits?.name, data?.traits?.email].find(
+    (value): value is string => typeof value === "string" && value.trim().length > 0
+  );
   const isIdentified = !!data?.identified_user_id;
   return (
-    traitsUsername ||
-    traitsName ||
-    traitsEmail ||
+    profileName ||
     (isIdentified ? (data?.identified_user_id as string) : generateName(data?.user_id as string))
   );
 }

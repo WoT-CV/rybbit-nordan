@@ -57,7 +57,9 @@ vi.mock("@/hooks/useDateTimeFormat", () => ({
 }));
 
 vi.mock("@/components/Avatar", () => ({
-  Avatar: () => <span data-testid="avatar" />,
+  Avatar: ({ traits }: { traits?: Record<string, unknown> | null }) => (
+    <span data-testid="avatar" data-avatar-url={typeof traits?.avatarUrl === "string" ? traits.avatarUrl : undefined} />
+  ),
   generateName: (id: string) => `Visitor ${id}`,
 }));
 vi.mock("@/components/Favicon", () => ({ Favicon: () => <span /> }));
@@ -127,6 +129,12 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("UserRow", () => {
+  it("preserves WoT-CV clan name, profile ID and logo traits without a second tag", () => {
+    renderRow({ ...identified, traits: { username: "[WOT] Player", name: "[WOT] Player", clanTag: "WOT", avatarUrl: "https://cdn.example.com/clan.png" } });
+    expect(screen.getByRole("link", { name: "[WOT] Player" }).getAttribute("href")).toBe("/7/user/usr%2F42");
+    expect(screen.getByTestId("avatar").getAttribute("data-avatar-url")).toBe("https://cdn.example.com/clan.png");
+  });
+
   it("shows an identified user by name with the email under it, and their traits", () => {
     renderRow(identified);
 

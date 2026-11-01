@@ -21,6 +21,8 @@ export type ErrorEvent = {
   timestamp: string;
   session_id: string;
   user_id: string | null;
+  identified_user_id: string;
+  traits: Record<string, unknown> | null;
   pathname: string | null;
   hostname: string | null;
   page_title: string | null;

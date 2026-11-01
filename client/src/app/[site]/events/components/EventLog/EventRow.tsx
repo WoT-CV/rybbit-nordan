@@ -147,7 +147,7 @@ export function EventRow({ event, site, privateKey, typeLabel, onClick, arrivedA
         onClick={e => e.stopPropagation()}
         className="flex min-w-0 items-center gap-2 hover:underline"
       >
-        <Avatar size={18} id={event.user_id} lastActiveTime={eventTime} />
+        <Avatar size={18} id={event.user_id} traits={event.traits} lastActiveTime={eventTime} />
         <span className="truncate text-neutral-700 dark:text-neutral-200">{displayName}</span>
         {event.identified_user_id && (
           <IdCard

@@ -9,6 +9,7 @@ import { analyticsRoute, runAnalyticsQuery } from "../utils/analyticsQuery.js";
 import { goalSessionUtmAgg } from "../utils/sessionAttribution.js";
 import { buildFilteredSessionsCTE } from "../utils/sessionFilters.js";
 import { buildGoalCondition } from "./goalConditions.js";
+import { enrichWithTraits } from "../utils/utils.js";
 
 export interface GetGoalSessionsRequest {
   Params: {
@@ -46,6 +47,7 @@ export const buildGoalSessionsQuery = (
       SELECT
         e.session_id,
         e.user_id,
+        argMax(e.identified_user_id, e.timestamp) AS identified_user_id,
         argMax(e.country, e.timestamp) AS country,
         argMax(e.region, e.timestamp) AS region,
         argMax(e.city, e.timestamp) AS city,
@@ -135,6 +137,6 @@ export const getGoalSessions = analyticsRoute<GetGoalSessionsRequest>(
       },
     });
 
-    return res.send({ data });
+    return res.send({ data: await enrichWithTraits(data, Number(siteId)) });
   }
 );

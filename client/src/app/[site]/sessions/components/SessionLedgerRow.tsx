@@ -151,7 +151,7 @@ export function SessionLedgerRow({ session, showGoals, showReplay, groupedByDay 
 
   const user = (
     <Link href={userHref} onClick={stop} className="flex min-w-0 items-center gap-2">
-      <Avatar size={20} id={session.user_id} lastActiveTime={DateTime.fromSQL(session.session_end, { zone: "utc" })} />
+      <Avatar size={20} id={session.user_id} traits={session.traits} lastActiveTime={DateTime.fromSQL(session.session_end, { zone: "utc" })} />
       <span
         className={cn(
           "truncate hover:underline",

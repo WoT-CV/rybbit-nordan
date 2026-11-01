@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("../../../db/clickhouse/clickhouse.js", () => ({
   clickhouse: { query: vi.fn() },
 }));
+vi.mock("../../../db/postgres/postgres.js", () => ({ db: {} }));
 
 import { buildSessionLocationsQuery } from "./getSessionLocations.js";
 
@@ -19,6 +20,9 @@ describe("buildSessionLocationsQuery session-scoped filters", () => {
     expect(sql).toContain("AND pathname = '/thank-you'");
     expect(sql).toContain("INNER JOIN FilteredSessions USING (session_id)");
     expect(sql).toContain("argMax(lat, timestamp) AS lat");
+    expect(sql).toContain("argMax(identified_user_id, timestamp) AS identified_user_id");
+    expect(sql).toContain("any(session_id) AS session_id");
+    expect(sql.slice(sql.lastIndexOf("GROUP BY"))).not.toMatch(/session_id|user_id/);
     expect(sql.match(/utm_campaign = 'recipe_book_2026'/g)).toHaveLength(1);
     expect(sql.match(/pathname = '\/thank-you'/g)).toHaveLength(1);
   });

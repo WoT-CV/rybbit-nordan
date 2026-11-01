@@ -1,6 +1,6 @@
 import mapboxgl from "mapbox-gl";
 import type { GetSessionsResponse } from "../../../../../../api/analytics/endpoints";
-import { frogAvatarSVG } from "../../../../../../lib/frogAvatar";
+import { globeIdentityKey, hydrateGlobeAvatars, setGlobeAvatar } from "../../../utils/globeIdentity";
 import { getUnclusteredFeatures } from "./timelineClusterUtils";
 import { buildTooltipHTML } from "../../../utils/timelineTooltipBuilder";
 
@@ -8,6 +8,7 @@ export type MarkerData = {
   marker: mapboxgl.Marker;
   element: HTMLDivElement;
   cleanup: () => void;
+  update: (session: GetSessionsResponse[number], lng: number, lat: number) => void;
 };
 
 /**
@@ -22,14 +23,16 @@ export function createAvatarMarker(
   openTooltipSessionIdRef: React.MutableRefObject<string | null>,
   map: React.RefObject<mapboxgl.Map | null>,
   setSelectedSession: (session: GetSessionsResponse[number]) => void
-): { marker: mapboxgl.Marker; element: HTMLDivElement; cleanup: () => void } {
+): MarkerData {
+  let currentSession = session;
+  let currentLng = lng;
+  let currentLat = lat;
   const avatarContainer = document.createElement("div");
   avatarContainer.className = "timeline-avatar-marker";
   avatarContainer.style.cssText =
     "cursor: pointer; width: 32px; height: 32px; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.55));";
 
-  const avatarSVG = frogAvatarSVG(session.user_id, 32);
-  avatarContainer.innerHTML = avatarSVG;
+  setGlobeAvatar(avatarContainer, session, 32);
 
   const marker = new mapboxgl.Marker({
     element: avatarContainer,
@@ -44,7 +47,7 @@ export function createAvatarMarker(
     if (!map.current || !popupRef.current) return;
 
     // If clicking the same marker that has the tooltip open, close it
-    if (popupRef.current.isOpen() && openTooltipSessionIdRef.current === session.session_id) {
+    if (popupRef.current.isOpen() && openTooltipSessionIdRef.current === currentSession.session_id) {
       popupRef.current.remove();
       openTooltipSessionIdRef.current = null;
       return;
@@ -55,17 +58,18 @@ export function createAvatarMarker(
       popupRef.current.remove();
     }
 
-    const html = buildTooltipHTML(session, lng, lat);
+    const html = buildTooltipHTML(currentSession, currentLng, currentLat);
 
-    popupRef.current.setLngLat([lng, lat]).setHTML(html).addTo(map.current);
-    openTooltipSessionIdRef.current = session.session_id;
+    popupRef.current.setLngLat([currentLng, currentLat]).setHTML(html).addTo(map.current);
+    hydrateGlobeAvatars(popupRef.current.getElement());
+    openTooltipSessionIdRef.current = currentSession.session_id;
 
     // Add click handler to the button
-    const button = document.querySelector(`[data-session-id="${session.session_id}"]`);
+    const button = popupRef.current.getElement()?.querySelector(".view-session-btn");
     if (button) {
       button.addEventListener("click", e => {
         e.stopPropagation();
-        setSelectedSession(session);
+        setSelectedSession(currentSession);
         popupRef.current?.remove();
         openTooltipSessionIdRef.current = null;
       });
@@ -78,7 +82,25 @@ export function createAvatarMarker(
     avatarContainer.removeEventListener("click", toggleTooltip);
   };
 
-  return { marker, element: avatarContainer, cleanup };
+  const update = (nextSession: GetSessionsResponse[number], nextLng: number, nextLat: number) => {
+    const identityChanged = globeIdentityKey(currentSession) !== globeIdentityKey(nextSession);
+    currentSession = nextSession;
+    currentLng = nextLng;
+    currentLat = nextLat;
+    setGlobeAvatar(avatarContainer, currentSession, 32);
+    const position = marker.getLngLat();
+    if (position.lng !== nextLng || position.lat !== nextLat) marker.setLngLat([nextLng, nextLat]);
+    // An already-open popup must not retain the profile from its creation.
+    if (
+      identityChanged &&
+      openTooltipSessionIdRef.current === currentSession.session_id &&
+      popupRef.current?.isOpen()
+    ) {
+      popupRef.current.remove();
+      openTooltipSessionIdRef.current = null;
+    }
+  };
+  return { marker, element: avatarContainer, cleanup, update };
 }
 
 /**
@@ -93,7 +115,8 @@ export async function updateMarkers(
   openTooltipSessionIdRef: React.MutableRefObject<string | null>,
   map: React.RefObject<mapboxgl.Map | null>,
   setSelectedSession: (session: GetSessionsResponse[number]) => void,
-  spreadStartZoom: number
+  spreadStartZoom: number,
+  isCurrent: () => boolean = () => true
 ): Promise<void> {
   // Get unclustered features (including expanded small clusters)
   const unclusteredFeatures = await getUnclusteredFeatures(
@@ -102,6 +125,7 @@ export async function updateMarkers(
     activeSessions,
     spreadStartZoom
   );
+  if (!isCurrent()) return;
 
   // Build set of current session IDs
   const currentSessionIds = new Set(
@@ -122,20 +146,18 @@ export async function updateMarkers(
   });
   toRemove.forEach(id => markersMap.delete(id));
 
-  // Create or update markers for unclustered sessions
+  const sessionsById = new Map(activeSessions.map(session => [session.session_id, session]));
+  // Mapbox serializes nested properties. Resolve the original typed session,
+  // rather than pretending that feature.properties.traits is still an object.
   unclusteredFeatures.forEach(feature => {
-    const session = feature.properties as GetSessionsResponse[number];
-    if (!session?.session_id) return;
+    const session = sessionsById.get(feature.properties?.session_id);
+    if (!session) return;
 
     const existing = markersMap.get(session.session_id);
     const [lng, lat] = (feature.geometry as any).coordinates;
 
     if (existing) {
-      // Update position if needed
-      const currentLngLat = existing.marker.getLngLat();
-      if (currentLngLat.lng !== lng || currentLngLat.lat !== lat) {
-        existing.marker.setLngLat([lng, lat]);
-      }
+      existing.update(session, lng, lat);
     } else {
       // Create new marker
       const markerData = createAvatarMarker(

@@ -10,7 +10,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { useDateTimeFormat } from "../../../../hooks/useDateTimeFormat";
 import { useGetRegionName } from "@/lib/geo";
 import { getTimezone } from "@/lib/store";
-import { getCountryName, truncateString } from "@/lib/utils";
+import { getCountryName, getUserDisplayName, truncateString } from "@/lib/utils";
 import { AlertTriangle, Code, Loader2, TriangleAlert } from "lucide-react";
 import { DateTime } from "luxon";
 import Link from "next/link";
@@ -32,7 +32,8 @@ function ErrorEventItem({ errorEvent }: { errorEvent: ErrorEvent }) {
   const t = useExtracted();
   const { formatRelative } = useDateTimeFormat();
   const { getRegionName } = useGetRegionName();
-  const { site } = useParams();
+  const { site, privateKey } = useParams();
+  const userId = errorEvent.identified_user_id || errorEvent.user_id;
 
   const getFullLocation = (event: ErrorEvent) => {
     let location = "";
@@ -114,14 +115,18 @@ function ErrorEventItem({ errorEvent }: { errorEvent: ErrorEvent }) {
           </Link>
         </div>
         <div className="flex items-center gap-2">
-          {errorEvent.user_id && (
+          {userId && (
             <Tooltip>
               <TooltipTrigger asChild>
-                <Link href={`/${site}/user/${encodeURIComponent(errorEvent.user_id)}`}>
-                  <Avatar size={24} id={errorEvent.user_id} />
+                <Link
+                  href={`/${site}/${privateKey ? `${privateKey}/` : ""}user/${encodeURIComponent(userId)}`}
+                >
+                  <Avatar size={24} id={errorEvent.user_id || userId} traits={errorEvent.traits} />
                 </Link>
               </TooltipTrigger>
-              <TooltipContent>User ID: {errorEvent.user_id}</TooltipContent>
+              <TooltipContent>
+                {getUserDisplayName({ ...errorEvent, user_id: errorEvent.user_id ?? undefined })}
+              </TooltipContent>
             </Tooltip>
           )}
         </div>
