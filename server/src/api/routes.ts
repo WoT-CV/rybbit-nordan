@@ -110,6 +110,7 @@ import {
   updateUserTraits,
 } from "./analytics/index.js";
 import { getConfig, getVersion } from "./getConfig.js";
+import { getReplayCorrelationConfig } from "./sessionReplay/getReplayCorrelationConfig.js";
 import {
   createExperiment,
   deleteExperiment,
@@ -464,6 +465,7 @@ async function sessionReplayRoutes(fastify: FastifyInstance) {
   // Session Replay
   fastify.post("/session-replay/record/:siteId", publicRoute, recordSessionReplay); // Public - tracking endpoint
   fastify.get("/sites/:siteId/session-replay/list", publicReplayRead, getSessionReplays);
+  fastify.get("/sites/:siteId/session-replay/correlation-config", site("replay:read"), getReplayCorrelationConfig);
   fastify.get("/sites/:siteId/session-replay/:sessionId", publicReplayRead, getSessionReplayEvents);
   fastify.delete("/sites/:siteId/session-replay/:sessionId", site("replay:delete"), deleteSessionReplay);
 }

@@ -328,3 +328,95 @@ agenta; niezależny reviewer nie edytuje tych plików. Produkcja bez zmian.
   nie są zaliczone przez mocki. Pozostają acceptance etapu 6/wdrożenia.
 - Usunięto wyłącznie własny extraction churn: odtworzono semantycznie identyczne
   locale i dwa usuwane baseline keys po weryfikacji wartości. Produkcja nietknięta.
+
+## Etap 4 — ponowna analiza i plan przed implementacją
+
+Natywny rrweb przenosi CustomEvent (type=5) bez nowej tabeli: ingest zapisuje
+data jako JSON, odczyt odtwarza obiekt. Zatem korelacja nie wymaga starego
+Network Replay, Identity v2, modyfikacji kompresji ani schematu. `rybbit.event`
+nie jest właściwym kanałem (analytics, a nie rrweb). Rejestrator musi być
+właścicielem obserwacji HTTP: poza aktywną, wylosowaną powtórką nie ma capture.
+Native clock-skew poprawia zewnętrzny timestamp; nie zapisujemy drugiego
+absolutnego czasu wewnątrz payloadu. Odtwarzacz pozostaje natywny.
+
+Najważniejsze ryzyka: stare completion po stop/restart/identify, ponowne użycie
+XHR, nadpisanie wrappera innego narzędzia, odczyt/klonowanie body, redirect na
+obcy origin, publiczne udostępnienie konfiguracji Grafany, cache poprzedniej
+witryny lub użytkownika, duplikaty retry i zamknięcie mobile drawer przez dialog.
+Istnienie ID nie dowodzi retencji logów/body; trace może nie istnieć przy
+sampling. Historyczne nagrania bez CustomEvent pozostają odtwarzalne.
+
+Plan i kryteria odbioru:
+
+1. Mały wspólny kontrakt `wotcv/request-correlation@1`: rowId, transport,
+   method, origin, pathname, status, outcome, durationMs, opcjonalne correlationId
+   i traceId. Zewnętrzny timestamp jest czasem zakończenia żądania. Parser
+   kopiuje tylko whitelist, odrzuca nieprawidłowe wartości/ID i nie zgaduje braków.
+   Brak query/hash/credentials, headers map, body, stack i resource timing.
+2. Operator podaje `WOTCV_REPLAY_CORRELATION_JSON`; domyślnie wyłączone.
+   Profile: siteIds, requestOrigin, grafanaUrl, orgId, lokiDatasourceUid,
+   opcjonalny tempoDatasourceUid, serviceName, environment, timePaddingMs.
+   Limity rozmiaru/liczby, ścisłe URL, brak wildcard i dwuznaczności site+origin;
+   błędne JSON daje ogólny błąd, nigdy surowy input ani cause z parsera.
+3. Public tracking config ujawnia wyłącznie allowlist origins, gdy replay jest
+   włączony. Osobny no-store endpoint correlation-config wymaga natywnego
+   `site(replay:read)` i nie dziedziczy publicReplayRead/private-key dostępu.
+4. Fetch/XHR obserwuje tylko znane response headers x-correlation-id/x-trace-id.
+   Bez outgoing injection, preflight i dotykania streamu. Zachować argumenty,
+   this, identyczną Response/rejection, semantykę abort/timeout/500. Sprawdzić
+   początkowy i końcowy origin. Ograniczyć pending do 64, rows do 2000 oraz
+   istniejące natywne budżety. Ominąć własny transport analytics/replay.
+5. Właściciel/epoch rejestratora unieważnia pending przy stop, size cap,
+   cleanup, identity/session transition; stop podczas ładowania rrweb również
+   blokuje późny start. Cleanup przywraca wrapper tylko jeżeli nadal jest własny.
+6. UI: niewielki memoizowany dialog Requests w istniejącym player topbar,
+   dostępny także mobile. Natywny seek; brak nowego zegara/player/store.
+   Widoczne granice capture, empty/history/no-ID/unconfigured/error states.
+   Dedupe rowId, nie correlationId (równoległe żądania nie mogą zniknąć).
+7. Hook konfiguracji non-analytics endpoints+hooks, query key site+principal+
+   uprawnienia; pobieranie dopiero po otwarciu, bez previous-site placeholder,
+   public/private-key/wylogowany nie otrzymuje profili. Logi/Trace to osobne
+   bezpieczne anchors HTTPS, noopener/noreferrer. Loki: dokładne service/env i
+   structured metadata correlation filter; Tempo: traceId. Okno od poprawionego
+   timestamp-duration do timestamp z ograniczonym padding, encoding JSON/URL.
+8. Testy kontraktu, config/route auth, lifecycle/race/HTTP semantics i caps,
+   parser/link injection oraz UI/cache/seek. Następnie niezależne review,
+   poprawki, builds/typechecks i porządek locale/artifacts. Rendered synthetic
+   cross-browser w etapie 6; prawdziwa retencja Grafany pozostaje live gate.
+
+Własność: subagent implementuje shared + server/tracker i testy/artifacts;
+główny agent client endpoint/hook/dialog/link builder i dokument. Reviewer
+pracuje read-only na integracji. Bez nowych zależności, SQL, migracji i produkcji.
+
+### Review i wyniki etapu 4
+
+- Wykonano kontrakt, site-scoped konfigurację, chroniony endpoint, bounded
+  fetch/XHR observer, lifecycle rejestratora i niewielki memoizowany dialog
+  Requests z natywnym seek oraz linkami Loki/Tempo. Wszystkie 12 locale mają
+  dokładnie 17 nowych tłumaczeń, bez zmiany/usunięcia istniejących wartości.
+- Review poprawiło redirect A→B, tłumienie unhandledrejection, częściowo
+  nieudany patch read-only globals, konkurencyjnych właścicieli, stop podczas
+  ładowania rrweb, sampled-out manual start i stare batch controls po identify.
+  rrweb bez stop function nie włącza obserwacji. JSON jest ograniczone także
+  w bajtach UTF-8; znormalizowane URL mają te same granice co klient.
+- Rozszerzony real-browser smoke znalazł utratę pierwszego zakończonego XHR,
+  gdy aplikacja ponownie używa go w onload. Sam capture flag nie naprawił tego
+  w Chromium (9 zamiast 10 rows). Ostatecznie wrappedOpen odczytuje już gotowy
+  stary response przed natywnym resetem wyłącznie dla readyState4/status>=100.
+  Nie zgaduje wyniku status0. Ponowny test: wszystkie 10 rows w trzech silnikach.
+- Niezależne końcowe review nie zgłasza blokad źródłowych po poprawkach.
+  Główny agent: server 7 plików / 70 testów PASS; shared cały pakiet 2 pliki /
+  68 testów PASS (36 kontraktu); client 4 pliki / 23 testy PASS. Bez nowych skip.
+  Prawdziwy browser observer smoke: Chromium/Firefox/WebKit PASS, również
+  hidden CORS IDs, AbortController, synchroniczny/reused XHR i unhandledrejection.
+- Oba niezależnie wykonane buildy PASS. Serwer buduje tracker z lokalnego
+  source contract alias; natywne storage/query/schema i player/store nie są
+  zmienione. Route snapshot jest rozszerzony tylko o deklarowany endpoint.
+  Lint delta 76 plików: brak nowych errors, 14 odziedziczonych pozostaje.
+- Zmierzony script.js: baza 37 351 B → 44 788 B (+7 437 B); porównawcze gzip
+  11 823 B → 14 162 B (+2 339 B). To pomiar kosztu skryptu, nie upload replay,
+  nie deklaracja produkcyjnego oszczędzania transferu ani zmiana limitów.
+- Test roundtrip wykonuje prawdziwy ingest/query/clock correction z mockami
+  infrastruktury, nie bazę. Pełny ekran Next+rrweb i mobile acceptance wracają
+  w etapie 6; fizyczny iPhone oraz rzeczywiste datasource/retencja nadal live gate.
+  Instrukcja operatora: WOTCV_REPLAY_CORRELATION.md. Produkcja bez zmian.

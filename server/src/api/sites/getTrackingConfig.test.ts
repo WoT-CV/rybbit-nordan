@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   getConfig: vi.fn(),
@@ -21,6 +21,7 @@ vi.mock("../../services/usageService.js", () => ({
 import { getTrackingConfig } from "./getTrackingConfig.js";
 
 describe("getTrackingConfig", () => {
+  afterEach(() => vi.unstubAllEnvs());
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.getConfig.mockResolvedValue({
@@ -50,6 +51,26 @@ describe("getTrackingConfig", () => {
 
     expect(mocks.hasFeatureFlagsForRuntime).toHaveBeenCalledWith(123, "client");
     expect(reply.send).toHaveBeenCalledWith(expect.objectContaining({ featureFlagsEnabled: false }));
+  });
+
+  it.each([false, true])("publishes only origin allowlists when replay is active=%s", async active => {
+    mocks.getConfig.mockResolvedValue({ ...(await mocks.getConfig()), sessionReplay: active });
+    vi.stubEnv("WOTCV_REPLAY_CORRELATION_JSON", JSON.stringify([{ siteIds: [123], requestOrigin: "https://api.example.com", grafanaUrl: "https://private-grafana.example.com", orgId: 1, lokiDatasourceUid: "private-loki", serviceName: "secret-service", environment: "prod", timePaddingMs: 1000 }]));
+    const reply = { send: vi.fn(), status: vi.fn().mockReturnThis() } as any;
+    await getTrackingConfig({ params: { siteId: "123" }, log: { error: vi.fn() } } as any, reply);
+    const body = reply.send.mock.calls[0][0];
+    expect(body.requestCorrelation).toEqual(active ? { origins: ["https://api.example.com"] } : undefined);
+    expect(JSON.stringify(body)).not.toMatch(/grafana|private-loki|secret-service/);
+  });
+
+  it("fails correlation closed without breaking native tracking when its operator config is invalid", async () => {
+    mocks.getConfig.mockResolvedValue({ ...(await mocks.getConfig()), sessionReplay: true });
+    vi.stubEnv("WOTCV_REPLAY_CORRELATION_JSON", "sensitive invalid config");
+    const log = { error: vi.fn() }; const reply = { send: vi.fn(), status: vi.fn().mockReturnThis() } as any;
+    await getTrackingConfig({ params: { siteId: "123" }, log } as any, reply);
+    expect(reply.status).not.toHaveBeenCalled();
+    expect(reply.send.mock.calls[0][0]).toMatchObject({ sessionReplay: true, requestCorrelation: { origins: [] } });
+    expect(JSON.stringify(log.error.mock.calls)).not.toContain("sensitive");
   });
 
   it.each([true, false])("returns URL fragment tracking set to %s", async enabled => {

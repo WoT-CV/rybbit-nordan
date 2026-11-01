@@ -18,7 +18,10 @@ if (!existsSync(publicDir)) {
 // alias names the contract module, not the package barrel, so nothing else in
 // @rybbit/shared can ever reach a tracked page.
 const botSignalContractSource = resolve(__dirname, "../../../shared/src/botSignalContract.ts");
-const bundleContractFromSource = { "@rybbit/shared/dist/botSignalContract.js": botSignalContractSource };
+const bundleContractFromSource = {
+  "@rybbit/shared/dist/botSignalContract.js": botSignalContractSource,
+  "@rybbit/shared/dist/requestCorrelation.js": resolve(__dirname, "../../../shared/src/requestCorrelation.ts"),
+};
 
 async function buildScript() {
   try {

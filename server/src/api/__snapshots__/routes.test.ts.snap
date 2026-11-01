@@ -109,6 +109,7 @@ exports[`API route table > pins the access each route requires 1`] = `
   "GET    /api/sites/:siteId/segments → site segments:read [viewer+] (or public)",
   "GET    /api/sites/:siteId/segments/:segmentId → site segments:read [viewer+] (or public)",
   "GET    /api/sites/:siteId/session-replay/:sessionId → site replay:read [viewer+] (or public)",
+  "GET    /api/sites/:siteId/session-replay/correlation-config → site replay:read [viewer+]",
   "GET    /api/sites/:siteId/session-replay/list → site replay:read [viewer+] (or public)",
   "GET    /api/sites/:siteId/sessions → site sessions:read [viewer+] (or public)",
   "GET    /api/sites/:siteId/sessions/:sessionId → site sessions:read [viewer+] (or public)",

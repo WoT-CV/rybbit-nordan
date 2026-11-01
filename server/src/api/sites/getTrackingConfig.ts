@@ -2,6 +2,7 @@ import { FastifyReply, FastifyRequest } from "fastify";
 import { siteConfig } from "../../lib/siteConfig.js";
 import { hasFeatureFlagsForRuntime } from "../../services/featureFlags/definitions.js";
 import { usageService } from "../../services/usageService.js";
+import { getReplayCorrelationProfiles } from "../../lib/replayCorrelation.js";
 
 export async function getTrackingConfig(request: FastifyRequest<{ Params: { siteId: string } }>, reply: FastifyReply) {
   try {
@@ -16,6 +17,11 @@ export async function getTrackingConfig(request: FastifyRequest<{ Params: { site
     // never loads the recorder (replay payloads would be dropped at ingest anyway)
     const sessionReplay =
       config.type === "mobile" ? false : config.sessionReplay && !usageService.isSiteWithoutReplay(config.siteId);
+    let correlationOrigins: string[] = [];
+    if (sessionReplay) {
+      try { correlationOrigins = getReplayCorrelationProfiles(config.siteId).map(profile => profile.requestOrigin); }
+      catch { request.log.error("Invalid replay correlation configuration"); }
+    }
     const featureFlagsEnabled = await hasFeatureFlagsForRuntime(config.siteId, "client");
 
     // Return tracking configuration
@@ -27,6 +33,7 @@ export async function getTrackingConfig(request: FastifyRequest<{ Params: { site
       type: config.type,
       featureFlagsEnabled,
       sessionReplay,
+      ...(sessionReplay ? { requestCorrelation: { origins: correlationOrigins } } : {}),
       webVitals: config.type === "mobile" ? false : config.webVitals,
       trackErrors: config.trackErrors,
       trackOutbound: config.trackOutbound,

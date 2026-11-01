@@ -29,6 +29,7 @@ export interface ScriptConfig {
   sessionReplaySampling?: Record<string, any>;
   sessionReplaySlimDOMOptions?: Record<string, boolean> | boolean;
   sessionReplaySampleRate?: number; // 0-100, percentage of sessions to record
+  requestCorrelation?: { origins: string[] };
   trackButtonClicks: boolean;
   trackCopy: boolean;
   trackFormInteractions: boolean;

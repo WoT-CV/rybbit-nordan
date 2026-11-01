@@ -255,6 +255,9 @@ export async function parseScriptConfig(scriptTag: HTMLScriptElement): Promise<S
         enableWebVitals: apiConfig.webVitals ?? defaultConfig.enableWebVitals,
         trackErrors: apiConfig.trackErrors ?? defaultConfig.trackErrors,
         enableSessionReplay: apiConfig.sessionReplay ?? defaultConfig.enableSessionReplay,
+        requestCorrelation: apiConfig.sessionReplay === true && Array.isArray(apiConfig.requestCorrelation?.origins)
+          ? { origins: apiConfig.requestCorrelation.origins.filter((origin: unknown) => typeof origin === "string").slice(0, 32) }
+          : undefined,
         trackButtonClicks: apiConfig.trackButtonClicks ?? defaultConfig.trackButtonClicks,
         trackCopy: apiConfig.trackCopy ?? defaultConfig.trackCopy,
         trackFormInteractions: apiConfig.trackFormInteractions ?? defaultConfig.trackFormInteractions,

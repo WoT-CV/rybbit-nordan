@@ -265,6 +265,7 @@
           enableWebVitals: apiConfig.webVitals ?? defaultConfig.enableWebVitals,
           trackErrors: apiConfig.trackErrors ?? defaultConfig.trackErrors,
           enableSessionReplay: apiConfig.sessionReplay ?? defaultConfig.enableSessionReplay,
+          requestCorrelation: apiConfig.sessionReplay === true && Array.isArray(apiConfig.requestCorrelation?.origins) ? { origins: apiConfig.requestCorrelation.origins.filter((origin) => typeof origin === "string").slice(0, 32) } : void 0,
           trackButtonClicks: apiConfig.trackButtonClicks ?? defaultConfig.trackButtonClicks,
           trackCopy: apiConfig.trackCopy ?? defaultConfig.trackCopy,
           trackFormInteractions: apiConfig.trackFormInteractions ?? defaultConfig.trackFormInteractions,
@@ -487,6 +488,342 @@
     canvas.height = 0;
   }
 
+  // ../../../shared/src/requestCorrelation.ts
+  var REQUEST_CORRELATION_TAG = "wotcv/request-correlation@1";
+  var object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+  var isCorrelationId = (value) => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value) && !/\s/.test(value);
+  var isCorrelationTraceId = (value) => typeof value === "string" && value.length === 32 && /^[a-fA-F0-9]{32}$/.test(value) && !/^0{32}$/.test(value);
+  function parseRequestCorrelationEvent(value) {
+    if (!object(value) || value.type !== 5 && value.type !== "5" || !object(value.data) || value.data.tag !== REQUEST_CORRELATION_TAG)
+      return;
+    const timestamp = value.timestamp;
+    const payload = value.data.payload;
+    if (!Number.isSafeInteger(timestamp) || timestamp <= 0 || timestamp > 864e13 || !object(payload))
+      return;
+    const { rowId, transport, method, origin, pathname, status, outcome, durationMs, correlationId, traceId } = payload;
+    if (typeof rowId !== "string" || !/^[A-Za-z0-9_-]{1,80}$/.test(rowId) || /\s/.test(rowId)) return;
+    if (transport !== "fetch" && transport !== "xhr") return;
+    if (typeof method !== "string" || !/^[A-Z]{1,16}$/.test(method) || /\s/.test(method)) return;
+    if (typeof origin !== "string" || origin.length > 256) return;
+    try {
+      const url = new URL(origin);
+      if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || origin !== url.origin) return;
+    } catch {
+      return;
+    }
+    if (typeof pathname !== "string" || pathname.length > 2048 || !pathname.startsWith("/") || /[?#\u0000-\u001f\u007f]/.test(pathname))
+      return;
+    if (!Number.isInteger(status) || status < 0 || status > 599) return;
+    if (!["response", "network-error", "abort", "timeout"].includes(outcome)) return;
+    if (outcome === "response" ? status < 100 : status !== 0) return;
+    if (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs < 0 || durationMs > 36e5)
+      return;
+    if (correlationId !== void 0 && !isCorrelationId(correlationId)) return;
+    if (traceId !== void 0 && !isCorrelationTraceId(traceId)) return;
+    return {
+      timestamp,
+      request: {
+        rowId,
+        transport,
+        method,
+        origin,
+        pathname,
+        status,
+        outcome,
+        durationMs,
+        ...correlationId !== void 0 ? { correlationId } : {},
+        ...traceId !== void 0 ? { traceId: traceId.toLowerCase() } : {}
+      }
+    };
+  }
+
+  // requestCorrelation.ts
+  var MAX_PENDING = 64;
+  var MAX_ROWS = 2e3;
+  var OWNER = Symbol.for("wotcv/request-correlation-owner");
+  var RequestCorrelationObserver = class {
+    constructor(origins, analyticsHost, emit) {
+      this.emit = emit;
+      this.epoch = 0;
+      this.running = false;
+      this.rows = 0;
+      this.sequence = 0;
+      this.prefix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+      this.pending = /* @__PURE__ */ new Set();
+      this.origins = new Set(
+        origins.slice(0, 32).flatMap((value) => {
+          try {
+            const url = new URL(value);
+            return value === url.origin && ["http:", "https:"].includes(url.protocol) && !url.username && !url.password ? [value] : [];
+          } catch {
+            return [];
+          }
+        })
+      );
+      try {
+        this.analyticsUrl = new URL(analyticsHost, window.location.href);
+      } catch {
+      }
+    }
+    ownTransport(url) {
+      const host = this.analyticsUrl;
+      if (!host || host.origin !== url.origin) return false;
+      const prefix = host.pathname.replace(/\/$/, "");
+      return ["/track", "/identify", "/session-replay/", "/site/"].some(
+        (path) => path.endsWith("/") ? url.pathname.startsWith(`${prefix}${path}`) : url.pathname === `${prefix}${path}`
+      );
+    }
+    begin(input, method, epoch) {
+      if (!this.running || epoch !== this.epoch || this.pending.size >= MAX_PENDING || this.rows >= MAX_ROWS) return;
+      try {
+        if (typeof input !== "string" && !(input instanceof URL)) return;
+        const url = new URL(input, window.location.href);
+        if (!this.origins.has(url.origin) || url.username || url.password || this.ownTransport(url)) return;
+        if (typeof method !== "string") return;
+        const normalizedMethod = method.toUpperCase();
+        if (!/^[A-Z]{1,16}$/.test(normalizedMethod) || /\s/.test(normalizedMethod)) return;
+        if (url.pathname.length > 2048) return;
+        url.search = "";
+        url.hash = "";
+        const request = { url, method: normalizedMethod, started: performance.now(), epoch };
+        this.pending.add(request);
+        return request;
+      } catch {
+        return;
+      }
+    }
+    finish(request, transport, outcome, status = 0, finalUrl, header) {
+      if (!this.pending.delete(request)) return;
+      try {
+        request.cancel?.();
+      } catch {
+      }
+      if (!this.running || request.epoch !== this.epoch || this.rows >= MAX_ROWS) return;
+      try {
+        if (finalUrl) {
+          const final = new URL(finalUrl);
+          if (!this.origins.has(final.origin) || final.origin !== request.url.origin || final.username || final.password || this.ownTransport(final))
+            return;
+        } else if (outcome === "response") return;
+        const correlationId = header?.("x-correlation-id");
+        const traceId = header?.("x-trace-id");
+        const event = {
+          type: 5,
+          timestamp: Date.now(),
+          data: {
+            tag: REQUEST_CORRELATION_TAG,
+            payload: {
+              rowId: `${this.prefix}-${++this.sequence}`,
+              transport,
+              method: request.method,
+              origin: request.url.origin,
+              pathname: request.url.pathname,
+              status,
+              outcome,
+              durationMs: Math.max(0, performance.now() - request.started),
+              ...isCorrelationId(correlationId) ? { correlationId } : {},
+              ...isCorrelationTraceId(traceId) ? { traceId: traceId.toLowerCase() } : {}
+            }
+          }
+        };
+        if (!parseRequestCorrelationEvent(event)) return;
+        this.rows++;
+        this.emit(event);
+      } catch {
+      }
+    }
+    start() {
+      if (this.running || this.origins.size === 0 || this.rows >= MAX_ROWS) return;
+      const owners = window;
+      try {
+        owners[OWNER]?.stop();
+      } catch {
+      }
+      owners[OWNER] = this;
+      this.running = true;
+      const epoch = ++this.epoch;
+      const originalFetch = window.fetch;
+      const prototype = window.XMLHttpRequest?.prototype;
+      const originalOpen = prototype?.open;
+      const originalSend = prototype?.send;
+      const observer = this;
+      const wrappedFetch = function(...args) {
+        let pending;
+        try {
+          const input = args[0];
+          const isRequest = typeof Request !== "undefined" && input instanceof Request;
+          const init = args[1];
+          const descriptor = init && Object.getOwnPropertyDescriptor(init, "method");
+          const plain = !init || Object.getPrototypeOf(init) === Object.prototype || Object.getPrototypeOf(init) === null;
+          if (plain && (!descriptor || "value" in descriptor)) {
+            pending = observer.begin(
+              isRequest ? input.url : input,
+              descriptor?.value === void 0 ? isRequest ? input.method : "GET" : descriptor.value,
+              epoch
+            );
+          }
+        } catch {
+        }
+        let promise;
+        try {
+          promise = Reflect.apply(originalFetch, this, args);
+        } catch (error) {
+          if (pending) observer.finish(pending, "fetch", "network-error");
+          throw error;
+        }
+        if (pending) {
+          const request = pending;
+          try {
+            return promise.then(
+              (response) => {
+                try {
+                  observer.finish(
+                    request,
+                    "fetch",
+                    "response",
+                    response.status,
+                    response.url,
+                    (name) => response.headers.get(name)
+                  );
+                } catch {
+                }
+                return response;
+              },
+              (error) => {
+                try {
+                  observer.finish(request, "fetch", error?.name === "AbortError" ? "abort" : "network-error");
+                } catch {
+                }
+                throw error;
+              }
+            );
+          } catch {
+            observer.pending.delete(request);
+          }
+        }
+        return promise;
+      };
+      const states = /* @__PURE__ */ new WeakMap();
+      const wrappedOpen = function(...args) {
+        const previous = states.get(this)?.request;
+        if (previous) {
+          try {
+            if (this.readyState === 4 && this.status >= 100) {
+              observer.finish(
+                previous,
+                "xhr",
+                "response",
+                this.status,
+                this.responseURL,
+                (name) => this.getResponseHeader(name)
+              );
+            }
+          } catch {
+          }
+          observer.pending.delete(previous);
+          try {
+            previous.cancel?.();
+          } catch {
+          }
+        }
+        states.delete(this);
+        const result = Reflect.apply(originalOpen, this, args);
+        if (observer.running && epoch === observer.epoch) states.set(this, { method: args[0], input: args[1] });
+        return result;
+      };
+      const wrappedSend = function(...args) {
+        const state = states.get(this);
+        if (state?.request && observer.pending.has(state.request)) return Reflect.apply(originalSend, this, args);
+        const request = state && observer.begin(state.input, state.method, epoch);
+        if (request && state) {
+          state.request = request;
+          const xhr = this;
+          const listeners = ["load", "error", "abort", "timeout"].map((type) => {
+            const listener = () => {
+              try {
+                observer.finish(
+                  request,
+                  "xhr",
+                  type === "load" ? "response" : type === "error" ? "network-error" : type,
+                  type === "load" ? xhr.status : 0,
+                  xhr.responseURL,
+                  (name) => xhr.getResponseHeader(name)
+                );
+              } catch {
+                observer.pending.delete(request);
+                try {
+                  request.cancel?.();
+                } catch {
+                }
+              }
+            };
+            xhr.addEventListener(type, listener, true);
+            return { type, listener };
+          });
+          request.cancel = () => listeners.forEach(({ type, listener }) => xhr.removeEventListener(type, listener, true));
+        }
+        try {
+          return Reflect.apply(originalSend, this, args);
+        } catch (error) {
+          if (request) {
+            observer.pending.delete(request);
+            try {
+              request.cancel?.();
+            } catch {
+            }
+          }
+          throw error;
+        }
+      };
+      this.restore = () => {
+        try {
+          if (window.fetch === wrappedFetch) window.fetch = originalFetch;
+        } catch {
+        }
+        try {
+          if (prototype?.open === wrappedOpen) prototype.open = originalOpen;
+        } catch {
+        }
+        try {
+          if (prototype?.send === wrappedSend) prototype.send = originalSend;
+        } catch {
+        }
+      };
+      try {
+        if (typeof originalFetch === "function") window.fetch = wrappedFetch;
+        if (prototype && typeof originalOpen === "function" && typeof originalSend === "function") {
+          prototype.open = wrappedOpen;
+          prototype.send = wrappedSend;
+        }
+      } catch {
+        this.stop();
+      }
+    }
+    stop() {
+      this.running = false;
+      this.epoch++;
+      this.pending.forEach((request) => {
+        try {
+          request.cancel?.();
+        } catch {
+        }
+      });
+      this.pending.clear();
+      this.restore?.();
+      this.restore = void 0;
+      const owners = window;
+      try {
+        if (owners[OWNER] === this) delete owners[OWNER];
+      } catch {
+      }
+    }
+    reset() {
+      const active = this.running;
+      this.stop();
+      if (active) this.start();
+    }
+  };
+
   // sessionReplay.ts
   var SAMPLE_STORAGE_KEY = "rybbit-replay-sampled";
   var FULL_SNAPSHOT_REQUEST_INTERVAL_MS = 1e4;
@@ -517,28 +854,36 @@
       // page it was recorded under.
       this.failedBatches = [];
       this.lastFullSnapshotRequestAt = -Infinity;
+      this.lifecycleEpoch = 0;
+      this.contextEpoch = 0;
+      this.disposed = false;
+      this.batchEpochs = /* @__PURE__ */ new WeakMap();
+      this.onVisibilityChange = () => {
+        if (document.visibilityState === "hidden") void this.flushEvents();
+      };
+      this.onPageHide = () => void this.flushEvents();
       this.config = config;
       this.userId = userId;
       this.sendBatch = sendBatch;
-      document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "hidden") {
-          void this.flushEvents();
-        }
+      this.correlation = new RequestCorrelationObserver(config.requestCorrelation?.origins ?? [], config.analyticsHost, (event) => {
+        if (this.isRecording && !this.capped && !this.disposed) this.addEvent(event);
       });
-      window.addEventListener("pagehide", () => void this.flushEvents());
+      document.addEventListener("visibilitychange", this.onVisibilityChange);
+      window.addEventListener("pagehide", this.onPageHide);
     }
     async initialize() {
-      if (!this.config.enableSessionReplay) {
+      if (!this.config.enableSessionReplay || this.disposed || this.capped) {
         return;
       }
-      const sampleRate = this.config.sessionReplaySampleRate;
-      if (sampleRate !== void 0 && !shouldSampleSession(sampleRate)) {
+      this.sampled ?? (this.sampled = shouldSampleSession(this.config.sessionReplaySampleRate ?? 100));
+      if (!this.sampled) {
         return;
       }
+      const epoch = this.lifecycleEpoch;
       if (!window.rrweb) {
         await this.loadRrweb();
       }
-      if (window.rrweb) {
+      if (window.rrweb && epoch === this.lifecycleEpoch && !this.disposed && !this.capped) {
         this.startRecording();
       }
     }
@@ -555,10 +900,13 @@
       });
     }
     startRecording() {
-      if (this.capped || this.isRecording || !window.rrweb || !this.config.enableSessionReplay) {
+      this.sampled ?? (this.sampled = shouldSampleSession(this.config.sessionReplaySampleRate ?? 100));
+      if (this.capped || this.disposed || !this.sampled || this.isRecording || !window.rrweb || !this.config.enableSessionReplay) {
         return;
       }
       try {
+        const epoch = ++this.lifecycleEpoch;
+        this.contextEpoch++;
         const defaultSampling = {
           // Aggressive sampling to reduce data volume
           mousemove: false,
@@ -596,6 +944,7 @@
         };
         const recordingOptions = {
           emit: (event) => {
+            if (epoch !== this.lifecycleEpoch || this.disposed || this.capped) return;
             this.addEvent({
               type: event.type,
               data: event.data,
@@ -623,13 +972,26 @@
         if (this.config.sessionReplayMaskTextSelectors && this.config.sessionReplayMaskTextSelectors.length > 0) {
           recordingOptions.maskTextSelector = this.config.sessionReplayMaskTextSelectors.join(", ");
         }
-        this.stopRecordingFn = window.rrweb.record(recordingOptions);
+        const stopRecording = window.rrweb.record(recordingOptions);
+        if (typeof stopRecording !== "function") {
+          this.lifecycleEpoch++;
+          this.correlation.stop();
+          return;
+        }
+        this.stopRecordingFn = stopRecording;
         this.isRecording = true;
         this.setupBatchTimer();
+        try {
+          this.correlation.start();
+        } catch {
+        }
       } catch (error) {
       }
     }
     stopRecording() {
+      this.lifecycleEpoch++;
+      this.contextEpoch++;
+      this.correlation.stop();
       if (!this.isRecording) {
         return;
       }
@@ -674,7 +1036,7 @@
       const batches = this.failedBatches;
       this.failedBatches = [];
       if (this.eventBuffer.length > 0) {
-        batches.push({
+        const batch = {
           userId: this.userId,
           events: this.eventBuffer,
           metadata: {
@@ -684,14 +1046,18 @@
             language: navigator.language
           },
           _bsm: getBotSignalMask()
-        });
+        };
+        this.batchEpochs.set(batch, this.contextEpoch);
+        batches.push(batch);
         this.eventBuffer = [];
       }
       await Promise.all(batches.map((batch) => this.sendOrRequeue(batch)));
     }
     async sendOrRequeue(batch) {
+      const epoch = this.batchEpochs.get(batch);
       try {
         const result = await this.sendBatch(batch);
+        if (!this.isRecording || epoch !== this.contextEpoch || batch.userId !== this.userId) return;
         if (result?.stopRecording) {
           this.stopForSizeCap();
         } else if (result?.takeFullSnapshot) {
@@ -710,7 +1076,7 @@
     // so an outage retries one batch per flush rather than one per failed send.
     requeue(batch) {
       const last = this.failedBatches[this.failedBatches.length - 1];
-      if (last && last.userId === batch.userId && JSON.stringify(last.metadata) === JSON.stringify(batch.metadata)) {
+      if (last && this.batchEpochs.get(last) === this.batchEpochs.get(batch) && last.userId === batch.userId && JSON.stringify(last.metadata) === JSON.stringify(batch.metadata)) {
         last.events = last.events.concat(batch.events);
         return;
       }
@@ -735,6 +1101,8 @@
       }
       this.lastFullSnapshotRequestAt = Date.now();
       void this.flushEvents();
+      this.contextEpoch++;
+      this.correlation.reset();
       try {
         window.rrweb?.record.takeFullSnapshot?.(true);
       } catch {
@@ -743,6 +1111,9 @@
     }
     // Unlike stopRecording, drops what's buffered: the server refuses it anyway.
     stopForSizeCap() {
+      this.lifecycleEpoch++;
+      this.contextEpoch++;
+      this.correlation.stop();
       this.capped = true;
       if (this.stopRecordingFn) {
         this.stopRecordingFn();
@@ -750,6 +1121,10 @@
       }
       this.isRecording = false;
       this.clearBatchTimer();
+      if (this.deferredSnapshotTimer !== void 0) {
+        clearTimeout(this.deferredSnapshotTimer);
+        this.deferredSnapshotTimer = void 0;
+      }
       this.eventBuffer = [];
       this.failedBatches = [];
     }
@@ -761,6 +1136,8 @@
       if (this.eventBuffer.length > 0) {
         void this.flushEvents();
       }
+      this.contextEpoch++;
+      this.correlation.reset();
       this.userId = userId;
     }
     // Handle page navigation for SPAs
@@ -771,7 +1148,10 @@
     }
     // Cleanup on page unload
     cleanup() {
+      this.disposed = true;
       this.stopRecording();
+      document.removeEventListener("visibilitychange", this.onVisibilityChange);
+      window.removeEventListener("pagehide", this.onPageHide);
     }
   };
 

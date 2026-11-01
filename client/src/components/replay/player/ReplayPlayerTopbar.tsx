@@ -10,6 +10,7 @@ import {
 } from "@/components/TooltipIcons/TooltipIcons";
 import { useShallow } from "zustand/react/shallow";
 import { useReplayStore } from "../replayStore";
+import { ReplayRequestCorrelation } from "../correlation/ReplayRequestCorrelation";
 
 // Extract pathname from full URL for display
 function getDisplayPath(url: string): string {
@@ -56,7 +57,7 @@ export function ReplayPlayerTopbar() {
     return currentUrl;
   }, [pageViewEvents, currentTime, metadata?.page_url]);
 
-  if (!pageUrl || !metadata) {
+  if (!data || !pageUrl || !metadata) {
     return (
       <div className="border border-neutral-100 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-2 rounded-t-lg overflow-hidden">
         <div className="flex items-center justify-between min-w-0">
@@ -86,6 +87,12 @@ export function ReplayPlayerTopbar() {
 
         {/* Right side: Screen dimensions */}
         <div className="flex items-center gap-2 text-xs text-neutral-600 dark:text-neutral-400 shrink-0 ml-2">
+          <ReplayRequestCorrelation
+            key={`${siteId}:${sessionId}`}
+            siteId={siteId}
+            sessionId={sessionId}
+            events={data.events}
+          />
           <CountryFlagTooltipIcon
             country={metadata.country}
             city={metadata.city}
@@ -105,7 +112,7 @@ export function ReplayPlayerTopbar() {
             size={16}
           />
 
-          <span className="whitespace-nowrap">{screenDimensions}</span>
+          <span className="hidden whitespace-nowrap sm:inline">{screenDimensions}</span>
         </div>
       </div>
     </div>

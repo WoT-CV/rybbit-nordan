@@ -1,5 +1,6 @@
 import { ScriptConfig, SessionReplayEvent, SessionReplayBatch, SessionReplayBatchResult } from "./types.js";
 import { getBotSignalMask } from "./botSignals.js";
+import { RequestCorrelationObserver } from "./requestCorrelation.js";
 
 type SendSessionReplayBatch = (batch: SessionReplayBatch) => Promise<SessionReplayBatchResult | void>;
 
@@ -80,42 +81,52 @@ export class SessionReplayRecorder {
   private lastFullSnapshotRequestAt = -Infinity;
   private deferredSnapshotTimer?: number;
   private sendBatch: SendSessionReplayBatch;
+  private lifecycleEpoch = 0;
+  private contextEpoch = 0;
+  private disposed = false;
+  private sampled?: boolean;
+  private correlation: RequestCorrelationObserver;
+  private batchEpochs = new WeakMap<SessionReplayBatch, number>();
+  private readonly onVisibilityChange = () => {
+    if (document.visibilityState === "hidden") void this.flushEvents();
+  };
+  private readonly onPageHide = () => void this.flushEvents();
 
   constructor(config: ScriptConfig, userId: string, sendBatch: SendSessionReplayBatch) {
     this.config = config;
     this.userId = userId;
     this.sendBatch = sendBatch;
+    this.correlation = new RequestCorrelationObserver(config.requestCorrelation?.origins ?? [], config.analyticsHost, event => {
+      if (this.isRecording && !this.capped && !this.disposed) this.addEvent(event);
+    });
 
     // The page may be about to unload: send what's buffered now (batches go
     // with keepalive while they fit) so the end of the replay survives it.
     // Recording itself carries on — a hidden tab can come back, and a page
     // restored from the back/forward cache resumes with its recorder intact,
     // which stopping on beforeunload broke.
-    document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "hidden") {
-        void this.flushEvents();
-      }
-    });
-    window.addEventListener("pagehide", () => void this.flushEvents());
+    document.addEventListener("visibilitychange", this.onVisibilityChange);
+    window.addEventListener("pagehide", this.onPageHide);
   }
 
   async initialize(): Promise<void> {
-    if (!this.config.enableSessionReplay) {
+    if (!this.config.enableSessionReplay || this.disposed || this.capped) {
       return;
     }
 
     // Check sample rate if specified
-    const sampleRate = this.config.sessionReplaySampleRate;
-    if (sampleRate !== undefined && !shouldSampleSession(sampleRate)) {
+    this.sampled ??= shouldSampleSession(this.config.sessionReplaySampleRate ?? 100);
+    if (!this.sampled) {
       return;
     }
 
     // Load rrweb if not already loaded
+    const epoch = this.lifecycleEpoch;
     if (!window.rrweb) {
       await this.loadRrweb();
     }
 
-    if (window.rrweb) {
+    if (window.rrweb && epoch === this.lifecycleEpoch && !this.disposed && !this.capped) {
       this.startRecording();
     }
   }
@@ -135,11 +146,14 @@ export class SessionReplayRecorder {
   }
 
   public startRecording(): void {
-    if (this.capped || this.isRecording || !window.rrweb || !this.config.enableSessionReplay) {
+    this.sampled ??= shouldSampleSession(this.config.sessionReplaySampleRate ?? 100);
+    if (this.capped || this.disposed || !this.sampled || this.isRecording || !window.rrweb || !this.config.enableSessionReplay) {
       return;
     }
 
     try {
+      const epoch = ++this.lifecycleEpoch;
+      this.contextEpoch++;
       // Default sampling configuration (can be overridden via config)
       const defaultSampling = {
         // Aggressive sampling to reduce data volume
@@ -176,6 +190,7 @@ export class SessionReplayRecorder {
 
       const recordingOptions: any = {
         emit: (event: any) => {
+          if (epoch !== this.lifecycleEpoch || this.disposed || this.capped) return;
           this.addEvent({
             type: event.type,
             data: event.data,
@@ -203,16 +218,26 @@ export class SessionReplayRecorder {
         recordingOptions.maskTextSelector = this.config.sessionReplayMaskTextSelectors.join(', ');
       }
 
-      this.stopRecordingFn = window.rrweb.record(recordingOptions);
+      const stopRecording = window.rrweb.record(recordingOptions);
+      if (typeof stopRecording !== "function") {
+        this.lifecycleEpoch++;
+        this.correlation.stop();
+        return;
+      }
+      this.stopRecordingFn = stopRecording;
 
       this.isRecording = true;
       this.setupBatchTimer();
+      try { this.correlation.start(); } catch { /* Optional observation must not interrupt native recording. */ }
     } catch (error) {
       // Recording failed silently
     }
   }
 
   public stopRecording(): void {
+    this.lifecycleEpoch++;
+    this.contextEpoch++;
+    this.correlation.stop();
     if (!this.isRecording) {
       return;
     }
@@ -271,7 +296,7 @@ export class SessionReplayRecorder {
     if (this.eventBuffer.length > 0) {
       // Built before the first await, so the identity and page are the ones
       // the events were recorded under.
-      batches.push({
+      const batch: SessionReplayBatch = {
         userId: this.userId,
         events: this.eventBuffer,
         metadata: {
@@ -281,7 +306,9 @@ export class SessionReplayRecorder {
           language: navigator.language,
         },
         _bsm: getBotSignalMask(),
-      });
+      };
+      this.batchEpochs.set(batch, this.contextEpoch);
+      batches.push(batch);
       this.eventBuffer = [];
     }
 
@@ -289,8 +316,10 @@ export class SessionReplayRecorder {
   }
 
   private async sendOrRequeue(batch: SessionReplayBatch): Promise<void> {
+    const epoch = this.batchEpochs.get(batch);
     try {
       const result = await this.sendBatch(batch);
+      if (!this.isRecording || epoch !== this.contextEpoch || batch.userId !== this.userId) return;
       if (result?.stopRecording) {
         this.stopForSizeCap();
       } else if (result?.takeFullSnapshot) {
@@ -311,7 +340,7 @@ export class SessionReplayRecorder {
   // so an outage retries one batch per flush rather than one per failed send.
   private requeue(batch: SessionReplayBatch): void {
     const last = this.failedBatches[this.failedBatches.length - 1];
-    if (last && last.userId === batch.userId && JSON.stringify(last.metadata) === JSON.stringify(batch.metadata)) {
+    if (last && this.batchEpochs.get(last) === this.batchEpochs.get(batch) && last.userId === batch.userId && JSON.stringify(last.metadata) === JSON.stringify(batch.metadata)) {
       last.events = last.events.concat(batch.events);
       return;
     }
@@ -341,6 +370,8 @@ export class SessionReplayRecorder {
     this.lastFullSnapshotRequestAt = Date.now();
 
     void this.flushEvents();
+    this.contextEpoch++;
+    this.correlation.reset();
     try {
       window.rrweb?.record.takeFullSnapshot?.(true);
     } catch {
@@ -351,6 +382,9 @@ export class SessionReplayRecorder {
 
   // Unlike stopRecording, drops what's buffered: the server refuses it anyway.
   private stopForSizeCap(): void {
+    this.lifecycleEpoch++;
+    this.contextEpoch++;
+    this.correlation.stop();
     this.capped = true;
     if (this.stopRecordingFn) {
       this.stopRecordingFn();
@@ -358,6 +392,10 @@ export class SessionReplayRecorder {
     }
     this.isRecording = false;
     this.clearBatchTimer();
+    if (this.deferredSnapshotTimer !== undefined) {
+      clearTimeout(this.deferredSnapshotTimer);
+      this.deferredSnapshotTimer = undefined;
+    }
     this.eventBuffer = [];
     this.failedBatches = [];
   }
@@ -375,6 +413,8 @@ export class SessionReplayRecorder {
       void this.flushEvents();
     }
 
+    this.contextEpoch++;
+    this.correlation.reset();
     this.userId = userId;
   }
 
@@ -388,6 +428,9 @@ export class SessionReplayRecorder {
 
   // Cleanup on page unload
   public cleanup(): void {
+    this.disposed = true;
     this.stopRecording();
+    document.removeEventListener("visibilitychange", this.onVisibilityChange);
+    window.removeEventListener("pagehide", this.onPageHide);
   }
 }
