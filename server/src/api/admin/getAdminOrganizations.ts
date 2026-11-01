@@ -4,6 +4,7 @@ import { DateTime } from "luxon";
 import { clickhouse } from "../../db/clickhouse/clickhouse.js";
 import { db } from "../../db/postgres/postgres.js";
 import { member, sites, user } from "../../db/postgres/schema.js";
+import { IS_CLOUD } from "../../lib/const.js";
 import { getOrganizationSubscriptions } from "../../services/admin/subscriptionService.js";
 
 interface EventCountResult {
@@ -15,20 +16,21 @@ export interface AdminOrganizationData {
   id: string;
   name: string;
   createdAt: string;
-  monthlyEventCount: number;
+  monthlyEventCount: number | null;
   overMonthlyLimit: boolean;
   subscription: {
     id: string | null;
-    source: "custom" | "override" | "stripe" | "appsumo" | "free";
+    source: "custom" | "override" | "stripe" | "appsumo" | "free" | "self-hosted";
     planName: string;
     status: string;
-    eventLimit: number;
-    currentPeriodEnd: Date;
+    eventLimit: number | null;
+    currentPeriodEnd: Date | null;
     cancelAtPeriodEnd?: boolean;
     interval?: string;
     memberLimit?: number | null;
     siteLimit?: number | null;
   };
+  eventCountCoverage: "NOT_VERIFIED" | "UNAVAILABLE";
   planOverride: string | null;
   customPlan: { events: number; members: number | null; websites: number | null } | null;
   stripeCustomerId: string | null;
@@ -39,8 +41,8 @@ export interface AdminOrganizationData {
     domain: string;
     type: "web" | "mobile" | null;
     createdAt: string;
-    eventsLast24Hours: number;
-    eventsLast30Days: number;
+    eventsLast24Hours: number | null;
+    eventsLast30Days: number | null;
   }[];
   members: {
     memberId: string;
@@ -110,6 +112,7 @@ export async function getAdminOrganizations(request: FastifyRequest, reply: Fast
     const yesterday = now.minus({ hours: 24 });
     const thirtyDaysAgo = now.minus({ days: 30 });
 
+    let eventCountsAvailable = true;
     let siteEventMap24h = new Map<number, number>();
     let siteEventMap30d = new Map<number, number>();
 
@@ -162,6 +165,7 @@ export async function getAdminOrganizations(request: FastifyRequest, reply: Fast
         siteEventMap30d.set(Number(event.site_id), event.total_events);
       }
     } catch (clickhouseError) {
+      eventCountsAvailable = false;
       request.log.warn(clickhouseError as Error, "ClickHouse query failed, continuing without event counts");
     }
 
@@ -178,8 +182,8 @@ export async function getAdminOrganizations(request: FastifyRequest, reply: Fast
           domain: site.domain,
           type: site.type,
           createdAt: site.createdAt,
-          eventsLast24Hours: siteEventMap24h.get(site.siteId) || 0,
-          eventsLast30Days: siteEventMap30d.get(site.siteId) || 0,
+          eventsLast24Hours: eventCountsAvailable ? Number(siteEventMap24h.get(site.siteId) ?? 0) : null,
+          eventsLast30Days: eventCountsAvailable ? Number(siteEventMap30d.get(site.siteId) ?? 0) : null,
         });
       }
     }
@@ -195,15 +199,17 @@ export async function getAdminOrganizations(request: FastifyRequest, reply: Fast
         id: org.id,
         name: org.name,
         createdAt: org.createdAt,
-        monthlyEventCount: org.monthlyEventCount || 0,
-        overMonthlyLimit: org.overMonthlyLimit || false,
+        monthlyEventCount: IS_CLOUD ? (org.monthlyEventCount ?? 0) : null,
+        eventCountCoverage: eventCountsAvailable ? "NOT_VERIFIED" : "UNAVAILABLE",
+        overMonthlyLimit: IS_CLOUD && (org.overMonthlyLimit || false),
         subscription: subscriptionData,
-        planOverride: org.planOverride,
-        customPlan: org.customPlan,
-        stripeCustomerId: org.stripeCustomerId,
-        stripeDashboardUrl: org.stripeCustomerId
-          ? `https://dashboard.stripe.com/${process.env.STRIPE_SECRET_KEY?.startsWith("sk_live") ? "" : "test/"}customers/${org.stripeCustomerId}`
-          : null,
+        planOverride: IS_CLOUD ? org.planOverride : null,
+        customPlan: IS_CLOUD ? org.customPlan : null,
+        stripeCustomerId: IS_CLOUD ? org.stripeCustomerId : null,
+        stripeDashboardUrl:
+          IS_CLOUD && org.stripeCustomerId
+            ? `https://dashboard.stripe.com/${process.env.STRIPE_SECRET_KEY?.startsWith("sk_live") ? "" : "test/"}customers/${org.stripeCustomerId}`
+            : null,
         sites: orgSitesMap.get(org.id) || [],
         members: orgMembersMap.get(org.id) || [],
       };

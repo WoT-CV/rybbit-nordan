@@ -10,7 +10,7 @@ import { getTimeStatement } from "../../api/analytics/utils/timeWindow.js";
 import { createServiceLogger } from "../../lib/logger/logger.js";
 import { sendWeeklyDigestEmail, sendWeeklyReportEmail } from "../../lib/email/email.js";
 import { filterSitesByMemberAccess } from "../../lib/access.js";
-import { IS_CLOUD } from "../../lib/const.js";
+import { getServiceConfiguration } from "../../lib/serviceConfiguration.js";
 import {
   BreakdownDimension,
   buildBreakdownQuery,
@@ -426,8 +426,8 @@ class WeeklyReportService {
   }
 
   public async generateAndSendReports(): Promise<void> {
-    if (!IS_CLOUD) {
-      this.logger.info("Skipping weekly reports for non-cloud instance");
+    if (!getServiceConfiguration().weeklyReportsEnabled) {
+      this.logger.info("Skipping weekly reports: email or server URL is not configured");
       return;
     }
 
@@ -471,8 +471,7 @@ class WeeklyReportService {
   }
 
   private initializeWeeklyReportCron(): void {
-    if (!IS_CLOUD) {
-      this.logger.info("Skipping weekly report cron initialization for non-cloud instance");
+    if (this.cronTask || !getServiceConfiguration().weeklyReportsEnabled) {
       return;
     }
 
@@ -497,6 +496,8 @@ class WeeklyReportService {
   public stopWeeklyReportCron(): void {
     if (this.cronTask) {
       this.cronTask.stop();
+      this.cronTask.destroy();
+      this.cronTask = null;
       this.logger.info("Weekly report cron stopped");
     }
   }

@@ -1,6 +1,6 @@
 import { render as renderEmail } from "@react-email/components";
 import { DateTime } from "luxon";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { DigestSite, SiteReport, WeeklyDigest } from "../../../services/weekyReports/weeklyReportTypes.js";
 import { installSnippet, welcome } from "../../../services/lifecycleEmails/lifecycleContent.js";
 import { formatChange, percentChange } from "../format.js";
@@ -15,6 +15,9 @@ import { TrialGraceEmail, trialGraceSubject } from "./TrialGraceEmail.js";
 import { VerifyEmailEmail } from "./VerifyEmailEmail.js";
 import { WeeklyDigestEmail, weeklyDigestPreview, weeklyDigestSubject } from "./WeeklyDigestEmail.js";
 import { WeeklyReportEmail, weeklyReportSubject } from "./WeeklyReportEmail.js";
+
+beforeAll(() => vi.stubEnv("BASE_URL", "https://app.rybbit.io"));
+afterAll(() => vi.unstubAllEnvs());
 
 /** Rendered HTML without the <!-- --> markers React puts between adjacent text nodes. */
 const render = async (element: Parameters<typeof renderEmail>[0]) =>

@@ -51,8 +51,10 @@ if (workerCount === 0) {
   telemetryService.startTelemetryCron();
   usageService.startUsageCheckCron();
   unclaimedSiteCleanupService.startCleanupCron();
-  if (IS_CLOUD && process.env.NODE_ENV !== "development") {
+  if (process.env.NODE_ENV !== "development") {
     weeklyReportService.startWeeklyReportCron();
+  }
+  if (IS_CLOUD && process.env.NODE_ENV !== "development") {
     lifecycleEmailService.startLifecycleCron();
   }
 
@@ -133,8 +135,8 @@ if (workerCount === 0) {
     unclaimedSiteCleanupService.stopCleanupCron();
     void sessionsService.close();
     telemetryService.stopTelemetryCron();
+    weeklyReportService.stopWeeklyReportCron();
     if (IS_CLOUD) {
-      weeklyReportService.stopWeeklyReportCron();
       lifecycleEmailService.stopLifecycleCron();
     }
 

@@ -592,12 +592,14 @@ async function stripeAdminRoutes(fastify: FastifyInstance) {
   fastify.put("/admin/sites/:siteId/move", systemAdmin, adminMoveSite);
   fastify.get("/admin/organizations", systemAdmin, getAdminOrganizations);
   fastify.get("/admin/organization-options", systemAdmin, getAdminOrganizationOptions);
-  fastify.get("/admin/subscription-plans", systemAdmin, getAdminSubscriptionPlans);
-  fastify.put(
-    "/admin/organizations/:organizationId/subscription-override",
-    systemAdmin,
-    updateAdminSubscriptionOverride
-  );
+  if (IS_CLOUD) {
+    fastify.get("/admin/subscription-plans", systemAdmin, getAdminSubscriptionPlans);
+    fastify.put(
+      "/admin/organizations/:organizationId/subscription-override",
+      systemAdmin,
+      updateAdminSubscriptionOverride
+    );
+  }
   fastify.get("/admin/organizations/:organizationId/members/:memberId", systemAdmin, getAdminOrganizationMember);
   fastify.patch("/admin/organizations/:organizationId/members/:memberId", systemAdmin, updateAdminOrganizationMember);
   fastify.delete("/admin/organizations/:organizationId/members/:memberId", systemAdmin, deleteAdminOrganizationMember);

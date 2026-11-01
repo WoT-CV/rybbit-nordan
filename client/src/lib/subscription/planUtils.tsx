@@ -45,7 +45,7 @@ export function findPriceForTier(
 // AppSumo tiers 4-7, and custom (enterprise) plans. Mirrors the server-side
 // subscriptionIncludesReplay rule.
 export function planIncludesReplay(
-  subscription: { planName: string; isTrial?: boolean; eventLimit?: number } | null | undefined
+  subscription: { planName: string; isTrial?: boolean; eventLimit?: number | null } | null | undefined
 ): boolean {
   if (!subscription) return false;
   if (subscription.planName === "custom") return true;

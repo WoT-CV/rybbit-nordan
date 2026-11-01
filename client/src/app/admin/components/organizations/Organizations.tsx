@@ -1,11 +1,12 @@
 "use client";
 
+import { formatEventCount, sumEventCounts } from "../shared/eventCounts";
 import { useState, useMemo } from "react";
 import { useAdminOrganizations } from "@/api/admin/hooks/useAdminOrganizations";
 import { CopyButton } from "@/components/interior/copy-button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/sonner";
-import { cn, formatter } from "@/lib/utils";
+import { cn } from "@/lib/utils";
 import { DateTime } from "luxon";
 import { useExtracted } from "next-intl";
 import { ErrorAlert } from "../shared/ErrorAlert";
@@ -70,15 +71,10 @@ export function Organizations() {
 
   const stats = useMemo(() => {
     const orgs = filteredOrganizations ?? [];
-    const active = orgs.filter(org => org.sites.some(site => site.eventsLast30Days > 0)).length;
-    const events24h = orgs.reduce(
-      (total, org) => total + org.sites.reduce((sum, site) => sum + Number(site.eventsLast24Hours || 0), 0),
-      0
-    );
-    const events30d = orgs.reduce(
-      (total, org) => total + org.sites.reduce((sum, site) => sum + Number(site.eventsLast30Days || 0), 0),
-      0
-    );
+    const hasUnknown = orgs.some(org => org.sites.some(site => site.eventsLast30Days === null));
+    const active = hasUnknown ? null : orgs.filter(org => org.sites.some(site => site.eventsLast30Days! > 0)).length;
+    const events24h = sumEventCounts(orgs.flatMap(org => org.sites.map(site => site.eventsLast24Hours)));
+    const events30d = sumEventCounts(orgs.flatMap(org => org.sites.map(site => site.eventsLast30Days)));
     return { total: orgs.length, active, events24h, events30d };
   }, [filteredOrganizations]);
 
@@ -96,6 +92,9 @@ export function Organizations() {
 
   return (
     <div className="space-y-6">
+      <p className="text-sm text-muted-foreground">
+        {t("Hourly aggregate observations; historical coverage is not verified. Missing data is shown as a dash.")}
+      </p>
       <Tabs value={chartTab} onValueChange={setChartTab}>
         <Panel
           flush
@@ -154,11 +153,11 @@ export function Organizations() {
             { label: t("Organizations"), value: stats.total.toLocaleString() },
             {
               label: t("Active (30d)"),
-              value: stats.active.toLocaleString(),
+              value: stats.active === null ? "—" : stats.active.toLocaleString(),
               hint: t("with events in the last 30 days"),
             },
-            { label: t("Events (24h)"), value: formatter(stats.events24h) },
-            { label: t("Events (30d)"), value: formatter(stats.events30d) },
+            { label: t("Events (24h)"), value: formatEventCount(stats.events24h) },
+            { label: t("Events (30d)"), value: formatEventCount(stats.events30d) },
           ]}
         />
         <OrganizationFilters

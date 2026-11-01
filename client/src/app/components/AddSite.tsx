@@ -143,7 +143,7 @@ export function AddSite({
       description: t("Track Core Web Vitals metrics (LCP, CLS, INP, FCP, TTFB)"),
       badge: <Badge variant="success">Standard</Badge>,
       disabled: standardFeaturesDisabled,
-      hidden: isMobile || !IS_CLOUD,
+      hidden: isMobile,
     },
     {
       key: "trackSpaNavigation",

@@ -3,6 +3,7 @@ import { Resend } from "resend";
 import type { SiteReport, WeeklyDigest } from "../../services/weekyReports/weeklyReportTypes.js";
 import { welcome } from "../../services/lifecycleEmails/lifecycleContent.js";
 import { IS_CLOUD } from "../const.js";
+import { getServiceConfiguration } from "../serviceConfiguration.js";
 import { signExpiringPayload } from "../signedToken.js";
 import { letterText, type Letter } from "./letter.js";
 import {
@@ -24,7 +25,8 @@ import { WeeklyReportEmail, weeklyReportSubject } from "./templates/WeeklyReport
 let resend: Resend | undefined;
 let marketingAudienceId: string | null = null;
 
-if (IS_CLOUD) {
+const emailConfiguration = getServiceConfiguration();
+if (IS_CLOUD || emailConfiguration.emailEnabled) {
   resend = new Resend(process.env.RESEND_API_KEY);
 }
 
@@ -44,6 +46,7 @@ class ResendRequestError extends Error {
 
 // Marketing audience management
 export const getOrCreateMarketingAudience = async (): Promise<string> => {
+  if (!IS_CLOUD) throw new Error("Marketing email is unavailable on self-hosted instances");
   if (marketingAudienceId) return marketingAudienceId;
   if (!resend) throw new Error("Resend not initialized");
 
@@ -68,7 +71,7 @@ export const getOrCreateMarketingAudience = async (): Promise<string> => {
 };
 
 export const addContactToAudience = async (email: string, firstName?: string): Promise<void> => {
-  if (!resend) return;
+  if (!IS_CLOUD || !resend) return;
   try {
     const audienceId = await getOrCreateMarketingAudience();
     const { error } = await resend.contacts.create({ audienceId, email, firstName, unsubscribed: false });
@@ -110,10 +113,10 @@ export const unsubscribeContact = async (email: string): Promise<void> => {
   }
 };
 
-const TRANSACTIONAL_FROM = "Rybbit <automail@email.rybbit.com>";
+const TRANSACTIONAL_FROM = emailConfiguration.emailFrom;
 const BILL_FROM = "Bill from Rybbit <bill@email.rybbit.com>";
 // Replies to any email land in the monitored support inbox.
-const REPLY_TO = "hello@rybbit.com";
+const REPLY_TO = emailConfiguration.emailReplyTo;
 
 interface SendOptions {
   text?: string;
@@ -135,9 +138,7 @@ export const isIdempotencyConflict = (error: unknown): boolean =>
 /** Sends a transactional email. Throws when Resend does not accept it. */
 export const sendEmail = async (email: string, subject: string, html: string, options: SendOptions = {}) => {
   if (!resend) {
-    return;
-    // not sure how to handle self hosted instances without resend
-    // throw new Error("Resend is not initialized");
+    throw new Error("Email transport is not configured");
   }
   try {
     const response = await resend.emails.send(
@@ -152,8 +153,11 @@ export const sendEmail = async (email: string, subject: string, html: string, op
       },
       options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : undefined
     );
-    if (response.error) {
-      throw new ResendRequestError("email send", response.error);
+    if (response.error || !response.data?.id) {
+      throw new ResendRequestError(
+        "email send",
+        response.error ?? { name: "application_error", message: "No accepted message ID" }
+      );
     }
     return response;
   } catch (error) {
@@ -218,7 +222,8 @@ export const sendTrialGraceEmail = async (email: string, props: TrialGraceEmailP
  */
 export const weeklyReportUnsubscribeUrl = (userId: string): string => {
   const { exp, sig } = signExpiringPayload(`unsubscribe-reports:${userId}`, 2 * 365 * 24 * 3600);
-  return `${process.env.BASE_URL}/api/user/unsubscribe-reports-oneclick?userId=${encodeURIComponent(userId)}&exp=${exp}&sig=${sig}`;
+  if (!getServiceConfiguration().weeklyReportsEnabled) throw new Error("Weekly report email is not configured");
+  return `${getServiceConfiguration().publicUrl}/api/user/unsubscribe-reports-oneclick?userId=${encodeURIComponent(userId)}&exp=${exp}&sig=${sig}`;
 };
 
 const listUnsubscribeHeaders = (unsubscribeUrl: string) => ({
@@ -255,7 +260,7 @@ export const sendWeeklyDigestEmail = async ({
 };
 
 export const sendWelcomeEmail = async (email: string, name?: string) => {
-  if (!resend) return;
+  if (!IS_CLOUD || !resend) return;
 
   const letter = welcome(name);
   try {
@@ -295,7 +300,7 @@ export const marketingUnsubscribeUrl = (email: string): string => {
  * "accepted but response lost" failure can't double-send.
  */
 export const sendLifecycleEmail = async (email: string, letter: Letter, idempotencyKey?: string): Promise<boolean> => {
-  if (!resend) return false;
+  if (!IS_CLOUD || !resend) return false;
 
   const unsubscribeUrl = marketingUnsubscribeUrl(email);
 

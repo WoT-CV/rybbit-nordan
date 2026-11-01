@@ -2,19 +2,19 @@ import { sql } from "drizzle-orm";
 import { DateTime } from "luxon";
 import Stripe from "stripe";
 import { db } from "../../db/postgres/postgres.js";
-import { APPSUMO_TIER_LIMITS, DEFAULT_EVENT_LIMIT, getStripePrices } from "../../lib/const.js";
+import { APPSUMO_TIER_LIMITS, DEFAULT_EVENT_LIMIT, getStripePrices, IS_CLOUD } from "../../lib/const.js";
 import { stripe } from "../../lib/stripe.js";
 import { getAllStripeSubscriptionsByCustomer } from "../../lib/subscriptionUtils.js";
 
 export interface SubscriptionData {
   id: string;
-  source: "custom" | "override" | "stripe" | "appsumo" | "free";
+  source: "custom" | "override" | "stripe" | "appsumo" | "free" | "self-hosted";
   planName: string;
   status: string;
   currentPeriodStart?: Date;
-  currentPeriodEnd?: Date;
+  currentPeriodEnd?: Date | null;
   cancelAtPeriodEnd?: boolean;
-  eventLimit?: number;
+  eventLimit?: number | null;
   memberLimit?: number | null;
   siteLimit?: number | null;
   interval?: string;
@@ -171,8 +171,28 @@ export async function getOrganizationSubscriptions(
   organizations: AdminOrganizationSubscriptionFields[],
   includeFullDetails = false
 ): Promise<
-  Map<string, SubscriptionData & { planName: string; status: string; eventLimit: number; currentPeriodEnd: Date }>
+  Map<
+    string,
+    SubscriptionData & { planName: string; status: string; eventLimit: number | null; currentPeriodEnd: Date | null }
+  >
 > {
+  if (!IS_CLOUD) {
+    return new Map(
+      organizations.map(org => [
+        org.id,
+        {
+          id: "",
+          source: "self-hosted" as const,
+          planName: "self-hosted",
+          status: "active",
+          eventLimit: null,
+          memberLimit: null,
+          siteLimit: null,
+          currentPeriodEnd: null,
+        },
+      ])
+    );
+  }
   const orgsWithStripe = organizations.filter(org => org.stripeCustomerId);
   const stripeCustomerIds = new Set(orgsWithStripe.map(org => org.stripeCustomerId!));
   const allOrgIds = new Set(organizations.map(org => org.id));

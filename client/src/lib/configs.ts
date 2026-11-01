@@ -5,6 +5,9 @@ interface Configs {
   disableSignup: boolean;
   mapboxToken: string;
   liteDashboard: boolean;
+  emailEnabled: boolean;
+  gscEnabled: boolean;
+  weeklyReportsEnabled: boolean;
 }
 
 export function useConfigs() {

@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { authClient } from "@/lib/auth";
+import { useConfigs } from "@/lib/configs";
 import { IS_CLOUD } from "@/lib/const";
 import { useRoleInfo } from "@/lib/roles";
 import { getTimezone } from "@/lib/store";
@@ -79,9 +80,10 @@ export function PeopleTable({
   const accessOf = (key: string) => (sitesError || teamsError ? null : accessByKey ? accessByKey.get(key) : undefined);
 
   const canEditMember = (member: MemberData) => assignableRoles.some(role => role === member.role);
-  // Invitations are emailed on cloud only, and resending needs the right to give the invited role.
+  // Resending needs a configured transport and the right to give the invited role.
+  const { configs } = useConfigs();
   const canResend = (invitation: Invitation) =>
-    IS_CLOUD && canManageMembers && assignableRoles.some(role => role === invitation.role);
+    (IS_CLOUD || !!configs?.emailEnabled) && canManageMembers && assignableRoles.some(role => role === invitation.role);
 
   const needle = query.trim().toLowerCase();
   const matches = (...values: (string | null | undefined)[]) =>
@@ -116,7 +118,7 @@ export function PeopleTable({
             />
           </div>
           {canManageMembers &&
-            (IS_CLOUD ? (
+            (IS_CLOUD || configs?.emailEnabled ? (
               <InviteMemberDialog
                 organizationId={organizationId}
                 onSuccess={onRefresh}

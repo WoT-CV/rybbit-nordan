@@ -14,7 +14,7 @@ import { Input } from "../../../../components/ui/input";
 import { Switch } from "../../../../components/ui/switch";
 import { useActiveOrgName } from "../../../../hooks/useActiveOrgName";
 import { validateEmail } from "../../../../lib/auth-utils";
-import { IS_CLOUD } from "../../../../lib/const";
+import { useConfigs } from "../../../../lib/configs";
 import { DangerRow, DangerZone, LedgerRow, LedgerRows, LedgerSaveBar, LedgerSection } from "../../components/Ledger";
 import { ApiKeyManager } from "./ApiKeyManager";
 import { ChangePassword } from "./ChangePassword";
@@ -29,6 +29,7 @@ export function AccountInner() {
   const hasActiveSubscription = useHasActiveSubscription();
   const orgName = useActiveOrgName();
   const t = useExtracted();
+  const { configs } = useConfigs();
 
   const user = session.data?.user;
   const currentName = user?.name ?? "";
@@ -226,7 +227,7 @@ export function AccountInner() {
 
       <LedgerSection title={t("Preferences")}>
         <LedgerRows>
-          {sendAutoEmailReports !== undefined && IS_CLOUD && (
+          {sendAutoEmailReports !== undefined && configs?.weeklyReportsEnabled && (
             <LedgerRow
               label={t("Weekly email reports")}
               description={t("A traffic summary for each site you can access.")}

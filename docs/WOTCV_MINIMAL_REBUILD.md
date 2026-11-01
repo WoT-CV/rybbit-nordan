@@ -149,3 +149,98 @@ deklaracją zaliczenia testów ani ukończenia implementacji.
 Etap 1 utrwala czysty punkt startowy i ujawnione ograniczenia, nie deklaruje
 gotowości do produkcji. Zależności runtime i finalne integracje pozostają
 bramkami następnych etapów.
+
+## Etap 2 — analiza i plan przed implementacją
+
+### Ponowna analiza
+
+Upstream ma gotowe endpointy Pages/Bots/Performance/Query/Dashboards, ale
+Sidebar i command palette ukrywają je na podstawie IS_CLOUD/DEPLOYMENT.
+Podobny warunek ukrywa przełączniki Web Vitals i wejście administratora.
+Nie oznacza to potrzeby usunięcia wszystkich IS_CLOUD: billing, usage limits,
+marketing i social sign-in to osobne polityki. Zachowujemy role, granty,
+private-link constraints i zasobooszczędne limity SQL/replay upstream.
+
+GSC wymaga prawdziwego OAuth ID/secret i redirect URI. Samo pokazanie karty
+nie konfiguruje usługi. Weekly reports wymaga własnego Resend/sendera,
+reply-to i poprawnego URL wypisania; upstream wiąże uruchomienie z cloud,
+a sendEmail bez transportu potrafi zwrócić bez błędu. Harmonogram musi mieć
+jednego właściciela w trybie single/cluster i zatrzymać się przy shutdown.
+Włączenie transportu nie może uruchomić marketingowych kampanii SaaS.
+
+Admin czyta hourly_event_counts, inicjalizowane obecnie wyłącznie dla cloud,
+i może pytać o nieistniejące AppSumo/Stripe. Inkrementalny MV nie uzupełnia
+historii. Błąd agregacji to brak danych, nie zero; aktualne sumy to obserwacja,
+nie dowód pełnego pokrycia historycznego. Self-hosted nie ma fikcyjnego Pro,
+renewal date ani limitu 3000. Nie dodajemy migracji/backfill ani nowej tabeli
+produktu: używamy istniejącego natywnego inicjalizatora.
+
+### Szczegółowa kolejność implementacji
+
+1. Usunąć wyłącznie bramki widoczności istniejących funkcji produktu w
+   Sidebar/palette/AppSidebar i Web Vitals (zachować mobile/private/role).
+2. Dodać mały, testowalny resolver gotowości konfiguracji; /config zwraca
+   wyłącznie gscEnabled/weeklyReportsEnabled, nigdy sekrety. Wpiąć gotowość
+   w GSC dashboard/settings i preferencje weekly. Social login nie jest
+   skutkiem skonfigurowania GSC.
+3. Włączyć własny transport email wyłącznie po kompletnej konfiguracji;
+   zachować cloud defaults. Brak transportu lub błąd providera nie oznacza
+   dostarczenia. Marketing/lifecycle/audience pozostawić cloud-only.
+4. Dostosować weekly service i oba entrypointy: jeden cron, idempotentny
+   start/stop, stop na shutdown, bez cronów w cluster workers. Sprawdzić
+   digest z dwoma aktywnymi sites, opt-out i ograniczone członkostwo.
+5. Uruchamiać istniejącą inicjalizację hourly counts również self-hosted;
+   nie uruchamiać jej podczas tej pracy przeciwko żadnej bazie. Naprawić
+   projekcje admin bez AppSumo/Stripe i null/coverage w UI/API, nie zgadywać
+   zera ani miesięcznego usage. Wyłączyć billing-only akcje self-hosted.
+6. Dodać regresje konfiguracji, menu, permission denial, harmonogramu,
+   mail failure/recipient scope, admin unknown/count coverage. Zmiany tekstu
+   przepuścić przez istniejące i18n, ograniczyć wygenerowany churn.
+7. Uruchomić testy zmienionych obszarów, server/client typecheck/build;
+   dokonać self-review i niezależnego przeglądu całego diffu. Naprawić
+   wykryte błędy, zapisać wyniki i dopiero wykonać commit etapu 2.
+
+Właścicielem kodu etapu 2 jest jeden subagent; główny agent utrzymuje ten
+plan, niezależnie sprawdza źródła/kontrakty i integruje wyniki. Brak zmian
+na produkcji i brak zmian dependency pins.
+
+### Review i walidacja etapu 2
+
+- Sidebar/palette udostępniają natywne Pages, Bots, Performance, Query i
+  Dashboards; zachowane są private-link/mobile constraints oraz role/granty.
+  GSC, mail i raporty mają odrębne booleany gotowości, bez sekretów w /config.
+  Skonfigurowany mail włącza też natywne zaproszenia i reset hasła; brak maila
+  pozostawia natywne lokalne tworzenie kont, nie fikcyjne wysłanie zaproszenia.
+- Dwa niezależne przeglądy doprowadziły do naprawienia niespójnych BASE_URL,
+  SERVER_URL i callback redirectów, kodowania invitation params, linków transferu,
+  zachowania jawnego trailing slash OAuth, inicjalizacji Stripe self-hosted
+  i dostępności backendowych billing mutations. Nie wystarcza ukrycie UI.
+- Obserwacje admin mają nullable counts i NOT_VERIFIED coverage; brak danych
+  nie jest dodawany jako zero. Brak wiersza w działającej agregacji oznacza
+  zero zaobserwowanych zdarzeń, nie dowód braku historycznych zdarzeń. Nie
+  uruchomiono backfill. R2 pozostaje natywną opcjonalną infrastrukturą cloud;
+  self-hosted replay używa natywnego storage ClickHouse, bez potrzeby R2.
+- Podejrzenie błędu weekly digest zostało ODRZUCONE po sprawdzeniu semantyki:
+  lastPageviewAt=null oznacza site aktywny w tym tygodniu; istniejący warunek
+  rozróżnia go od quiet site. Zachowano go, zamiast naprawiać pozorny błąd.
+- Pełny serwer: 188 plików PASS, 3032 testy PASS, 41 SKIP; po końcowych
+  poprawkach URL dodatkowy zestaw konfiguracja/transfer 38/38 PASS.
+  Zestaw zmienionego klienta: 10 plików / 52 testy PASS, dodatkowo reset hasła
+  2/2 PASS. Oba typecheck PASS. Główny agent niezależnie uruchomił oba buildy
+  po poprawkach URL/resetu: PASS. Pełny klient nadal ma jawny locale baseline
+  etapu 1 do rozwiązania w etapie 6, nie jest deklarowany jako zielony.
+- Realny ESLint Next (poza pustą konfiguracją upstream): w 29 zmienionych/
+  nowych TS/TSX zero nowych errors względem U; siedem dawnych errors i pięć
+  warnings pozostaje bazowych. Pełny audit 982 plików ma 56 error files.
+  Zwykły pnpm lint nie jest wiarygodną bramką: pusty config skanuje .next
+  i zgłasza brak reguł z wygenerowanych bundli. Etap 6 jawnie oddzieli debt
+  upstream od nowych problemów, bez formatowania/refactoru 56 obcych plików.
+- Weryfikacja uruchamiania schedulera: źródła single/cluster i testy lifecycle,
+  nie rzeczywisty wieloprocesowy test procesu. Akceptacja maila przez SDK nie
+  jest dowodem dostarczenia. Realne GSC, mail, SQL provisioning i browser QA
+  pozostają bramkami integracji. Brak operacji produkcyjnych/migracji.
+- Końcowy przegląd dodał wymóg zaakceptowanego message ID od providera;
+  odpowiedź data=null/error=null nie jest sukcesem. Po tej poprawce email
+  3 pliki / 37 testów PASS, server typecheck i ponowny build serwera PASS.
+  Locale: dokładnie trzy nowe tłumaczenia w 12 językach; zachowano wszystkie
+  wcześniejsze wartości i klucze. Usunięto wyłącznie własny format-only churn.

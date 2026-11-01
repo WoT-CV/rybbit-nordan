@@ -8,6 +8,7 @@ import { organization, sites, siteTransfers, user } from "../../db/postgres/sche
 import { effectiveOrgRole, getOrgMembership } from "../../lib/access.js";
 import { getIsUserAdmin } from "../../lib/auth-utils.js";
 import { IS_CLOUD } from "../../lib/const.js";
+import { getServiceConfiguration } from "../../lib/serviceConfiguration.js";
 import { sendSiteTransferEmail } from "../../lib/email/email.js";
 import { claimExpiryIso as utcIso } from "../../services/sites/claimExpiry.js";
 import { type SiteTransaction, withOrganizationSiteLock } from "../../services/sites/withOrganizationSiteLock.js";
@@ -41,7 +42,7 @@ const acceptTransferSchema = z.object({
 
 type TransferRow = typeof siteTransfers.$inferSelect;
 
-const transferUrl = (transferId: string) => `${process.env.BASE_URL ?? ""}/transfer/${transferId}`;
+const transferUrl = (transferId: string) => `${getServiceConfiguration().publicUrl}/transfer/${transferId}`;
 
 // Postgres hands timestamps back without a zone; they are UTC.
 const isExpired = (transfer: Pick<TransferRow, "expiresAt">) => Date.parse(utcIso(transfer.expiresAt)!) <= Date.now();

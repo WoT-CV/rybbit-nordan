@@ -29,7 +29,6 @@ import { CommandPaletteTrigger } from "../../../../components/command-palette/Co
 import { Sidebar as SidebarComponents } from "../../../../components/sidebar/Sidebar";
 import { SiteSettings } from "../../../../components/SiteSettings/SiteSettings";
 import { useAppEnv } from "../../../../hooks/useIsProduction";
-import { DEPLOYMENT, IS_CLOUD } from "../../../../lib/const";
 import { getSiteRouteContext } from "../../../../lib/siteRoute";
 import { useStripeSubscription } from "../../../../lib/subscription/useStripeSubscription";
 import { useEmbedPageOptions } from "../../utils";
@@ -87,28 +86,24 @@ function SidebarContent() {
           />
         </div>
         <SidebarComponents.SectionHeader>{t("Traffic")}</SidebarComponents.SectionHeader>
-        {IS_CLOUD && (
-          <SidebarComponents.Item
-            label={t("Pages")}
-            active={isActiveTab("pages")}
-            href={getTabPath("pages")}
-            icon={<File className="w-4 h-4" />}
-          />
-        )}
+        <SidebarComponents.Item
+          label={t("Pages")}
+          active={isActiveTab("pages")}
+          href={getTabPath("pages")}
+          icon={<File className="w-4 h-4" />}
+        />
         <SidebarComponents.Item
           label={t("Globe")}
           active={isActiveTab("globe")}
           href={getTabPath("globe")}
           icon={<Globe2 className="w-4 h-4" />}
         />
-        {IS_CLOUD && (
-          <SidebarComponents.Item
-            label={t("Bots")}
-            active={isActiveTab("bots")}
-            href={getTabPath("bots")}
-            icon={<Bot className="w-4 h-4" />}
-          />
-        )}
+        <SidebarComponents.Item
+          label={t("Bots")}
+          active={isActiveTab("bots")}
+          href={getTabPath("bots")}
+          icon={<Bot className="w-4 h-4" />}
+        />
         <SidebarComponents.SectionHeader>{t("Behavior")}</SidebarComponents.SectionHeader>
         <SidebarComponents.Item
           label={t("Sessions")}
@@ -189,7 +184,7 @@ function SidebarContent() {
           href={getTabPath("errors")}
           icon={<AlertTriangle className="w-4 h-4" />}
         />
-        {IS_CLOUD && !isMobileSite && (
+        {!isMobileSite && (
           <SidebarComponents.Item
             label={t("Performance")}
             active={isActiveTab("performance")}
@@ -197,13 +192,7 @@ function SidebarContent() {
             icon={<Gauge className="w-4 h-4" />}
           />
         )}
-        {/* API Playground is desktop-only, and it and Dashboards have no private-link route, so the header
-            hides with whatever is left: Query, else API Playground on desktop, else nothing */}
-        {(IS_CLOUD || DEPLOYMENT || !privateKey) && (
-          <div className={IS_CLOUD || DEPLOYMENT ? undefined : "hidden md:block"}>
-            <SidebarComponents.SectionHeader>{t("Explore")}</SidebarComponents.SectionHeader>
-          </div>
-        )}
+        <SidebarComponents.SectionHeader>{t("Explore")}</SidebarComponents.SectionHeader>
         {!privateKey && (
           <div className="hidden md:block">
             <SidebarComponents.Item
@@ -214,23 +203,19 @@ function SidebarContent() {
             />
           </div>
         )}
-        {(IS_CLOUD || DEPLOYMENT) && (
-          <>
-            <SidebarComponents.Item
-              label={t("Query")}
-              active={isActiveTab("query")}
-              href={getTabPath("query")}
-              icon={<Database className="w-4 h-4" />}
-            />
-            {!privateKey && (
-              <SidebarComponents.Item
-                label={t("Dashboards")}
-                active={isActiveTab("dashboards")}
-                href={getTabPath("dashboards")}
-                icon={<LayoutGrid className="w-4 h-4" />}
-              />
-            )}
-          </>
+        <SidebarComponents.Item
+          label={t("Query")}
+          active={isActiveTab("query")}
+          href={getTabPath("query")}
+          icon={<Database className="w-4 h-4" />}
+        />
+        {!privateKey && (
+          <SidebarComponents.Item
+            label={t("Dashboards")}
+            active={isActiveTab("dashboards")}
+            href={getTabPath("dashboards")}
+            icon={<LayoutGrid className="w-4 h-4" />}
+          />
         )}
         {/* <SidebarComponents.Item
           label="Reports"

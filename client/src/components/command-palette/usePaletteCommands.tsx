@@ -42,7 +42,7 @@ import { Favicon } from "@/components/Favicon";
 import { useAppEnv } from "@/hooks/useIsProduction";
 import { useOrgPermissions } from "@/hooks/usePermissions";
 import { authClient } from "@/lib/auth";
-import { DEPLOYMENT, IS_CLOUD } from "@/lib/const";
+import { IS_CLOUD } from "@/lib/const";
 import { getDashboardTimeForRange, setStoredDashboardDefaultTimeRange } from "@/lib/defaultTimeRange";
 import { getSiteRouteContext } from "@/lib/siteRoute";
 import { useStore, useTimezone } from "@/lib/store";
@@ -125,16 +125,15 @@ export function usePaletteCommands(entityCommands: PaletteCommand[]): {
     !subscription?.planName?.startsWith("appsumo") &&
     !isSubscriptionLoading &&
     appEnv !== "demo";
-  const canQuery = IS_CLOUD || !!DEPLOYMENT;
 
   const sections: { route: string; label: string; icon: ReactNode; keywords?: string; visible?: boolean }[] =
     siteId === null
       ? []
       : [
           { route: "main", label: t("Main"), icon: <LayoutDashboard />, keywords: t("overview dashboard") },
-          { route: "pages", label: t("Pages"), icon: <File />, visible: IS_CLOUD },
+          { route: "pages", label: t("Pages"), icon: <File /> },
           { route: "globe", label: t("Globe"), icon: <Globe2 />, keywords: t("map") },
-          { route: "bots", label: t("Bots"), icon: <Bot />, visible: IS_CLOUD },
+          { route: "bots", label: t("Bots"), icon: <Bot /> },
           { route: "sessions", label: t("Sessions"), icon: <Rewind /> },
           { route: "replay", label: t("Replay"), icon: <Video />, keywords: t("recordings"), visible: canReplay },
           { route: "users", label: t("Users"), icon: <User /> },
@@ -149,11 +148,11 @@ export function usePaletteCommands(entityCommands: PaletteCommand[]): {
             label: t("Performance"),
             icon: <Gauge />,
             keywords: t("web vitals"),
-            visible: IS_CLOUD && !isMobileSite,
+            visible: !isMobileSite,
           },
           { route: "api-playground", label: t("API Playground"), icon: <Code />, visible: isDesktop },
-          { route: "query", label: t("Query"), icon: <Database />, keywords: t("SQL"), visible: canQuery },
-          { route: "dashboards", label: t("Dashboards"), icon: <LayoutGrid />, visible: canQuery },
+          { route: "query", label: t("Query"), icon: <Database />, keywords: t("SQL") },
+          { route: "dashboards", label: t("Dashboards"), icon: <LayoutGrid /> },
         ];
 
   const sectionCommands: PaletteCommand[] = sections
@@ -328,7 +327,7 @@ export function useSiteEntityCommands(siteId: number): PaletteCommand[] {
   // The goals endpoint caps a page at 100.
   const { data: goals } = useGetGoals({ pageSize: 100 });
   const { data: funnels } = useGetFunnels(siteId);
-  const { data: dashboards } = useGetDashboards(IS_CLOUD || DEPLOYMENT ? siteId : undefined);
+  const { data: dashboards } = useGetDashboards(siteId);
 
   // Keep the time and filters, like the sidebar links do.
   const go = (path: string) => router.push(`${path}${window.location.search}`);

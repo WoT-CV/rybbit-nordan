@@ -5,20 +5,21 @@ export interface AdminOrganizationData {
   id: string;
   name: string;
   createdAt: string;
-  monthlyEventCount: number;
+  monthlyEventCount: number | null;
   overMonthlyLimit: boolean;
   subscription: {
     id: string | null;
-    source: "custom" | "override" | "stripe" | "appsumo" | "free";
+    source: "custom" | "override" | "stripe" | "appsumo" | "free" | "self-hosted";
     planName: string;
     status: string;
-    eventLimit: number;
-    currentPeriodEnd: Date;
+    eventLimit: number | null;
+    currentPeriodEnd: Date | null;
     cancelAtPeriodEnd?: boolean;
     interval?: string;
     memberLimit?: number | null;
     siteLimit?: number | null;
   };
+  eventCountCoverage: "NOT_VERIFIED" | "UNAVAILABLE";
   planOverride: string | null;
   customPlan: { events: number; members: number | null; websites: number | null } | null;
   stripeCustomerId: string | null;
@@ -29,8 +30,8 @@ export interface AdminOrganizationData {
     domain: string;
     type: "web" | "mobile" | null;
     createdAt: string;
-    eventsLast24Hours: number;
-    eventsLast30Days: number;
+    eventsLast24Hours: number | null;
+    eventsLast30Days: number | null;
   }[];
   members: {
     memberId: string;

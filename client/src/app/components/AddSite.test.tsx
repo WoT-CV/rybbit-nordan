@@ -66,6 +66,21 @@ function openDialogAndType(domain: string) {
 }
 
 describe("AddSite", () => {
+  it("offers Web Vitals on a self-hosted web site and submits collection enabled", () => {
+    mocks.addSite.mockReturnValue(new Promise(() => {}));
+    const input = openDialogAndType("example.com");
+    fireEvent.click(screen.getByRole("button", { name: "Advanced options" }));
+    const toggle = screen.getByRole("switch", { name: "Web Vitals" });
+    expect(toggle).toBeTruthy();
+    fireEvent.click(toggle!);
+    act(() => input.form!.requestSubmit());
+    expect(mocks.addSite).toHaveBeenCalledWith(
+      "example.com",
+      "example.com",
+      "org_1",
+      expect.objectContaining({ webVitals: true })
+    );
+  });
   it("adds the site when Enter is pressed in the domain field", async () => {
     const request = deferred<{ siteId: number }>();
     mocks.addSite.mockReturnValue(request.promise);

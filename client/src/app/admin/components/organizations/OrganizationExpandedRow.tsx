@@ -12,6 +12,7 @@ import { DateTime } from "luxon";
 import { ExternalLink, Pencil, UserCheck } from "lucide-react";
 import Link from "next/link";
 import { useExtracted } from "next-intl";
+import { formatEventCount } from "../shared/eventCounts";
 import { CopyText } from "../../../../components/CopyText";
 import { Favicon } from "../../../../components/Favicon";
 import { SiteSettings } from "@/components/SiteSettings/SiteSettings";
@@ -60,9 +61,10 @@ export function OrganizationExpandedRow({ organization }: OrganizationExpandedRo
     stripe: "Stripe",
     appsumo: "AppSumo",
     free: t("Free"),
+    "self-hosted": "self-hosted",
   }[subscription.source];
 
-  const sites = [...organization.sites].sort((a, b) => b.eventsLast30Days - a.eventsLast30Days);
+  const sites = [...organization.sites].sort((a, b) => (b.eventsLast30Days ?? -1) - (a.eventsLast30Days ?? -1));
   const members = [...organization.members].sort((a, b) => {
     const rankDiff = (ROLE_RANK[a.role?.toLowerCase()] ?? 3) - (ROLE_RANK[b.role?.toLowerCase()] ?? 3);
     return rankDiff !== 0 ? rankDiff : (a.name || a.email).localeCompare(b.name || b.email);
@@ -94,15 +96,17 @@ export function OrganizationExpandedRow({ organization }: OrganizationExpandedRo
                   </a>
                 </Button>
               )}
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-7 px-2 text-xs"
-                onClick={() => setEditingSubscription(true)}
-              >
-                <Pencil className="h-3.5 w-3.5" />
-                {t("Edit")}
-              </Button>
+              {subscription.source !== "self-hosted" && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 px-2 text-xs"
+                  onClick={() => setEditingSubscription(true)}
+                >
+                  <Pencil className="h-3.5 w-3.5" />
+                  {t("Edit")}
+                </Button>
+              )}
             </div>
           </div>
           <dl className="grid grid-cols-2 gap-x-4 gap-y-3 lg:grid-cols-1">
@@ -194,11 +198,11 @@ export function OrganizationExpandedRow({ organization }: OrganizationExpandedRo
                       </div>
                       <div className="flex shrink-0 items-center gap-3 text-sm tabular-nums">
                         <span className="w-24 text-right">
-                          {formatter(site.eventsLast24Hours)}
+                          {formatEventCount(site.eventsLast24Hours)}
                           <span className="ml-1 text-xs text-neutral-500 dark:text-neutral-400">24h</span>
                         </span>
                         <span className="w-24 text-right">
-                          {formatter(site.eventsLast30Days)}
+                          {formatEventCount(site.eventsLast30Days)}
                           <span className="ml-1 text-xs text-neutral-500 dark:text-neutral-400">30d</span>
                         </span>
                         <SiteSettings
@@ -273,11 +277,13 @@ export function OrganizationExpandedRow({ organization }: OrganizationExpandedRo
           </section>
         </div>
       </div>
-      <EditSubscriptionOverrideDialog
-        organization={organization}
-        open={editingSubscription}
-        onOpenChange={setEditingSubscription}
-      />
+      {subscription.source !== "self-hosted" && (
+        <EditSubscriptionOverrideDialog
+          organization={organization}
+          open={editingSubscription}
+          onOpenChange={setEditingSubscription}
+        />
+      )}
       <EditOrganizationMemberDialog
         organizationId={organization.id}
         memberId={editingMemberId}

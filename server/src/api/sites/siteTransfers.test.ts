@@ -136,6 +136,17 @@ beforeEach(async () => {
 });
 
 describe("starting a transfer", () => {
+  it("uses the same canonical public origin for sender and email transfer links", async () => {
+    vi.stubEnv("BASE_URL", "https://analytics.example.com/");
+    try {
+      const reply = await startTransfer();
+      const expected = `https://analytics.example.com/transfer/${reply.body.id}`;
+      expect(reply.body.url).toBe(expected);
+      expect(mocks.sendSiteTransferEmail).toHaveBeenCalledWith(expect.objectContaining({ transferLink: expected }));
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
   it("records one pending transfer, emails the recipient and returns the link", async () => {
     const reply = await startTransfer("  Tay@Example.org ");
 

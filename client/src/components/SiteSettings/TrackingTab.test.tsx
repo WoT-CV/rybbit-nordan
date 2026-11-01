@@ -35,6 +35,22 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("URL fragment tracking setting", () => {
+  it("enables native Web Vitals without a cloud plan", async () => {
+    renderTracking();
+    const toggle = screen.getByRole("switch", { name: "Web Vitals" });
+    fireEvent.click(toggle);
+    await waitFor(() => expect(mocks.updateSiteConfig).toHaveBeenCalledWith(17571, { webVitals: true }));
+  });
+
+  it("keeps Web Vitals read-only without configuration rights", () => {
+    renderTracking({}, true);
+    expect((screen.getByRole("switch", { name: "Web Vitals" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("never exposes Web Vitals on a mobile site", () => {
+    renderTracking({ type: "mobile" });
+    expect(screen.queryByRole("switch", { name: "Web Vitals" })).toBeNull();
+  });
   it("defaults off and saves the site setting when enabled", async () => {
     renderTracking();
     const toggle = screen.getByRole("switch", { name: "Track URL fragments" });

@@ -19,6 +19,7 @@ import { getMemberLimitError, getPlanMemberLimit } from "./memberLimits.js";
 import { invalidateSitesAccessCache } from "./auth-utils.js";
 import { ORG_API_KEY_CONFIG_ID } from "./bearerAuth.js";
 import { DISABLE_SIGNUP, IS_CLOUD } from "./const.js";
+import { getServiceConfiguration } from "./serviceConfiguration.js";
 import {
   addContactToAudience,
   sendChangeEmailVerification,
@@ -199,7 +200,14 @@ const pluginList = [
       },
     },
     sendInvitationEmail: async invitationData => {
-      const inviteLink = `${process.env.BASE_URL}/invitation?invitationId=${invitationData.invitation.id}&organization=${invitationData.organization.name}&inviterEmail=${invitationData.inviter.user.email}`;
+      const { publicUrl, emailEnabled } = getServiceConfiguration();
+      if (!publicUrl || !emailEnabled) throw new Error("Invitation email is not configured");
+      const query = new URLSearchParams({
+        invitationId: invitationData.invitation.id,
+        organization: invitationData.organization.name,
+        inviterEmail: invitationData.inviter.user.email,
+      });
+      const inviteLink = `${publicUrl}/invitation?${query}`;
       await sendInvitationEmail({
         email: invitationData.email,
         inviterName: invitationData.inviter.user.name,
@@ -419,10 +427,14 @@ export const auth = betterAuth({
     },
   },
   socialProviders: {
-    google: {
-      clientId: process.env.GOOGLE_CLIENT_ID!,
-      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
-    },
+    ...(IS_CLOUD && process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET
+      ? {
+          google: {
+            clientId: process.env.GOOGLE_CLIENT_ID!,
+            clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+          },
+        }
+      : {}),
     github: {
       clientId: process.env.GITHUB_CLIENT_ID!,
       clientSecret: process.env.GITHUB_CLIENT_SECRET!,

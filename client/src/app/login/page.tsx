@@ -113,7 +113,7 @@ function LoginPage() {
                   value={password}
                   onChange={e => setPassword(e.target.value)}
                   rightElement={
-                    IS_CLOUD && (
+                    (IS_CLOUD || configs?.emailEnabled) && (
                       <Link href="/reset-password" className="text-xs text-muted-foreground hover:text-primary">
                         {t("Forgot password?")}
                       </Link>

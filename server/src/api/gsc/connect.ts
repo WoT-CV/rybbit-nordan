@@ -2,6 +2,7 @@ import { FastifyReply, FastifyRequest } from "fastify";
 import { ConnectGSCRequest } from "./types.js";
 import { getSessionFromReq, getUserHasSitePermission } from "../../lib/auth-utils.js";
 import { signGSCState } from "./utils.js";
+import { getServiceConfiguration } from "../../lib/serviceConfiguration.js";
 
 /**
  * Initiates the OAuth flow for Google Search Console
@@ -30,9 +31,9 @@ export async function connectGSC(req: FastifyRequest<ConnectGSCRequest>, res: Fa
     }
 
     const clientId = process.env.GOOGLE_CLIENT_ID;
-    const redirectUri = process.env.GOOGLE_REDIRECT_URI || `${process.env.SERVER_URL}/api/gsc/callback`;
+    const { gscEnabled, gscRedirectUri: redirectUri } = getServiceConfiguration();
 
-    if (!clientId) {
+    if (!clientId || !gscEnabled) {
       return res.status(500).send({ error: "Google OAuth not configured" });
     }
 

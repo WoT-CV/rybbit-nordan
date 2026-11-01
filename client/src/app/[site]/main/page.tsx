@@ -3,7 +3,8 @@ import { ReactNode } from "react";
 import { useGetLiveUserCount } from "../../../api/analytics/hooks/useGetLiveUserCount";
 import { useInView } from "../../../hooks/useInView";
 import { useSetPageTitle } from "../../../hooks/useSetPageTitle";
-import { IS_CLOUD, LITE_DASHBOARD } from "../../../lib/const";
+import { LITE_DASHBOARD } from "../../../lib/const";
+import { useConfigs } from "../../../lib/configs";
 import { useStore } from "../../../lib/store";
 import { SubHeader } from "../components/SubHeader/SubHeader";
 import { MainSection } from "./components/MainSection/MainSection";
@@ -39,6 +40,7 @@ export default function MainPage() {
 }
 
 function MainPageContent() {
+  const { configs } = useConfigs();
   const { data } = useGetLiveUserCount(5);
 
   useSetPageTitle(`${data?.count ?? "…"} user${data?.count === 1 ? "" : "s"} online`);
@@ -89,7 +91,7 @@ function MainPageContent() {
         <LazySection>
           <Weekdays />
         </LazySection>
-        {IS_CLOUD && (
+        {configs?.gscEnabled && (
           <LazySection>
             <SearchConsole />
           </LazySection>

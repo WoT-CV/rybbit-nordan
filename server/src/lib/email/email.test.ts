@@ -31,6 +31,10 @@ beforeEach(() => {
 });
 
 describe("sendEmail", () => {
+  it("does not acknowledge a response without an accepted message ID", async () => {
+    mocks.emailsSend.mockResolvedValue({ data: null, error: null });
+    await expect(sendEmail("a@example.com", "Hi", "<p>Hi</p>")).rejects.toThrow("No accepted message ID");
+  });
   it("resolves when Resend accepts the email", async () => {
     mocks.emailsSend.mockResolvedValue({ data: { id: "email_1" }, error: null });
 

@@ -19,7 +19,7 @@ import { SettingRow, SettingsSection, SettingsSections } from "./SettingsSection
 interface TrackingTabProps {
   siteMetadata: SiteResponse;
   disabled?: boolean;
-  adminSubscription?: { planName: string; eventLimit?: number };
+  adminSubscription?: { planName: string; eventLimit?: number | null };
   adminMode?: boolean;
 }
 
@@ -128,7 +128,7 @@ export function TrackingTab({
           } as ToggleConfig,
         ]
       : []),
-    ...(IS_CLOUD && !isMobileSite
+    ...(!isMobileSite
       ? [
           {
             id: "webVitals",

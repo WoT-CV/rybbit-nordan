@@ -25,6 +25,8 @@ const state = vi.hoisted(() => ({
 }));
 
 const mocks = vi.hoisted(() => ({
+  enabled: true,
+  schedule: vi.fn(() => ({ stop: vi.fn(), destroy: vi.fn() })),
   sendWeeklyReportEmail: vi.fn(),
   sendWeeklyDigestEmail: vi.fn(),
 }));
@@ -88,6 +90,11 @@ vi.mock("../../lib/email/email.js", () => ({
   sendWeeklyDigestEmail: mocks.sendWeeklyDigestEmail,
 }));
 
+vi.mock("node-cron", () => ({ schedule: mocks.schedule }));
+vi.mock("../../lib/serviceConfiguration.js", () => ({
+  getServiceConfiguration: () => ({ weeklyReportsEnabled: mocks.enabled }),
+}));
+
 vi.mock("../../lib/const.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../lib/const.js")>()),
   IS_CLOUD: true,
@@ -124,6 +131,9 @@ const digestRecipients = () =>
   }));
 
 beforeEach(() => {
+  weeklyReportService.stopWeeklyReportCron();
+  mocks.enabled = true;
+  mocks.schedule.mockClear();
   state.organizations = [
     { id: "org_a", name: "Acme" },
     { id: "org_b", name: "Side Project" },
@@ -138,6 +148,34 @@ beforeEach(() => {
 });
 
 describe("weekly reports", () => {
+  it("does no work without configured email", async () => {
+    mocks.enabled = false;
+    state.memberships = [membership("ada", "org_a")];
+    state.activity = [{ site_id: 1, current: 10, previous: 5 }];
+    await weeklyReportService.generateAndSendReports();
+    expect(state.overviewQueries).toEqual([]);
+    expect(mocks.sendWeeklyReportEmail).not.toHaveBeenCalled();
+    expect(mocks.sendWeeklyDigestEmail).not.toHaveBeenCalled();
+  });
+
+  it("starts one scheduler, stops it and can restart safely", () => {
+    weeklyReportService.startWeeklyReportCron();
+    weeklyReportService.startWeeklyReportCron();
+    expect(mocks.schedule).toHaveBeenCalledTimes(1);
+    const task = mocks.schedule.mock.results[0].value;
+    weeklyReportService.stopWeeklyReportCron();
+    weeklyReportService.stopWeeklyReportCron();
+    expect(task.stop).toHaveBeenCalledTimes(1);
+    expect(task.destroy).toHaveBeenCalledTimes(1);
+    weeklyReportService.startWeeklyReportCron();
+    expect(mocks.schedule).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not schedule unconfigured reports", () => {
+    mocks.enabled = false;
+    weeklyReportService.startWeeklyReportCron();
+    expect(mocks.schedule).not.toHaveBeenCalled();
+  });
   it("sends the full report to someone with one site that had traffic", async () => {
     state.memberships = [membership("ada", "org_a")];
     state.activity = [{ site_id: 1, current: 50, previous: 40 }];

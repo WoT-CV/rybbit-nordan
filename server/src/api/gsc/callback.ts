@@ -1,3 +1,4 @@
+import { getServiceConfiguration } from "../../lib/serviceConfiguration.js";
 import { FastifyReply, FastifyRequest } from "fastify";
 import { GSCCallbackRequest } from "./types.js";
 import { gscConnections, sites } from "../../db/postgres/schema.js";
@@ -20,12 +21,14 @@ interface TokenResponse {
  * Exchanges the code for tokens and stores them in the database
  */
 export async function gscCallback(req: FastifyRequest<GSCCallbackRequest>, res: FastifyReply) {
+  const { publicUrl, gscEnabled, gscRedirectUri: redirectUri } = getServiceConfiguration();
+  if (!gscEnabled) return res.status(503).send({ error: "Google OAuth not configured" });
   try {
     const { code, state, error } = req.query;
 
     if (error) {
       req.log.info({ oauthError: error }, "GSC OAuth was cancelled or failed");
-      return res.redirect(`${process.env.BASE_URL}`);
+      return res.redirect(`${publicUrl}`);
     }
 
     if (!code || !state) {
@@ -69,9 +72,8 @@ export async function gscCallback(req: FastifyRequest<GSCCallbackRequest>, res: 
 
     const clientId = process.env.GOOGLE_CLIENT_ID;
     const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-    const redirectUri = process.env.GOOGLE_REDIRECT_URI || `${process.env.SERVER_URL}/api/gsc/callback`;
 
-    if (!clientId || !clientSecret) {
+    if (!clientId || !clientSecret || !gscEnabled) {
       return res.status(500).send({ error: "Google OAuth not configured" });
     }
 
@@ -95,7 +97,7 @@ export async function gscCallback(req: FastifyRequest<GSCCallbackRequest>, res: 
         { responseBody: await tokenResponse.text(), statusCode: tokenResponse.status },
         "GSC token exchange failed"
       );
-      return res.redirect(`${process.env.BASE_URL}/error?message=Token exchange failed`);
+      return res.redirect(`${publicUrl}/error?message=Token exchange failed`);
     }
 
     const tokens: TokenResponse = await tokenResponse.json();
@@ -104,7 +106,7 @@ export async function gscCallback(req: FastifyRequest<GSCCallbackRequest>, res: 
     const properties = await getGSCProperties(tokens.access_token, req.log);
 
     if (properties.length === 0) {
-      return res.redirect(`${process.env.CLIENT_URL}/error?message=No GSC properties found`);
+      return res.redirect(`${publicUrl}/error?message=No GSC properties found`);
     }
 
     const expiresAt = new Date(Date.now() + tokens.expires_in * 1000);
@@ -151,14 +153,14 @@ export async function gscCallback(req: FastifyRequest<GSCCallbackRequest>, res: 
 
     if (!stored) {
       req.log.warn({ siteId }, "Site changed organization during the GSC callback; tokens not stored");
-      return res.redirect(`${process.env.BASE_URL}/error?message=The site moved while connecting Search Console`);
+      return res.redirect(`${publicUrl}/error?message=The site moved while connecting Search Console`);
     }
 
     // Redirect to property selection page with properties as query params
     const propertiesParam = encodeURIComponent(JSON.stringify(properties));
-    return res.redirect(`${process.env.BASE_URL}/${siteId}/gsc/select-property?properties=${propertiesParam}`);
+    return res.redirect(`${publicUrl}/${siteId}/gsc/select-property?properties=${propertiesParam}`);
   } catch (error) {
     req.log.error(error, "Error handling GSC callback");
-    return res.redirect(`${process.env.BASE_URL}/error?message=Callback failed`);
+    return res.redirect(`${publicUrl}/error?message=Callback failed`);
   }
 }

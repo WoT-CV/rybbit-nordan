@@ -1,6 +1,13 @@
 import { DateTime } from "luxon";
+import { IS_CLOUD } from "../const.js";
+import { getServiceConfiguration } from "../serviceConfiguration.js";
 
-export const appUrl = () => (process.env.BASE_URL || "https://app.rybbit.io").replace(/\/$/, "");
+export const appUrl = () => {
+  const { publicUrl } = getServiceConfiguration();
+  if (publicUrl) return publicUrl;
+  if (IS_CLOUD) return "https://app.rybbit.io";
+  throw new Error("BASE_URL must be a valid HTTP(S) origin for email links");
+};
 
 export const formatCount = (n: number | null | undefined): string =>
   n == null || !Number.isFinite(n) ? "0" : Math.round(n).toLocaleString("en-US");

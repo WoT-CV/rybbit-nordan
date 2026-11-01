@@ -22,6 +22,7 @@ import { SortableHeader } from "../shared/SortableHeader";
 import { TableShell } from "../shared/Panel";
 import { OrganizationExpandedRow } from "./OrganizationExpandedRow";
 import { useExtracted } from "next-intl";
+import { formatEventCount, sumEventCounts } from "../shared/eventCounts";
 import { SiStripe } from "@icons-pack/react-simple-icons";
 import { Favicon } from "@/components/Favicon";
 
@@ -137,12 +138,12 @@ export function OrganizationsTable({ organizations, isLoading, searchQuery }: Or
         meta: { align: "right" } satisfies ColumnAlignMeta,
         header: ({ column }) => <SortableHeader column={column}>{t("Monthly Events")}</SortableHeader>,
         cell: ({ row }) => {
-          const count = row.getValue("monthlyEventCount") as number;
+          const count = row.getValue("monthlyEventCount") as number | null;
           const isOverLimit = row.original.overMonthlyLimit;
           const limit = row.original.subscription.eventLimit;
           return (
             <div className={cn("tabular-nums", isOverLimit && "font-medium text-red-500 dark:text-red-400")}>
-              {formatter(count || 0)}
+              {formatEventCount(count)}
               {isOverLimit && limit ? (
                 <span className="ml-1 text-xs text-neutral-500 dark:text-neutral-400">/ {formatter(limit)}</span>
               ) : null}
@@ -154,15 +155,15 @@ export function OrganizationsTable({ organizations, isLoading, searchQuery }: Or
         id: "eventsLast24Hours",
         meta: { align: "right" } satisfies ColumnAlignMeta,
         header: ({ column }) => <SortableHeader column={column}>{t("24h Events")}</SortableHeader>,
-        accessorFn: row => row.sites.reduce((total, site) => total + Number(site.eventsLast24Hours || 0), 0),
-        cell: ({ getValue }) => <span className="tabular-nums">{formatter(getValue<number>())}</span>,
+        accessorFn: row => sumEventCounts(row.sites.map(site => site.eventsLast24Hours)),
+        cell: ({ getValue }) => <span className="tabular-nums">{formatEventCount(getValue<number | null>())}</span>,
       },
       {
         id: "eventsLast30Days",
         meta: { align: "right" } satisfies ColumnAlignMeta,
         header: ({ column }) => <SortableHeader column={column}>{t("30d Events")}</SortableHeader>,
-        accessorFn: row => row.sites.reduce((total, site) => total + Number(site.eventsLast30Days || 0), 0),
-        cell: ({ getValue }) => <span className="tabular-nums">{formatter(getValue<number>())}</span>,
+        accessorFn: row => sumEventCounts(row.sites.map(site => site.eventsLast30Days)),
+        cell: ({ getValue }) => <span className="tabular-nums">{formatEventCount(getValue<number | null>())}</span>,
       },
       {
         id: "subscription",

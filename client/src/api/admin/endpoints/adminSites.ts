@@ -8,8 +8,9 @@ export interface AdminSiteData {
   organizationId: string | null;
   createdAt: string;
   public: boolean;
-  eventsLast24Hours: number;
-  eventsLast30Days: number;
+  eventsLast24Hours: number | null;
+  eventsLast30Days: number | null;
+  eventCountCoverage: "NOT_VERIFIED" | "UNAVAILABLE";
   goalsCount: number;
   funnelsCount: number;
   sessionReplay: boolean;

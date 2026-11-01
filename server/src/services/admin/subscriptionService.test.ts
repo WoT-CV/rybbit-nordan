@@ -14,6 +14,7 @@ const state = vi.hoisted(() => ({
   /** Number of licence queries issued — the loop batches at 1000 org ids. */
   licenseQueries: 0,
   stripeEnabled: true,
+  isCloud: true,
 }));
 
 const mocks = vi.hoisted(() => ({
@@ -29,6 +30,13 @@ vi.mock("../../db/postgres/postgres.js", () => ({
       }
       return state.licenses;
     },
+  },
+}));
+
+vi.mock("../../lib/const.js", async importOriginal => ({
+  ...(await importOriginal<object>()),
+  get IS_CLOUD() {
+    return state.isCloud;
   },
 }));
 
@@ -103,11 +111,28 @@ function snapshot(entries: Record<string, Stripe.Subscription>) {
 
 const nextMonthStart = () => DateTime.now().startOf("month").plus({ months: 1 }).toJSDate();
 
+it("self-hosted admin has no billing plan, renewal or external billing lookups", async () => {
+  state.isCloud = false;
+  const result = await getOrganizationSubscriptions(
+    [{ id: "org_self", stripeCustomerId: "legacy", planOverride: "appsumo-1" }],
+    true
+  );
+  expect(result.get("org_self")).toMatchObject({
+    source: "self-hosted",
+    planName: "self-hosted",
+    eventLimit: null,
+    currentPeriodEnd: null,
+  });
+  expect(state.licenseQueries).toBe(0);
+  expect(mocks.getAllStripeSubscriptionsByCustomer).not.toHaveBeenCalled();
+});
+
 beforeEach(() => {
   state.licenses = [];
   state.licenseQueryError = null;
   state.licenseQueries = 0;
   state.stripeEnabled = true;
+  state.isCloud = true;
   mocks.getAllStripeSubscriptionsByCustomer.mockReset();
   mocks.getAllStripeSubscriptionsByCustomer.mockResolvedValue(new Map());
   vi.spyOn(console, "error").mockImplementation(() => {});

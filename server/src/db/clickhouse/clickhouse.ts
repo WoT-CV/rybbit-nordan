@@ -1,4 +1,4 @@
-import { IS_CLOUD, LITE_DASHBOARD } from "../../lib/const.js";
+import { LITE_DASHBOARD } from "../../lib/const.js";
 import { clickhouse } from "./client.js";
 import { clickhouseInitLogger } from "./initUtils.js";
 import { initializeCloudTables } from "./schema/cloud.js";
@@ -25,9 +25,8 @@ export const initializeClickhouse = async () => {
 
   await initializeCoreTables();
 
-  if (IS_CLOUD) {
-    await initializeCloudTables();
-  }
+  // Native hourly counts also power the self-hosted admin. This does not backfill history.
+  await initializeCloudTables();
 
   if (LITE_DASHBOARD) {
     await initializeLiteDashboardMVs();

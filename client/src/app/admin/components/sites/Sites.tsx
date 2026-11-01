@@ -27,13 +27,14 @@ import {
   useReactTable,
 } from "@tanstack/react-table";
 import { useExtracted } from "next-intl";
+import { formatEventCount } from "../shared/eventCounts";
 import Link from "next/link";
 import { useMemo, useState } from "react";
 import { Favicon } from "../../../../components/Favicon";
 import { Pagination } from "../../../../components/pagination";
 import { useDateTimeFormat } from "../../../../hooks/useDateTimeFormat";
 import { parseUtcTimestamp } from "../../../../lib/dateTimeUtils";
-import { cn, formatter, truncateString } from "../../../../lib/utils";
+import { cn, truncateString } from "../../../../lib/utils";
 import { ErrorAlert } from "../shared/ErrorAlert";
 import { GrowthChart } from "../shared/GrowthChart";
 import { Panel, TableShell } from "../shared/Panel";
@@ -196,13 +197,17 @@ export function Sites() {
         accessorKey: "eventsLast24Hours",
         meta: { align: "right" } satisfies ColumnAlignMeta,
         header: ({ column }) => <SortableHeader column={column}>{t("Events (24h)")}</SortableHeader>,
-        cell: ({ row }) => <span className="tabular-nums">{formatter(Number(row.getValue("eventsLast24Hours")))}</span>,
+        cell: ({ row }) => (
+          <span className="tabular-nums">{formatEventCount(row.getValue<number | null>("eventsLast24Hours"))}</span>
+        ),
       },
       {
         accessorKey: "eventsLast30Days",
         meta: { align: "right" } satisfies ColumnAlignMeta,
         header: ({ column }) => <SortableHeader column={column}>{t("Events (30d)")}</SortableHeader>,
-        cell: ({ row }) => <span className="tabular-nums">{formatter(Number(row.getValue("eventsLast30Days")))}</span>,
+        cell: ({ row }) => (
+          <span className="tabular-nums">{formatEventCount(row.getValue<number | null>("eventsLast30Days"))}</span>
+        ),
       },
       {
         accessorKey: "goalsCount",
@@ -281,6 +286,9 @@ export function Sites() {
 
   return (
     <div className="space-y-6">
+      <p className="text-sm text-muted-foreground">
+        {t("Hourly aggregate observations; historical coverage is not verified. Missing data is shown as a dash.")}
+      </p>
       <Panel
         title={t("New sites per day")}
         actions={

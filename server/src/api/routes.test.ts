@@ -17,10 +17,13 @@ vi.mock("../db/redis/redis.js", () => ({
 }));
 vi.mock("../lib/auth.js", () => ({ auth: { api: {} } }));
 
+const deployment = vi.hoisted(() => ({ cloud: true }));
 vi.mock("../lib/const.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../lib/const.js")>()),
   // Register the cloud-only billing routes too.
-  IS_CLOUD: true,
+  get IS_CLOUD() {
+    return deployment.cloud;
+  },
 }));
 
 import { PERMISSIONS } from "@rybbit/shared";
@@ -53,6 +56,31 @@ const describeAccess = (access: RouteAccess | undefined) => {
 };
 
 describe("API route table", () => {
+  it("keeps native product routes and their permissions without self-hosted billing routes", async () => {
+    deployment.cloud = false;
+    try {
+      const routes = await collectRoutes();
+      expect(
+        routes.some(
+          route =>
+            route.url.includes("/stripe/") ||
+            route.url.endsWith("/admin/subscription-plans") ||
+            route.url.endsWith("/subscription-override")
+        )
+      ).toBe(false);
+      for (const path of [
+        "/api/admin/sites",
+        "/api/admin/organizations",
+        "/api/sites/:siteId/dashboards",
+        "/api/sites/:siteId/gsc/connect",
+      ]) {
+        expect(routes.some(route => route.url === path)).toBe(true);
+      }
+      expect(routes.find(route => route.url === "/api/admin/sites")?.access).toBe("system-admin");
+    } finally {
+      deployment.cloud = true;
+    }
+  });
   it("declares who may call every route", async () => {
     const routes = await collectRoutes();
 

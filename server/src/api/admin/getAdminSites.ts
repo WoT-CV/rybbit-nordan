@@ -4,6 +4,7 @@ import { DateTime } from "luxon";
 import { clickhouse } from "../../db/clickhouse/clickhouse.js";
 import { db } from "../../db/postgres/postgres.js";
 import { goals, funnels, member, user } from "../../db/postgres/schema.js";
+import { IS_CLOUD } from "../../lib/const.js";
 import { getOrganizationSubscriptions } from "../../services/admin/subscriptionService.js";
 
 interface EventCountResult {
@@ -45,9 +46,13 @@ export async function getAdminSites(request: FastifyRequest, reply: FastifyReply
   const yesterday = now.minus({ hours: 24 });
   const thirtyDaysAgo = now.minus({ days: 30 });
 
-  // Get 24h event counts
-  const eventCounts24hResult = await clickhouse.query({
-    query: `
+  let eventCountsAvailable = true;
+  const siteEventMap24h = new Map<number, number>();
+  const siteEventMap30d = new Map<number, number>();
+  try {
+    // Get 24h event counts
+    const eventCounts24hResult = await clickhouse.query({
+      query: `
       SELECT 
         site_id,
         sum(event_count) as total_events
@@ -59,12 +64,12 @@ export async function getAdminSites(request: FastifyRequest, reply: FastifyReply
       GROUP BY 
         site_id
     `,
-    format: "JSONEachRow",
-  });
+      format: "JSONEachRow",
+    });
 
-  // Get 30d event counts
-  const eventCounts30dResult = await clickhouse.query({
-    query: `
+    // Get 30d event counts
+    const eventCounts30dResult = await clickhouse.query({
+      query: `
       SELECT 
         site_id,
         sum(event_count) as total_events
@@ -76,26 +81,26 @@ export async function getAdminSites(request: FastifyRequest, reply: FastifyReply
       GROUP BY 
         site_id
     `,
-    format: "JSONEachRow",
-  });
+      format: "JSONEachRow",
+    });
 
-  const rawEventCounts24h = await eventCounts24hResult.json();
-  const rawEventCounts30d = await eventCounts30dResult.json();
+    const rawEventCounts24h = await eventCounts24hResult.json();
+    const rawEventCounts30d = await eventCounts30dResult.json();
 
-  // Create maps of site IDs to event counts
-  const siteEventMap24h = new Map<number, number>();
-  const siteEventMap30d = new Map<number, number>();
+    // Type assertion for the events data
+    const eventCounts24h = rawEventCounts24h as EventCountResult[];
+    const eventCounts30d = rawEventCounts30d as EventCountResult[];
 
-  // Type assertion for the events data
-  const eventCounts24h = rawEventCounts24h as EventCountResult[];
-  const eventCounts30d = rawEventCounts30d as EventCountResult[];
+    for (const event of eventCounts24h) {
+      siteEventMap24h.set(Number(event.site_id), event.total_events);
+    }
 
-  for (const event of eventCounts24h) {
-    siteEventMap24h.set(Number(event.site_id), event.total_events);
-  }
-
-  for (const event of eventCounts30d) {
-    siteEventMap30d.set(Number(event.site_id), event.total_events);
+    for (const event of eventCounts30d) {
+      siteEventMap30d.set(Number(event.site_id), event.total_events);
+    }
+  } catch (error) {
+    eventCountsAvailable = false;
+    request.log.warn({ err: error }, "Admin event counts unavailable");
   }
 
   // Get goal and funnel counts per site
@@ -122,7 +127,7 @@ export async function getAdminSites(request: FastifyRequest, reply: FastifyReply
   const enrichedSites = sitesData.map(site => {
     const subscription = site.organizationId
       ? orgSubscriptionMap.get(site.organizationId)
-      : { planName: "free", status: "free" };
+      : { planName: IS_CLOUD ? "free" : "self-hosted", status: IS_CLOUD ? "free" : "active" };
 
     return {
       siteId: site.siteId,
@@ -132,8 +137,9 @@ export async function getAdminSites(request: FastifyRequest, reply: FastifyReply
       organizationId: site.organizationId,
       createdAt: site.createdAt,
       public: site.public,
-      eventsLast24Hours: siteEventMap24h.get(site.siteId) || 0,
-      eventsLast30Days: siteEventMap30d.get(site.siteId) || 0,
+      eventsLast24Hours: eventCountsAvailable ? Number(siteEventMap24h.get(site.siteId) ?? 0) : null,
+      eventsLast30Days: eventCountsAvailable ? Number(siteEventMap30d.get(site.siteId) ?? 0) : null,
+      eventCountCoverage: eventCountsAvailable ? "NOT_VERIFIED" : "UNAVAILABLE",
       goalsCount: siteGoalCountMap.get(site.siteId) || 0,
       funnelsCount: siteFunnelCountMap.get(site.siteId) || 0,
       sessionReplay: site.sessionReplay ?? false,

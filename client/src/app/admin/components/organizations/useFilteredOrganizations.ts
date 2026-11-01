@@ -25,7 +25,10 @@ export function useFilteredOrganizations(
         return (
           org.id.toLowerCase().includes(lowerSearchQuery) ||
           org.name.toLowerCase().includes(lowerSearchQuery) ||
-          org.sites.some(site => site.name.toLowerCase().includes(lowerSearchQuery) || site.domain.toLowerCase().includes(lowerSearchQuery)) ||
+          org.sites.some(
+            site =>
+              site.name.toLowerCase().includes(lowerSearchQuery) || site.domain.toLowerCase().includes(lowerSearchQuery)
+          ) ||
           org.members.some(
             member =>
               member.email.toLowerCase().includes(lowerSearchQuery) ||
@@ -37,7 +40,9 @@ export function useFilteredOrganizations(
 
     // Filter out organizations with 0 events in last 30 days
     if (!showZeroEvents) {
-      filtered = filtered.filter(org => org.sites.some(site => site.eventsLast30Days > 0));
+      filtered = filtered.filter(org =>
+        org.sites.some(site => site.eventsLast30Days === null || site.eventsLast30Days > 0)
+      );
     }
 
     // Filter by selected subscription tiers (if any selected)

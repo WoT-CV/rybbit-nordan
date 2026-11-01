@@ -24,7 +24,10 @@ export function SubscriptionTiersTable({ organizations, isLoading }: Subscriptio
   });
 
   const subscriptionBreakdown = useMemo(() => {
-    if (!organizations || organizations.length === 0) return [];
+    if (!organizations || organizations.length === 0 || organizations.some(org =>
+      org.subscription.source === "self-hosted" ||
+      org.sites.some(site => site.eventsLast24Hours === null || site.eventsLast30Days === null)
+    )) return [];
 
     const tierData: Record<string, { count: number; events24h: number; events30d: number }> = {};
     let totalEvents24h = 0;
@@ -85,6 +88,11 @@ export function SubscriptionTiersTable({ organizations, isLoading }: Subscriptio
         className={`h-4 w-4 transition-transform ${tierSorting.direction === "asc" ? "rotate-180" : ""}`}
       />
     ) : null;
+
+  if (organizations?.some(org => org.subscription.source === "self-hosted"))
+    return <p className="text-sm text-muted-foreground">{t("Self-hosted: billing does not apply.")}</p>;
+  if (organizations?.some(org => org.sites.some(site => site.eventsLast24Hours === null || site.eventsLast30Days === null)))
+    return <p className="text-sm text-muted-foreground">{t("Event counts are unavailable.")}</p>;
 
   return (
     <div className="space-y-2">

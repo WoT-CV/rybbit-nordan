@@ -182,8 +182,10 @@ const start = async () => {
       telemetryService.startTelemetryCron();
       usageService.startUsageCheckCron();
       unclaimedSiteCleanupService.startCleanupCron();
-      if (IS_CLOUD && process.env.NODE_ENV !== "development") {
+      if (process.env.NODE_ENV !== "development") {
         weeklyReportService.startWeeklyReportCron();
+      }
+      if (IS_CLOUD && process.env.NODE_ENV !== "development") {
         lifecycleEmailService.startLifecycleCron();
       }
     }
@@ -222,6 +224,7 @@ const shutdown = async (signal: string) => {
   }, 10000); // 10 second timeout
 
   try {
+    weeklyReportService.stopWeeklyReportCron();
     unclaimedSiteCleanupService.stopCleanupCron();
     // Stop accepting new connections
     await server.close();
