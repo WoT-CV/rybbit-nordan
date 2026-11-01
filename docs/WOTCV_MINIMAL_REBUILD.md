@@ -420,3 +420,85 @@ pracuje read-only na integracji. Bez nowych zależności, SQL, migracji i produk
   infrastruktury, nie bazę. Pełny ekran Next+rrweb i mobile acceptance wracają
   w etapie 6; fizyczny iPhone oraz rzeczywiste datasource/retencja nadal live gate.
   Instrukcja operatora: WOTCV_REPLAY_CORRELATION.md. Produkcja bez zmian.
+
+## Etap 5 — ponowna analiza i plan przed implementacją
+
+Native docker-compose.yml ma stałe container_name oraz domyślne porty. Samo
+inne -p nie izoluje od produkcyjnych kontenerów. Named volumes bez external
+pozostają natomiast project-scoped. Nie przenosimy starego zestawu updaterów,
+reconcile i automatycznych napraw baz. Native server/docker-entrypoint.sh
+uruchamia Drizzle przed startem; backend inicjalizuje także struktury CH.
+Żadnego `up`, entrypoint, SQL ani backup/restore nie używamy do preflight.
+Nie zmieniamy upstreamowego compose i nie podpinamy produkcyjnych wolumenów.
+
+Noindex wymaga osobnego vhosta. add_header w child location zastępuje dziedziczone
+headers: include trzeba świadomie powtórzyć tam, gdzie są własne add_header.
+Literalny pusty return 410 generuje HTML Nginx; puste manifests wymagają
+zmiennej empty response. Nie dodajemy robots/meta/canonical do kodu aplikacji.
+Noindex nie usuwa natychmiast wcześniej zindeksowanych wyników i nie jest auth.
+
+Plan:
+
+1. Osobny, jawnie wybrany overlay kandydata: usunąć stałe nazwy kontenerów,
+   stały bezpieczny project name, loopback porty 13001/13002/18123/15432/16379,
+   zachować native volumes/configs/health. Wyłączyć build w overlay, wymagać
+   jawnych obrazów aplikacji przypiętych digestem. Wszystkie pięć usług ma
+   json-file 50m/5. Brak external network/volumes i bindów do produkcji.
+2. Nie dostarczać automatycznego deployera. Backend entrypoint w overlay
+   pozostaje zablokowany domyślnie dedykowanym candidate startup guard;
+   świadomy operator musi osobno zatwierdzić wyłącznie pustą izolowaną bazę.
+   To nie jest zgoda na migrację starej bazy ani dowód, że jest ona pusta.
+3. Env example zawiera wszystkie niezbędne public/private parametry etapów
+   2/4; syntetyczne adresy, bez sekretów/UID z produkcji. CLOUD=false,
+   telemetry off. Weryfikator czyta effective Compose JSON, sprawdza project,
+   digests, ports, logging, storage, internal wiring i guard, nie drukuje
+   credentials, nie korzysta z daemon/start/migrate/restart/prune.
+   Testy fixture invalid/valid. Jeśli dostępny tylko standalone Compose,
+   zweryfikować oficjalny pinned binarny checksum i użyć wyłącznie config.
+4. Mały konfigurowany publiczny odnośnik SOURCE_CODE_URL do źródeł forka,
+   walidacja HTTPS/no credentials/query/hash, zachowane upstream notices i
+   license. Sidebar nie pokazuje błędnego URL. Wydanie wymaga opublikowania
+   odpowiadającego źródła; samo ustawienie linku nie dowodzi publikacji.
+5. Dedicated Nginx snippets: X-Robots-Tag always, hide upstream duplicate,
+   robots.txt/sitemap.xml exact GET/HEAD empty410 i no-store, bez catch-all
+   zmian innych usług. Instrukcja manualnej instalacji: kopia, wybrany vhost,
+   konflikt locations/inheritance, nginx -t, kontrolowany reload i rollback.
+   Nie instalować ani reloadować teraz; żadnego kopiowania globalnych snippets.
+6. Read-only HTTP verifier dla osobnych explicit public/origin base URL:
+   bez redirectów, timeout/body cap, natywne health200textOK, JS200nieHTML, noindex na
+   normalnych/error/manifest odpowiedziach, GET/HEAD empty410/no-store.
+   Nie logować body ani sekretów. Testy lokalnym HTTP fixture, brak live apply.
+7. Podział: główny agent overlay/guard/Compose verifier i dokument centralny;
+   subagent A source link i testy; subagent B Nginx/verifier/testy/instrukcja.
+   Niezależne review, poprawki, walidacja dostępna lokalnie, osobny commit.
+   Realny Nginx/Docker daemon i hostowe runtime checks pozostają release gate.
+
+### Review i wyniki etapu 5
+
+- Gotowy oddzielny candidate overlay, prywatny env example, domyślnie zamknięty
+  startup guard, effective-model checker, dedicated Nginx snippets oraz bounded
+  HTTP verifier. Upstream docker-compose.yml i Dockerfiles bez zmian. Nie
+  przeniesiono updatera/reconcile/backfill/maintenance infrastruktury starego forka.
+- Parametr SOURCE_CODE_URL jest walidowany po obu stronach, widoczny bez
+  logowania i bez fallback sugerującego nieprawdziwe źródło. Native notices i
+  license pozostają. Każdy z 12 katalogów ma jeden nowy przekład, bez usunięć.
+- Realny Docker Compose 5.6.1 standalone (oficjalny SHA256
+  91b1492f0a923427651e2b955739d732ac36b8191193bf4799e62f3e3525c4cd)
+  zweryfikował merge/quiet config na syntetycznych parametrach: PASS, gate CLOSED.
+  Wyłącznie parser config, bez daemon/start/DB/migracji. Fixture checker 29 PASS,
+  fixture HTTP verifier 29 PASS, razem 58 PASS. Guard z pustym ACK realnie
+  odmówił kodem 78; native entrypoint nie został wykonany. Shell syntax PASS.
+- Niezależne review wykryło frozen NEXT_PUBLIC_* (runtime env nie zmienia obrazu)
+  i CRLF native entrypoint w Windows. Instrukcja wymaga właściwych build args,
+  provenance/digest i browser request proof. .gitattributes wymusza LF; plik
+  entrypoint ma teraz 0CR/17LF, bez zmiany kanonicznego Git content ani logiki.
+  Backend restart=no zapobiega restart-loop zamkniętego gate.
+- Main review poprawiło odziedziczony MIME XML (`types { }` w obu manifests),
+  Redis credential consistency i loopback callback URLs. Natywne health to
+  text/plain OK, nie JSON starego forka; verifier nie wymusza zmiany aplikacji.
+  Końcowe niezależne review nie pozostawia source blockers.
+- Główny agent niezależnie: source backend 2 pliki/21 PASS, sidebar 19 PASS,
+  oba buildy PASS. Lint delta 76 plików: brak nowych errors, 14 odziedziczonych.
+  Nie uruchamiano Nginx, Docker images ani live HTTP/prod; realne inheritance,
+  empty410, CDN, image provenance i opublikowanie źródeł pozostają release gate.
+- Instrukcje: WOTCV_MINIMAL_DEPLOYMENT.md i WOTCV_MINIMAL_NOINDEX.md.

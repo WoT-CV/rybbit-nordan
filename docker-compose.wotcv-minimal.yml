@@ -1,0 +1,67 @@
+# Explicit candidate overlay only. Never select this for the existing production project.
+# Compose >= 2.24.4 supports !override. `config` is read-only; `up` is NOT.
+name: rybbit-minimal-candidate
+
+x-candidate-logging: &candidate-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+services:
+  backend:
+    container_name: !reset null
+    image: ${WOTCV_BACKEND_IMAGE:?Set an approved backend image by digest}
+    build: !reset null
+    ports: !override ["127.0.0.1:13001:3001"]
+    entrypoint: ["/bin/sh", "/wotcv/candidate-start.sh"]
+    command: ["node", "dist/cluster.js"]
+    restart: "no"
+    volumes:
+      - ./ops/minimal/candidate-start.sh:/wotcv/candidate-start.sh:ro
+    environment:
+      CLOUD: "false"
+      DISABLE_TELEMETRY: "true"
+      SOURCE_CODE_URL: ${SOURCE_CODE_URL:?Set the published source revision URL}
+      SERVER_URL: ${WOTCV_CANDIDATE_API_URL:-http://127.0.0.1:13001}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      EMAIL_REPLY_TO: ${EMAIL_REPLY_TO:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-}
+      WOTCV_REPLAY_CORRELATION_JSON: ${WOTCV_REPLAY_CORRELATION_JSON:-[]}
+      WOTCV_CANDIDATE_START_ACK: ${WOTCV_CANDIDATE_START_ACK:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *candidate-logging
+
+  client:
+    container_name: !reset null
+    image: ${WOTCV_CLIENT_IMAGE:?Set an approved client image by digest}
+    build: !reset null
+    ports: !override ["127.0.0.1:13002:3002"]
+    environment:
+      NEXT_PUBLIC_CLOUD: "false"
+      NEXT_PUBLIC_BACKEND_URL: ${WOTCV_CANDIDATE_API_URL:-http://127.0.0.1:13001}
+    logging: *candidate-logging
+
+  postgres:
+    container_name: !reset null
+    ports: !override ["127.0.0.1:15432:5432"]
+    logging: *candidate-logging
+
+  redis:
+    container_name: !reset null
+    ports: !override ["127.0.0.1:16379:6379"]
+    logging: *candidate-logging
+
+  clickhouse:
+    container_name: !reset null
+    ports: !override ["127.0.0.1:18123:8123"]
+    logging: *candidate-logging
+
+  caddy:
+    container_name: !reset null
+    profiles: !override ["unused-candidate-webserver"]

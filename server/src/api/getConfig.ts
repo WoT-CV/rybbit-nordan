@@ -2,6 +2,7 @@ import { FastifyRequest, FastifyReply } from "fastify";
 import { createRequire } from "module";
 import { DISABLE_SIGNUP, LITE_DASHBOARD, MAPBOX_TOKEN } from "../lib/const.js";
 import { getServiceConfiguration } from "../lib/serviceConfiguration.js";
+import { getSourceCodeUrl } from "../lib/sourceCodeUrl.js";
 
 const require = createRequire(import.meta.url);
 const { version } = require("../../package.json");
@@ -15,6 +16,7 @@ export async function getConfig(_: FastifyRequest, reply: FastifyReply) {
     emailEnabled,
     gscEnabled,
     weeklyReportsEnabled,
+    sourceCodeUrl: getSourceCodeUrl(),
   });
 }
 

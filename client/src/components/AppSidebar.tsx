@@ -1,6 +1,6 @@
 "use client";
 
-import { BookOpen, Building2, HelpCircle, LogOut, Moon, ShieldUser, Sun, User } from "lucide-react";
+import { BookOpen, Building2, Code2, HelpCircle, LogOut, Moon, ShieldUser, Sun, User } from "lucide-react";
 import { useExtracted } from "next-intl";
 import { useTheme } from "next-themes";
 import Link from "next/link";
@@ -11,6 +11,7 @@ import { useEmbedablePage } from "../app/[site]/utils";
 import { useAdminPermission } from "../app/admin/hooks/useAdminPermission";
 import { useSignout } from "../hooks/useSignout";
 import { authClient } from "../lib/auth";
+import { getSourceCodeUrl, useConfigs } from "../lib/configs";
 import { IS_CLOUD } from "../lib/const";
 import { getSiteRouteContext } from "../lib/siteRoute";
 import { useStore } from "../lib/store";
@@ -39,6 +40,8 @@ function AdminLink() {
 function AppSidebarContent() {
   const { data: session } = authClient.useSession();
   const embed = useEmbedablePage();
+  const { configs } = useConfigs();
+  const sourceCodeUrl = getSourceCodeUrl(configs?.sourceCodeUrl);
   const t = useExtracted();
 
   const { data: subscription } = useStripeSubscription();
@@ -70,6 +73,14 @@ function AppSidebarContent() {
           label={t("Documentation")}
           target="_blank"
         />
+        {sourceCodeUrl && (
+          <RailLink
+            href={sourceCodeUrl}
+            icon={<Code2 className="w-5 h-5" />}
+            label={t("Source code")}
+            target="_blank"
+          />
+        )}
         {IS_CLOUD && (subscription?.status === "active" || subscription?.status === "trialing") && (
           <RailLink
             href="mailto:hello@rybbit.com"
@@ -117,6 +128,7 @@ function RailLink({
         <Link
           href={href}
           target={target}
+          rel={target === "_blank" ? "noopener noreferrer" : undefined}
           aria-label={label}
           className={cn(
             "p-1 rounded-md transition-colors flex items-center justify-center",
