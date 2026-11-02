@@ -23,6 +23,7 @@ export default defineConfig({
           name: "node",
           include: ["src/**/*.test.ts"],
           environment: "node",
+          setupFiles: [path.resolve(__dirname, "src/test/setupLocale.ts")],
         },
       },
       {
@@ -31,6 +32,7 @@ export default defineConfig({
           name: "dom",
           include: ["src/**/*.test.tsx"],
           environment: "jsdom",
+          setupFiles: [path.resolve(__dirname, "src/test/setupLocale.ts")],
         },
       },
     ],

@@ -502,3 +502,150 @@ Plan:
   Nie uruchamiano Nginx, Docker images ani live HTTP/prod; realne inheritance,
   empty410, CDN, image provenance i opublikowanie źródeł pozostają release gate.
 - Instrukcje: WOTCV_MINIMAL_DEPLOYMENT.md i WOTCV_MINIMAL_NOINDEX.md.
+
+## Etap 6 — ponowna analiza i plan przed implementacją
+
+Wszystkie poprzednie etapy są osobno commitowane, native schema/transport i
+player zostały zachowane. Bazowe 28 błędów klienta pochodzi z locale Windows:
+5 Luxon, 8 calendar day selectors i 15 default Number formatting. Node 24 ma
+navigator.language=pl-PL; samo TZ/LANG lub ustawienie Luxon przed importem
+nie wystarcza, bo aplikacja odczytuje navigator i nadpisuje locale. Nie zmieniamy
+aplikacji ani globalnego ICU. Fixture dotyczy wyłącznie izolowanych workerów testu.
+
+Native lint config jest pusty; jego zwykłe polecenie skanuje też .next i nie
+jest poprawną bramką TS. Rzeczywisty preset Next raportuje odziedziczony dług.
+Nie poprawiamy kilkudziesięciu nietkniętych komponentów tylko dla zielonego lint.
+Potrzebna jest jawna bramka delta, nie ciche pomijanie nowych błędów. Dotychczas
+sprawdzała 76 zmienionych TS/TSX, 14 starych errors i zero nowych.
+
+Plan:
+
+1. Test-only setup w OBU inline Vitest projects: navigator en-US, Luxon default
+   reset beforeEach, natywne Number.toLocaleString/Date.toLocaleDateString z
+   en-US tylko przy locales===undefined. Jawne locale/options/null/error/receiver
+   zachowują native zachowanie. Fixture przetrwa restoreAllMocks/unstubGlobals.
+   Dowody dom/node, explicit pl/de/ar i brak podmiany host Intl. Potem wszystkie
+   10 bazowo czerwonych plików bez filtrów i cały client suite, żadnych nowych skip.
+2. Rzeczywiste branch execution entrypointów cluster/index z mockami I/O:
+   primary/single/worker/dev/db-failure, jeden weekly scheduler, brak marketing
+   self-hosted, IPC readiness, shutdown stop przed close/kill. Bez OS fork,
+   listen, sygnałów, process.exit, DB init/migrate lub prawdziwych cron callbacks.
+   Test prawdziwego konstruktora Stripe: CLOUD=false/off → null; cloud+fakekey
+   → realna instancja bez wywołania API. In-memory PGlite+real Drizzle i helper
+   enrichment: izolacja site+opaque ID, history null i leading zeros. Wyłącznie
+   mała syntetyczna tabela fixture, bez odpalania journal/migracji aplikacji.
+3. Przenieść rzetelny lint-delta do repo: pin U, pełny preset Next, multiset
+   rule+message first-line+source-line; bazę czytać przez git bez stderr noise.
+   Nowe/zmienione errors blokują. Raport oddziela odziedziczone errors/warnings.
+   Test samego porównania, deleted/untracked/path rules i exit status.
+4. Mała adaptacja istniejącego CI, nie nowy system: push minimal branches,
+   contents:read, checkout bez credentials, pełna historia tylko dla client
+   delta. Uruchamiać istniejące Node fixture checks i lint delta w aktualnych
+   jobach. Zachować pnpm/Node24/native runner/dependency layout. Nie kopiować
+   Yarn/Maven/self-hosted/deploy jobs. Zweryfikować używane action SHA i
+   trust boundary przed zmianą, bez tokenów/secrets, bez publikacji workflow.
+5. Prawdziwy local Next frontend + rrweb z syntetycznym auth/API/native replay:
+   lista→player/drawer→Requests→native seek→encoded Grafana URL, clan logo,
+   przyspieszanie i zamykanie dialogu bez utraty sesji. Chromium desktop i
+   mobile, Firefox desktop, WebKit mobile. Wszystkie zewnętrzne requesty
+   blokować/stubować; app/API tylko loopback, bez produkcji i credentials.
+   Profile/cookie/cache tests pozostają dodatkową bramką RTL/HTTP. Nie uznawać
+   emulacji za test fizycznego iPhone ani fixture za realną retencję Grafany.
+6. Native HTTP handler/ingest/read roundtrip i budgets/auth/cache wracają do
+   pełnego suite. Przegląd całego diffu względem U i starego forka: zachowane
+   capability gates/profiles/correlation, brak Identityv2/custom gzip/export/
+   player/Growth/Uptime, brak limit increases, nowych secrets/migracji/deps.
+   Build/typecheck obu pakietów i shared, native/generated artifacts/locale
+   additive audit, Node ops tests, lint delta. Nie mylić skip integracji z PASS.
+7. Własność: subagent A fixture locale/client config/tests; subagent B testy
+   entrypoint/Stripe/PGlite; główny agent browser smoke/CI/lint gate/docs i pełna
+   walidacja. Niezależny reviewer read-only. Naprawić wykryte regresje w swoim
+   zakresie, ponowić bramki, dopiero osobny commit etapu 6. Live gates i pełny
+   dług upstream raportować jawnie, nie maskować statusem zielonej delty.
+
+### Etap 6 — analiza dodatkowych usterek wykrytych w realnym UI (przed poprawką)
+
+Synthetic Next+rrweb smoke dotarł do Requests i linków, ale wykazał dwie
+odziedziczone usterki. Native replay page używa useMediaQuery z @uidotdev/usehooks,
+który jawnie rzuca w SSR; klient później odzyskuje widok po HTTP 500. Ten sam
+pakiet ma już używany przez SiteLayout useWindowSize, bezpieczny dla SSR.
+CheckoutModal wykonuje module-level loadStripe niezależnie od CLOUD, więc samo
+zaimportowanie ukrytego billing UI próbuje pobrać zewnętrzny Stripe.js i powoduje
+rejection, gdy transfer jest zablokowany. Nie jest to dowód awarii Grafany/rrweb.
+
+Plan poprawki ograniczony do granicy środowiska, nie custom playera:
+
+1. Replay page: zastąpić client-only media hook istniejącym useWindowSize;
+   breakpoint nadal dokładnie <768. Brak nowych hooków/deps lub zmian odtwarzania.
+2. CheckoutModal: module-level Stripe wyłącznie IS_CLOUD; self-hosted render
+   zwraca null również przy podstawionym clientSecret. Cloud flow bez zmian.
+   Testy rzeczywistego importu mockują wyłącznie zewnętrzny SDK/komponenty,
+   sprawdzają brak load w self-hosted i zachowanie cloud.
+3. Powtórzyć typecheck/lint delta/build, UI HTTP200 + brak zewnętrznego Stripe
+   i nowych pageerrors, lokalne native seek/speed/drawer. Ponowić pełny client
+   suite; native backend/storage/player nadal niezmienione.
+
+Przegląd zainstalowanego @stripe/stripe-js 8.8.0 ujawnił, że root import sam
+wstrzykuje skrypt w microtask nawet bez wywołania loadStripe. Sama bramka na
+wywołaniu jest niewystarczająca. Używamy oficjalnego `/pure` entrypoint tego
+samego SDK i bramki CLOUD, bez nowej zależności. Cloud nadal wywołuje loadStripe;
+self-hosted nie importuje eager loadera i nie inicjalizuje SDK. Weryfikacja
+obejmuje dependency source oraz rzeczywistą przeglądarkę z blokadą egress.
+
+Końcowe review strony replay wykazało również pięć odziedziczonych conditional
+hooks po demo early-return. Minimalna poprawka rozdziela pusty demo guard od
+komponentu zawartości: hooki są unconditional, demo nadal nie uruchamia query
+ani playera. Dodano osobny dowód renderu demo bez query. Nie zmienia to store,
+rrweb ani algorytmu odtwarzania. Nowy build i pełny suite obejmują tę poprawkę.
+
+### Etap 6 — wyniki i końcowe review
+
+Główny agent obejrzał także finalne PNG Requests, nie tylko odtwarzanie.
+Własna tabela na telefonie ściskała endpoint do kilku znaków i ucinała akcje.
+Plan ostatniej poprawki: ten sam pojedynczy DOM danych, responsive grid row
+na <640px z pełnej szerokości endpoint/IDs i wrap akcji; desktop pozostaje
+tabelą. Zachować nagłówki dla accessibility, bez drugiego renderu/hooków,
+nowych tekstów, playera lub zmian payload. Powtórzyć RTL/lint/build i cały
+czteroprzeglądarkowy smoke z widocznymi linkami mieszczącymi się w mobile.
+
+- Pełny client: 156 plików / 1631 PASS, bez failures i skips; Node24, UTC,
+  maxWorkers=2. Bazowe 28 locale failures usunięto wyłącznie fixture testowym.
+  Nowe testy potwierdzają native locale explicit/null/options/receivers oraz
+  brak zmiany globalnego Intl/hosta; osobny proces nadal używa pl-PL.
+- Pełny server: 199 plików PASS, 4 SKIP; 3147 PASS, 41 SKIP. Shared 68 PASS.
+  Skips natywnych integracji nie są dowodem działania live DB/infrastruktury.
+  Nowe entrypoint/SDK/PGlite: 27 PASS; prawdziwy helper+Drizzle izoluje site,
+  leading zeros, duże opaque IDs i punctuation. Brak migracji aplikacji.
+- Oba buildy PASS. Client build ma jawny loopback API origin 13001/CLOUD=false;
+  build+typecheck obejmują finalną poprawkę SSR/demo oraz Stripe pure-loader.
+  Wszystkie 12 katalogów sprawdzono semantycznie i przywrócono HEAD; żadnych
+  nowych tłumaczeń, usunięć bazowych kluczy ani generated-artifact churn.
+- Node fixtures 64 PASS. Repo-owned lint delta z pełnym presetem Next:
+  84 pliki, 14 odziedziczonych errors, zero nowych errors. Porównanie multiset
+  nie maskuje duplikatu starego błędu; brak Git/bazy daje sanitizowany exit2.
+  Nie jest to deklaracja naprawienia całego długu lint upstream.
+- CI zachowuje native jobs/pnpm/Node24. Dodano minimal branch push, read-only
+  token, brak persisted checkout credentials, full-SHA actions i bramki fixture/
+  lint delta. Oficjalne action refs sprawdzono przed pinningiem. Niezależne
+  review: 0 critical/high/medium/low/info nowych findings. Remote CI nie uruchomiono.
+- Recorder smoke Chromium/Firefox/WebKit: 10 request rows każdy, body unchanged,
+  native rejection/abort/XHR reuse zachowane. Real Next+rrweb UI: Chromium
+  desktop/mobile, Firefox desktop i WebKit mobile — HTTP200, brak pageerrors,
+  exact Grafana origin/basepath/datasource/query/ID/time window, clan logo,
+  native goto20s, wszystkie pięć prędkości, touch/pointer seek, realne 4x playback.
+  Ten sam player i iframe pozostają; nested Requests Escape/goto nie zamyka
+  mobile drawer. Główny agent obejrzał finalne desktop/mobile playback PNG.
+- Smoke używa własnych loopback Next i syntetycznego API GET/OPTIONS. Ten drugi
+  jest potrzebny również natywnemu SSR module-level auth getSession, nie tylko
+  interceptowi przeglądarki. Nie startuje prawdziwy backend. Jedyny zadeklarowany
+  zewnętrzny URL-fixture to native GET app.rybbit.io/api/version, obsłużony lokalnie
+  bez wyjścia do sieci; pozostałe próby egress blokują test. Stripe nie jest ładowany.
+  Brak unhandledRejection/ECONNREFUSED w Next log. Oba własne zasoby zatrzymano.
+- Niezależny semantic review całego diffu: native SQL rate limits 60/20 per min,
+  query budgets/isolation, auth/site permissions, cache, PG schema/journal,
+  identity i replay storage/query oraz dependency pins zachowane. Nowa korelacja
+  nie jest starym Network Replay ani drugim playerem. Nie ma nowej tabeli,
+  Identityv2, custom gzip, eksportu WebM/ZIP, Growth Accounting czy Uptime.
+- Fizyczny iPhone, live Grafana/retencja/CORS, real SQL query-user provisioning,
+  mail delivery/GSC, Nginx/CDN, obrazy/provenance i przejście danych pozostają
+  osobnymi release gates. Fixture/browser emulation nie zamyka tych bramek.

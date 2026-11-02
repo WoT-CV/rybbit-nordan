@@ -1,6 +1,6 @@
 "use client";
 
-import { useMeasure, useMediaQuery } from "@uidotdev/usehooks";
+import { useMeasure, useWindowSize } from "@uidotdev/usehooks";
 import { Video } from "lucide-react";
 import { useExtracted } from "next-intl";
 import { useState } from "react";
@@ -20,10 +20,14 @@ import { ReplayList } from "./components/ReplayList";
 import { useAppEnv } from "../../../hooks/useIsProduction";
 
 export default function SessionReplayPage() {
+  const appEnv = useAppEnv();
+  return appEnv === "demo" ? null : <SessionReplayContent />;
+}
+
+function SessionReplayContent() {
   const t = useExtracted();
   useSetPageTitle("Session Replay");
-  const appEnv = useAppEnv();
-  if (appEnv === "demo") return null;
+  const { width } = useWindowSize();
 
   const { minDuration, sessionId } = useReplayStore(
     useShallow(s => ({ minDuration: s.minDuration, sessionId: s.sessionId }))
@@ -37,7 +41,7 @@ export default function SessionReplayPage() {
 
   // On narrow screens the player can't sit beside the list, so selecting a
   // replay opens the fullscreen drawer (player + timeline) instead.
-  const isCompact = useMediaQuery("(max-width: 767px)");
+  const isCompact = !!width && width < 768;
   const [mobileOpen, setMobileOpen] = useState(false);
 
   const [playerRef, { width: playerWidth, height: playerHeight }] = useMeasure();

@@ -97,8 +97,8 @@ export const ReplayRequestCorrelation = memo(function ReplayRequestCorrelation({
             {t("No request correlation data in this recording. Older recordings may not contain it.")}
           </p>
         ) : (
-          <Table>
-            <TableHeader>
+          <Table className="block sm:table" role="table">
+            <TableHeader className="sr-only sm:not-sr-only sm:table-header-group">
               <TableRow>
                 <TableHead>{t("Start")}</TableHead>
                 <TableHead>{t("Endpoint")}</TableHead>
@@ -107,18 +107,19 @@ export const ReplayRequestCorrelation = memo(function ReplayRequestCorrelation({
                 <TableHead>{t("Actions")}</TableHead>
               </TableRow>
             </TableHeader>
-            <TableBody>
+            <TableBody className="block sm:table-row-group" role="rowgroup">
               {rows.map(row => {
                 const { request } = row;
                 const offset = Math.max(0, requestStartTime(row) - firstTimestamp);
                 const links =
                   authorized && config?.enabled ? getRequestObservabilityLinks(row, config.profiles) : undefined;
                 return (
-                  <TableRow key={request.rowId}>
-                    <TableCell className="whitespace-nowrap">
+                  <TableRow key={request.rowId} className="grid grid-cols-3 sm:table-row" role="row">
+                    <TableCell className="whitespace-nowrap" role="cell">
+                      <span className="block text-xs text-muted-foreground sm:hidden">{t("Start")}</span>
                       {Math.floor(offset / 60000)}:{String(Math.floor(offset / 1000) % 60).padStart(2, "0")}
                     </TableCell>
-                    <TableCell className="max-w-sm break-all">
+                    <TableCell className="order-first col-span-3 min-w-0 break-all sm:max-w-sm" role="cell">
                       <span className="font-medium">{request.method}</span> {request.origin}
                       {request.pathname}
                       {request.correlationId && (
@@ -132,7 +133,8 @@ export const ReplayRequestCorrelation = memo(function ReplayRequestCorrelation({
                         </div>
                       )}
                     </TableCell>
-                    <TableCell>
+                    <TableCell role="cell">
+                      <span className="block text-xs text-muted-foreground sm:hidden">{t("Status")}</span>
                       {request.outcome === "response"
                         ? request.status
                         : request.outcome === "abort"
@@ -141,8 +143,11 @@ export const ReplayRequestCorrelation = memo(function ReplayRequestCorrelation({
                             ? t("Timed out")
                             : t("Network error")}
                     </TableCell>
-                    <TableCell className="whitespace-nowrap">{Math.round(request.durationMs)} ms</TableCell>
-                    <TableCell>
+                    <TableCell className="whitespace-nowrap" role="cell">
+                      <span className="block text-xs text-muted-foreground sm:hidden">{t("Duration")}</span>
+                      {Math.round(request.durationMs)} ms
+                    </TableCell>
+                    <TableCell className="col-span-3" role="cell">
                       <div className="flex flex-wrap items-center gap-2">
                         <Button size="sm" variant="outline" disabled={!player} onClick={() => seek(row)}>
                           {t("Go to request")}

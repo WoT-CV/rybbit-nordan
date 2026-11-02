@@ -4,11 +4,15 @@ on:
   push:
     branches:
       - master
+      - feat/wotcv-minimal-*
   pull_request:
     branches:
       - master
     paths-ignore:
       - "**.md"
+
+permissions:
+  contents: read
 
 # A newer push to the same branch makes an in-flight run obsolete.
 concurrency:
@@ -26,9 +30,11 @@ jobs:
     name: Docs and agent HTTP
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: npm
@@ -58,11 +64,13 @@ jobs:
     name: Server
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: pnpm
@@ -77,15 +85,21 @@ jobs:
       - name: Run server tests
         run: pnpm --filter rybbit-backend test:run
 
+      - name: Check isolated operations fixtures
+        run: node --test scripts/*.test.mjs
+
   client:
     name: Client
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # Pinned upstream baseline is required by the lint delta.
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: pnpm
@@ -99,6 +113,9 @@ jobs:
 
       - name: Run client tests
         run: pnpm --filter client test:run
+
+      - name: Reject new client lint errors against pinned upstream
+        run: node scripts/lint-minimal-delta.cjs
 
       - name: Build client
         run: pnpm --filter client build
