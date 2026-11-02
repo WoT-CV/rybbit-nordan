@@ -47,6 +47,7 @@ it("server-renders the actual replay page with native window-size hooks and no b
   expect(html).toContain("h-dvh w-full");
   expect(html).not.toContain("max-w-[2000px]");
   expect(html).not.toContain("mx-auto");
+  expect(html).toContain("w-full xl:w-[260px] shrink-0");
 });
 
 it("keeps demo empty without mounting query/player hooks", () => {

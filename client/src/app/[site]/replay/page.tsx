@@ -57,7 +57,7 @@ function SessionReplayContent() {
 
         <div className="flex gap-3 flex-1 min-h-0">
           {/* List */}
-          <div className="w-full xl:w-[210px] shrink-0 min-h-0">
+          <div className="w-full xl:w-[260px] shrink-0 min-h-0">
             <ReplayList onSelect={isCompact ? () => setMobileOpen(true) : undefined} />
           </div>
 
