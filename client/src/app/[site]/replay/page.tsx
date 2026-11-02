@@ -48,7 +48,7 @@ function SessionReplayContent() {
 
   return (
     <DisabledOverlay message="Replay" featurePath="replay" requiredPlan="pro">
-      <div className="flex flex-col h-dvh overflow-hidden p-2 md:p-4 gap-3 max-w-[2000px] mx-auto">
+      <div className="flex flex-col h-dvh w-full overflow-hidden p-2 md:p-4 gap-3">
         <div className="shrink-0">
           <SubHeader availableFilters={SESSION_REPLAY_PAGE_FILTERS} />
         </div>

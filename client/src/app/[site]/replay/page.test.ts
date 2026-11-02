@@ -44,6 +44,9 @@ it("server-renders the actual replay page with native window-size hooks and no b
   expect(html).toContain("No session replays found");
   expect(html).toContain('data-compact="false"');
   expect(html).not.toContain("Mobile drawer");
+  expect(html).toContain("h-dvh w-full");
+  expect(html).not.toContain("max-w-[2000px]");
+  expect(html).not.toContain("mx-auto");
 });
 
 it("keeps demo empty without mounting query/player hooks", () => {
