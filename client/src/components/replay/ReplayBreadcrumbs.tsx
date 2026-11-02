@@ -34,6 +34,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { useVirtualizer, type VirtualItem } from "@tanstack/react-virtual";
 import { useShallow } from "zustand/react/shallow";
 import { useGetSessionReplayEvents } from "@/api/analytics/hooks/sessionReplay/useGetSessionReplayEvents";
+import { useReplayCorrelation } from "@/api/admin/hooks/useReplayCorrelation";
 import { Avatar } from "@/components/Avatar";
 import { IdentifiedBadge } from "@/components/IdentifiedBadge";
 import { SegmentedControl } from "@/components/interior/segmented-control";
@@ -43,6 +44,8 @@ import { ThreeDotLoader } from "@/components/Loaders";
 import { getTimezone } from "@/lib/store";
 import { cn, getUserDisplayName } from "@/lib/utils";
 import { useReplayStore } from "./replayStore";
+import { ReplayRequestCorrelation } from "./correlation/ReplayRequestCorrelation";
+import { getRequestCorrelationRows } from "./correlation/requestRows";
 import {
   getMeaningfulEvents,
   getTechnicalGroups,
@@ -170,7 +173,14 @@ export function ReplayBreadcrumbs() {
   const t = useExtracted();
   const params = useParams();
   const siteId = Number(params.site);
-  const [showTechnical, setShowTechnical] = useState(false);
+  const [detailLevel, setDetailLevel] = useState<"key" | "requests" | "all">("key");
+  const showTechnical = detailLevel === "all";
+  const showRequests = detailLevel === "requests";
+  const [expandedRequest, setExpandedRequest] = useState<{
+    siteId: number;
+    sessionId: string;
+    rowId: string;
+  } | null>(null);
   const { sessionId, player, setCurrentTime } = useReplayStore(
     useShallow(s => ({
       sessionId: s.sessionId,
@@ -183,6 +193,11 @@ export function ReplayBreadcrumbs() {
 
   const meaningful = useMemo(() => getMeaningfulEvents(data?.events), [data?.events]);
   const technical = useMemo(() => getTechnicalGroups(data?.events), [data?.events]);
+  const requests = useMemo(() => getRequestCorrelationRows(data?.events ?? []), [data?.events]);
+  const expandedRowId =
+    expandedRequest?.siteId === siteId && expandedRequest.sessionId === sessionId ? expandedRequest.rowId : null;
+  const hasExpandedRequest = showRequests && requests.some(event => event.request.rowId === expandedRowId);
+  const correlation = useReplayCorrelation(siteId, hasExpandedRequest);
 
   const handleSeek = useCallback(
     (offset: number) => {
@@ -225,11 +240,13 @@ export function ReplayBreadcrumbs() {
   };
 
   const scrollRef = useRef<HTMLDivElement>(null);
-  const rowCount = showTechnical ? technical.length : meaningful.length;
+  const rowCount = showTechnical ? technical.length : showRequests ? requests.length : meaningful.length;
   const virtualizer = useVirtualizer({
     count: rowCount,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => 44,
+    getItemKey: index =>
+      showTechnical ? `technical-${index}` : showRequests ? `request-${requests[index].request.rowId}` : `key-${index}`,
     overscan: 16,
   });
 
@@ -268,7 +285,9 @@ export function ReplayBreadcrumbs() {
               ? t("Timeline")
               : showTechnical
                 ? t("{count} groups", { count: String(technical.length) })
-                : t("{count} key events", { count: String(meaningful.length) })}
+                : showRequests
+                  ? `Requests (${requests.length})`
+                  : t("{count} key events", { count: String(meaningful.length) })}
           </div>
           <SegmentedControl
             aria-label={t("Event detail level")}
@@ -276,10 +295,14 @@ export function ReplayBreadcrumbs() {
             className="shrink-0"
             options={[
               { value: "key", label: t("Key") },
+              { value: "requests", label: "Requests" },
               { value: "all", label: t("All") },
             ]}
-            value={showTechnical ? "all" : "key"}
-            onValueChange={value => setShowTechnical(value === "all")}
+            value={detailLevel}
+            onValueChange={value => {
+              setDetailLevel(value);
+              setExpandedRequest(null);
+            }}
           />
         </div>
 
@@ -289,7 +312,11 @@ export function ReplayBreadcrumbs() {
           </div>
         ) : rowCount === 0 ? (
           <div className="flex flex-1 items-center justify-center p-4 text-center text-xs text-neutral-500">
-            {showTechnical ? t("No events recorded.") : t("No key interactions in this session.")}
+            {showRequests
+              ? "No request correlation data in this recording. Older recordings may not contain it."
+              : showTechnical
+                ? t("No events recorded.")
+                : t("No key interactions in this session.")}
           </div>
         ) : (
           <div ref={scrollRef} className="flex-1 overflow-auto rounded-b-lg">
@@ -305,6 +332,36 @@ export function ReplayBreadcrumbs() {
                       measure={virtualizer.measureElement}
                       onSeek={handleSeek}
                     />
+                  );
+                }
+                if (showRequests) {
+                  const event = requests[row.index];
+                  return (
+                    <div
+                      key={row.key}
+                      data-index={row.index}
+                      ref={virtualizer.measureElement}
+                      className="absolute left-0 right-0"
+                      style={{ top: `${row.start}px` }}
+                    >
+                      <ReplayRequestCorrelation
+                        siteId={siteId}
+                        sessionId={sessionId}
+                        event={event}
+                        firstTimestamp={data.events[0]?.timestamp ?? 0}
+                        expanded={event.request.rowId === expandedRowId}
+                        onExpandedChange={() =>
+                          setExpandedRequest(previous =>
+                            previous?.siteId === siteId &&
+                            previous.sessionId === sessionId &&
+                            previous.rowId === event.request.rowId
+                              ? null
+                              : { siteId, sessionId, rowId: event.request.rowId }
+                          )
+                        }
+                        correlation={correlation}
+                      />
+                    </div>
                   );
                 }
                 const event = meaningful[row.index];
@@ -453,4 +510,3 @@ function TechnicalRow({
     </div>
   );
 }
-

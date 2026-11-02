@@ -39,9 +39,9 @@ function SessionReplayContent() {
   // have no way to lower it. Errors are shown by the list itself.
   const hasNoReplays = !isLoading && !error && !data?.pages[0].data?.length;
 
-  // On narrow screens the player can't sit beside the list, so selecting a
-  // replay opens the fullscreen drawer (player + timeline) instead.
-  const isCompact = !!width && width < 768;
+  // Keep the key timeline accessible whenever there isn't room for all three
+  // columns. The compact drawer provides a timeline pane without remounting playback.
+  const isCompact = !!width && width < 1280;
   const [mobileOpen, setMobileOpen] = useState(false);
 
   const [playerRef, { width: playerWidth, height: playerHeight }] = useMeasure();
@@ -57,12 +57,12 @@ function SessionReplayContent() {
 
         <div className="flex gap-3 flex-1 min-h-0">
           {/* List */}
-          <div className="w-full md:w-[200px] lg:w-[210px] shrink-0 min-h-0">
+          <div className="w-full xl:w-[210px] shrink-0 min-h-0">
             <ReplayList onSelect={isCompact ? () => setMobileOpen(true) : undefined} />
           </div>
 
           {hasNoReplays ? (
-            <div className="hidden md:flex flex-1 items-center justify-center">
+            <div className="hidden xl:flex flex-1 items-center justify-center">
               <NothingFound
                 icon={<Video className="w-10 h-10" />}
                 title={t("No session replays found")}
@@ -72,7 +72,7 @@ function SessionReplayContent() {
           ) : (
             <>
               {/* Player */}
-              <div ref={playerRef} className="hidden md:block flex-1 min-w-0 overflow-hidden">
+              <div ref={playerRef} className="hidden xl:block flex-1 min-w-0 overflow-hidden">
                 {playerWidth && playerHeight ? <ReplayPlayer width={playerWidth} height={playerHeight} /> : null}
               </div>
 

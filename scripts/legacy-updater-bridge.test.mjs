@@ -121,7 +121,9 @@ test(
         assert.equal(result.stdout, "");
         assert.match(result.stderr, /^HOLD: legacy -> minimal transition/m);
         assert.match(result.stderr, /^HOLD: przejscie ze starej produkcji/m);
-        assert.match(result.stderr, /separate data decision and approved isolated rehearsal/);
+        assert.match(result.stderr, /reviewed fresh installer and isolated startup verification/);
+        assert.match(result.stderr, /docs\/WOTCV_FRESH_INSTALL\.md/);
+        assert.doesNotMatch(result.stderr, /requires a separate data decision/);
         assert.match(result.stderr, /release remains HOLD/);
         assert(!existsSync(marker), "Bridge must not invoke any external command");
         assert(!existsSync(join(directory, ".wotcv-deployment.env")));

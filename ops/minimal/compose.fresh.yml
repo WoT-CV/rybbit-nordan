@@ -1,0 +1,126 @@
+# Fresh native installation only; never combine with the candidate overlay.
+# Select explicitly after docker-compose.yml with project rybbit-wotcv-native.
+# Requires Compose >= 2.24.4 (!override). `config` does not start services.
+# The native backend entrypoint initializes databases: an operator must start it.
+name: rybbit-wotcv-native
+
+x-fresh-logging: &fresh-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+services:
+  backend:
+    container_name: !reset null
+    # The installer validates these as local sha256:<64 hex> image IDs.
+    image: ${WOTCV_BACKEND_IMAGE:?Set the approved local backend sha256 image ID}
+    pull_policy: never
+    build: !reset null
+    ports: !override ["127.0.0.1:13001:3001"]
+    volumes: !reset []
+    # Bootstrap must not loop on a failing native initialization. The production
+    # phase explicitly selects unless-stopped after signup has been closed.
+    restart: ${WOTCV_BACKEND_RESTART:-no}
+    environment: !override
+      NODE_ENV: production
+      CLOUD: "false"
+      DISABLE_TELEMETRY: "true"
+      BASE_URL: ${WOTCV_FRONTEND_URL:?Set the public frontend origin}
+      SERVER_URL: ${WOTCV_API_URL:?Set the public API origin}
+      SOURCE_CODE_URL: ${SOURCE_CODE_URL:?Set the published source revision URL}
+      DISABLE_SIGNUP: ${DISABLE_SIGNUP:?Set signup state explicitly for this phase}
+      CLUSTER_WORKERS: "0"
+      CLICKHOUSE_HOST: http://clickhouse:8123
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-analytics}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?Set a fresh ClickHouse password}
+      CLICKHOUSE_QUERY_PASSWORD: ${CLICKHOUSE_QUERY_PASSWORD:-${CLICKHOUSE_PASSWORD:?Set a fresh ClickHouse password}}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-analytics}
+      POSTGRES_USER: ${POSTGRES_USER:-frog}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a fresh Postgres password}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set a fresh Redis password}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set a fresh authentication secret}
+      MAPBOX_TOKEN: ${MAPBOX_TOKEN:-}
+      WOTCV_REPLAY_CORRELATION_JSON: ${WOTCV_REPLAY_CORRELATION_JSON:-[]}
+      DEPLOYMENT: ""
+      LITE_DASHBOARD: "false"
+      DASHBOARD_CACHE_TTL_SECONDS: "30"
+      OPENROUTER_API_KEY: ""
+      OPENROUTER_MODEL: ""
+      RESEND_API_KEY: ""
+      EMAIL_FROM: ""
+      EMAIL_REPLY_TO: ""
+      GOOGLE_CLIENT_ID: ""
+      GOOGLE_CLIENT_SECRET: ""
+      GOOGLE_REDIRECT_URI: ""
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    logging: *fresh-logging
+
+  client:
+    container_name: !reset null
+    image: ${WOTCV_CLIENT_IMAGE:?Set the approved local client sha256 image ID}
+    pull_policy: never
+    build: !reset null
+    ports: !override ["127.0.0.1:13002:3002"]
+    volumes: !reset []
+    restart: unless-stopped
+    # NEXT_PUBLIC_* must also be baked into the selected phase-specific image.
+    # These runtime values alone cannot rewrite a compiled Next.js bundle.
+    environment: !override
+      NODE_ENV: production
+      NEXT_PUBLIC_CLOUD: "false"
+      NEXT_PUBLIC_BACKEND_URL: ${WOTCV_API_URL:?Set the public API origin}
+      NEXT_PUBLIC_DISABLE_SIGNUP: ${DISABLE_SIGNUP:?Set signup state explicitly for this phase}
+      NEXT_PUBLIC_DEPLOYMENT: ""
+      NEXT_PUBLIC_LITE_DASHBOARD: "false"
+    logging: *fresh-logging
+
+  postgres:
+    container_name: !reset null
+    image: ${WOTCV_POSTGRES_IMAGE:?Set approved Postgres image ID}
+    pull_policy: never
+    ports: !reset []
+    volumes: !override ["postgres-data:/var/lib/postgresql/data"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a fresh Postgres password}
+    logging: *fresh-logging
+
+  clickhouse:
+    container_name: !reset null
+    image: ${WOTCV_CLICKHOUSE_IMAGE:?Set approved ClickHouse image ID}
+    pull_policy: never
+    ports: !reset []
+    volumes: !override ["clickhouse-data:/var/lib/clickhouse"]
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?Set a fresh ClickHouse password}
+    logging: *fresh-logging
+
+  redis:
+    container_name: !reset null
+    image: ${WOTCV_REDIS_IMAGE:?Set approved Redis image ID}
+    pull_policy: never
+    ports: !reset []
+    volumes: !override ["redis-data:/data"]
+    restart: unless-stopped
+    logging: *fresh-logging
+
+  caddy:
+    # Reverse proxy configuration is managed separately; never enable this profile.
+    container_name: !reset null
+    profiles: !override ["unused-fresh-webserver"]
+    ports: !reset []
+    volumes: !reset []
+    restart: unless-stopped
+    logging: *fresh-logging

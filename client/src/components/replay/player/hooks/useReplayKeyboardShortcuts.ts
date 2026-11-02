@@ -1,5 +1,8 @@
 import { useEffect } from "react";
 
+const INTERACTIVE_TARGET_SELECTOR =
+  "button,a[href],input,textarea,select,[contenteditable],[role=button],[role=radio],[role=slider],[role=tab]";
+
 interface UseReplayKeyboardShortcutsProps {
   player: any;
   onSkipBack: () => void;
@@ -15,8 +18,14 @@ export const useReplayKeyboardShortcuts = ({
 }: UseReplayKeyboardShortcutsProps) => {
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      // Only handle hotkeys when the player exists and focus is not on an input/textarea
-      if (!player || event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) {
+      // React and playback listeners can both be delegated to document. A control's
+      // stopPropagation does not stop other listeners on that same node, so leave
+      // its native keyboard behavior intact here instead of preventing its default.
+      if (
+        !player ||
+        event.defaultPrevented ||
+        (event.target instanceof Element && event.target.closest(INTERACTIVE_TARGET_SELECTOR))
+      ) {
         return;
       }
 

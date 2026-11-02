@@ -1,190 +1,205 @@
 "use client";
 
-import { ListFilter } from "lucide-react";
-import { useExtracted } from "next-intl";
-import { memo, useMemo, useState } from "react";
 import type { RequestCorrelationEvent } from "@rybbit/shared";
-import { useReplayCorrelation } from "@/api/admin/hooks/useReplayCorrelation";
-import type { SessionReplayEvent } from "@/api/analytics/endpoints/sessionReplay";
+import { ChevronDown, ChevronRight } from "lucide-react";
+import { memo, useId } from "react";
+import type { useReplayCorrelation } from "@/api/admin/hooks/useReplayCorrelation";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { formatTime } from "../player/utils/replayUtils";
 import { useReplayStore } from "../replayStore";
 import { getRequestObservabilityLinks } from "./observabilityLinks";
-import { getRequestCorrelationRows, requestStartTime } from "./requestRows";
+import { requestStartTime } from "./requestRows";
 
 interface Props {
   siteId: number;
   sessionId: string;
-  events: readonly SessionReplayEvent[];
+  event: RequestCorrelationEvent;
+  firstTimestamp: number;
+  expanded: boolean;
+  onExpandedChange: () => void;
+  correlation: ReturnType<typeof useReplayCorrelation>;
 }
 
-// Only event/configuration changes render this panel; playback's clock stays in the native player.
-export const ReplayRequestCorrelation = memo(function ReplayRequestCorrelation({ siteId, sessionId, events }: Props) {
-  const t = useExtracted();
-  const [open, setOpen] = useState(false);
-  const { authorized, config, isLoading, isError, refetch } = useReplayCorrelation(siteId, open);
-  const player = useReplayStore(state => state.player);
-  const rows = useMemo(() => getRequestCorrelationRows(events), [events]);
-  const firstTimestamp = events[0]?.timestamp ?? 0;
+// The timeline fetches configuration once, only while a request is expanded.
+// Read the live player on seek without subscribing every row to the playback clock.
+export const ReplayRequestCorrelation = memo(function ReplayRequestCorrelation({
+  siteId,
+  sessionId,
+  event,
+  firstTimestamp,
+  expanded,
+  onExpandedChange,
+  correlation,
+}: Props) {
+  const detailsId = useId();
+  const canSeek = useReplayStore(state => state.sessionId === sessionId && !!state.player);
+  const { authorized, config, isLoading, isError, refetch } = correlation;
+  const { request } = event;
+  const offset = Math.max(0, requestStartTime(event) - firstTimestamp);
+  const links =
+    expanded && authorized && !isLoading && !isError && config?.enabled && Number.isSafeInteger(siteId) && siteId > 0
+      ? getRequestObservabilityLinks(event, config.profiles)
+      : undefined;
+  const status =
+    request.outcome === "response"
+      ? request.status
+      : request.outcome === "abort"
+        ? "Aborted"
+        : request.outcome === "timeout"
+          ? "Timed out"
+          : "Network error";
+  const failed = request.outcome !== "response" || request.status >= 400;
 
-  const seek = (row: RequestCorrelationEvent) => {
+  const seek = () => {
     const state = useReplayStore.getState();
-    if (state.sessionId !== sessionId || !state.player || !Number.isFinite(firstTimestamp)) return;
-    const offset = Math.max(0, Math.min(state.duration, requestStartTime(row) - firstTimestamp));
+    if (
+      state.sessionId !== sessionId ||
+      !state.player ||
+      !Number.isFinite(firstTimestamp) ||
+      !Number.isFinite(offset) ||
+      !Number.isFinite(state.duration)
+    )
+      return;
+    const position = Math.max(0, Math.min(state.duration, offset));
     state.player.pause();
     state.setIsPlaying(false);
-    state.player.goto(offset);
-    state.setCurrentTime(offset);
-    setOpen(false);
+    state.player.goto(position);
+    state.setCurrentTime(position);
   };
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <Button
-          variant="ghost"
-          size="sm"
-          aria-label={t("Requests")}
-          onPointerDown={e => e.stopPropagation()}
-          onClick={e => e.stopPropagation()}
-        >
-          <ListFilter data-icon="inline-start" />
-          <span className="hidden sm:inline">{t("Requests")}</span>
-        </Button>
-      </DialogTrigger>
-      <DialogContent
-        className="max-h-[85dvh] max-w-5xl overflow-y-auto"
-        data-vaul-no-drag
-        onPointerDown={e => e.stopPropagation()}
-        onClick={e => e.stopPropagation()}
-        onKeyDown={e => e.stopPropagation()}
-        onEscapeKeyDown={e => e.stopPropagation()}
+    <div
+      className="min-w-0 border-b border-neutral-100 dark:border-neutral-800"
+      onPointerDown={event => event.stopPropagation()}
+      onClick={event => event.stopPropagation()}
+      onKeyDown={event => {
+        // Escape belongs to the containing replay drawer.
+        if (event.key !== "Escape") event.stopPropagation();
+      }}
+    >
+      <button
+        type="button"
+        aria-label={`Requests: ${request.method} ${request.pathname}`}
+        aria-expanded={expanded}
+        aria-controls={detailsId}
+        onClick={onExpandedChange}
+        className="flex min-h-11 w-full min-w-0 items-center gap-2 px-2.5 py-1.5 text-left hover:bg-neutral-50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-neutral-950 dark:hover:bg-neutral-850 dark:focus-visible:ring-neutral-300"
       >
-        <DialogHeader>
-          <DialogTitle>{t("Requests")}</DialogTitle>
-          <DialogDescription>
-            {t(
-              "Only allowed API requests captured in this recording are listed. No request bodies or header maps are stored. Grafana retention and trace sampling are independent."
-            )}
-          </DialogDescription>
-        </DialogHeader>
-        <p className="text-xs text-muted-foreground">
-          {t("Grafana links use the recording clock. If results are missing, verify the time range in Grafana.")}
-        </p>
-        {!authorized ? (
-          <p className="text-sm text-muted-foreground">{t("Sign in with replay access to view correlation links.")}</p>
-        ) : isLoading ? (
-          <p role="status" className="text-sm text-muted-foreground">
-            {t("Loading...")}
-          </p>
-        ) : isError ? (
-          <div className="flex items-center gap-2" role="alert">
-            <p className="text-sm">{t("Unable to load Grafana configuration.")}</p>
-            <Button variant="outline" size="sm" onClick={() => void refetch()}>
-              {t("Retry")}
-            </Button>
-          </div>
-        ) : !config?.enabled ? (
-          <p className="text-sm text-muted-foreground">{t("Grafana correlation is not configured for this site.")}</p>
-        ) : null}
-        {rows.length === 0 ? (
-          <p className="text-sm text-muted-foreground">
-            {t("No request correlation data in this recording. Older recordings may not contain it.")}
-          </p>
+        <span className="min-w-0 flex-1">
+          <span className="flex min-w-0 items-baseline gap-1.5 text-xs">
+            <span className="shrink-0 font-medium">{request.method}</span>
+            <span className="min-w-0 truncate" title={`${request.origin}${request.pathname}`}>
+              {request.pathname}
+            </span>
+          </span>
+          <span className="flex gap-x-2 text-[11px] leading-4 text-muted-foreground">
+            <span className={failed ? "text-red-600 dark:text-red-400" : undefined}>
+              <span className="sr-only">Status: </span>
+              {status}
+            </span>
+            <span>
+              <span className="sr-only">Duration: </span>
+              {Math.round(request.durationMs)} ms
+            </span>
+          </span>
+        </span>
+        <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">{formatTime(offset)}</span>
+        {expanded ? (
+          <ChevronDown aria-hidden="true" className="size-3 shrink-0 text-muted-foreground" />
         ) : (
-          <Table className="block sm:table" role="table">
-            <TableHeader className="sr-only sm:not-sr-only sm:table-header-group">
-              <TableRow>
-                <TableHead>{t("Start")}</TableHead>
-                <TableHead>{t("Endpoint")}</TableHead>
-                <TableHead>{t("Status")}</TableHead>
-                <TableHead>{t("Duration")}</TableHead>
-                <TableHead>{t("Actions")}</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody className="block sm:table-row-group" role="rowgroup">
-              {rows.map(row => {
-                const { request } = row;
-                const offset = Math.max(0, requestStartTime(row) - firstTimestamp);
-                const links =
-                  authorized && config?.enabled ? getRequestObservabilityLinks(row, config.profiles) : undefined;
-                return (
-                  <TableRow key={request.rowId} className="grid grid-cols-3 sm:table-row" role="row">
-                    <TableCell className="whitespace-nowrap" role="cell">
-                      <span className="block text-xs text-muted-foreground sm:hidden">{t("Start")}</span>
-                      {Math.floor(offset / 60000)}:{String(Math.floor(offset / 1000) % 60).padStart(2, "0")}
-                    </TableCell>
-                    <TableCell className="order-first col-span-3 min-w-0 break-all sm:max-w-sm" role="cell">
-                      <span className="font-medium">{request.method}</span> {request.origin}
-                      {request.pathname}
-                      {request.correlationId && (
-                        <div className="mt-1 text-xs text-muted-foreground">
-                          {t("Correlation ID")}: <code className="select-all">{request.correlationId}</code>
-                        </div>
-                      )}
-                      {request.traceId && (
-                        <div className="mt-1 text-xs text-muted-foreground">
-                          {t("Trace ID")}: <code className="select-all">{request.traceId}</code>
-                        </div>
-                      )}
-                    </TableCell>
-                    <TableCell role="cell">
-                      <span className="block text-xs text-muted-foreground sm:hidden">{t("Status")}</span>
-                      {request.outcome === "response"
-                        ? request.status
-                        : request.outcome === "abort"
-                          ? t("Aborted")
-                          : request.outcome === "timeout"
-                            ? t("Timed out")
-                            : t("Network error")}
-                    </TableCell>
-                    <TableCell className="whitespace-nowrap" role="cell">
-                      <span className="block text-xs text-muted-foreground sm:hidden">{t("Duration")}</span>
-                      {Math.round(request.durationMs)} ms
-                    </TableCell>
-                    <TableCell className="col-span-3" role="cell">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <Button size="sm" variant="outline" disabled={!player} onClick={() => seek(row)}>
-                          {t("Go to request")}
-                        </Button>
-                        {links?.logs && (
-                          <Button asChild size="sm" variant="outline">
-                            <a href={links.logs} target="_blank" rel="noopener noreferrer">
-                              {t("Logs in Grafana")}
-                            </a>
-                          </Button>
-                        )}
-                        {links?.trace && (
-                          <Button asChild size="sm" variant="outline">
-                            <a href={links.trace} target="_blank" rel="noopener noreferrer">
-                              {t("Trace in Grafana")}
-                            </a>
-                          </Button>
-                        )}
-                        {!request.correlationId && !request.traceId ? (
-                          <span className="text-xs text-muted-foreground">{t("No correlation ID available.")}</span>
-                        ) : config?.enabled && !links ? (
-                          <span className="text-xs text-muted-foreground">
-                            {t("No matching origin configuration.")}
-                          </span>
-                        ) : null}
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                );
-              })}
-            </TableBody>
-          </Table>
+          <ChevronRight aria-hidden="true" className="size-3 shrink-0 text-muted-foreground" />
         )}
-      </DialogContent>
-    </Dialog>
+      </button>
+      {expanded ? (
+        <div id={detailsId} className="min-w-0 space-y-1.5 px-2.5 pb-2 text-xs">
+          <dl className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-1 text-[11px]">
+            {request.correlationId ? (
+              <>
+                <dt className="text-muted-foreground">correlationId</dt>
+                <dd className="min-w-0 [overflow-wrap:anywhere]">
+                  <code className="select-all font-sans">{request.correlationId}</code>
+                </dd>
+              </>
+            ) : null}
+            {request.traceId ? (
+              <>
+                <dt className="text-muted-foreground">traceId</dt>
+                <dd className="min-w-0 [overflow-wrap:anywhere]">
+                  <code className="select-all font-sans">{request.traceId}</code>
+                </dd>
+              </>
+            ) : null}
+          </dl>
+          {!authorized ? (
+            <p className="text-muted-foreground">Sign in with replay access to view correlation links.</p>
+          ) : isLoading ? (
+            <p role="status" className="text-muted-foreground">
+              Loading...
+            </p>
+          ) : isError ? (
+            <div className="space-y-2" role="alert">
+              <p>Unable to load Grafana configuration.</p>
+              <Button type="button" variant="outline" size="sm" onClick={() => void refetch()}>
+                Retry
+              </Button>
+            </div>
+          ) : !config?.enabled ? (
+            <p className="text-muted-foreground">Grafana correlation is not configured for this site.</p>
+          ) : !links && (request.correlationId || request.traceId) ? (
+            <p className="text-muted-foreground">No matching origin configuration.</p>
+          ) : null}
+          {!request.correlationId && !request.traceId ? (
+            <p className="text-muted-foreground">No correlation ID available.</p>
+          ) : null}
+          <div className="flex min-w-0 flex-wrap gap-1">
+            <Button
+              type="button"
+              size="xs"
+              variant="outline"
+              aria-label="Go to request"
+              title="Go to request"
+              disabled={!canSeek}
+              onClick={seek}
+            >
+              Seek
+            </Button>
+            {links?.logs ? (
+              <Button asChild size="xs" variant="outline">
+                <a
+                  href={links.logs}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label="Logs in Grafana"
+                  title="Logs in Grafana"
+                >
+                  Logs
+                </a>
+              </Button>
+            ) : null}
+            {links?.trace ? (
+              <Button asChild size="xs" variant="outline">
+                <a
+                  href={links.trace}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label="Trace in Grafana"
+                  title="Trace in Grafana"
+                >
+                  Trace
+                </a>
+              </Button>
+            ) : null}
+          </div>
+          {links?.logs || links?.trace ? (
+            <p
+              className="text-[11px] leading-4 text-muted-foreground"
+              title="Grafana links use the recording clock. If results are missing, verify the time range in Grafana."
+            >
+              Recording time; verify Grafana range.
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
   );
 });

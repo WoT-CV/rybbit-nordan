@@ -27,7 +27,20 @@ assert(
   "An explicit http://127.0.0.1:<port> origin is required"
 );
 const app = appUrl.origin;
-const api = "http://127.0.0.1:13001"; // Origin baked into the reviewed local production build.
+// This origin must match NEXT_PUBLIC_BACKEND_URL baked into the reviewed client build.
+const apiUrl = new URL(process.env.WOTCV_UI_SMOKE_API_ORIGIN ?? "http://127.0.0.1:13001");
+assert(
+  apiUrl.protocol === "http:" &&
+    apiUrl.hostname === "127.0.0.1" &&
+    apiUrl.port &&
+    apiUrl.pathname === "/" &&
+    !apiUrl.username &&
+    !apiUrl.password &&
+    !apiUrl.search &&
+    !apiUrl.hash,
+  "WOTCV_UI_SMOKE_API_ORIGIN must be an explicit http://127.0.0.1:<port> origin"
+);
+const api = apiUrl.origin;
 assert.notEqual(app, api);
 const { chromium, firefox, webkit, devices } = await import(pathToFileURL(resolve(process.argv[3])).href);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -48,6 +61,7 @@ console.log(`Synthetic UI evidence: ${output}`);
 const start = Date.parse("2026-10-24T10:00:00Z");
 const traceId = "1234567890abcdef1234567890abcdef";
 const correlationId = "qa-request-123";
+const requestPath = `/players/000123/${"synthetic-responsive-endpoint-".repeat(4)}`;
 const permissions = ["analytics:read", "replay:read", "sites:read", "sessions:read", "users:read", "events:read"];
 const site = {
   siteId: 2,
@@ -184,7 +198,7 @@ const events = [
         transport: "fetch",
         method: "GET",
         origin: "https://api.example.test",
-        pathname: "/players/000123",
+        pathname: requestPath,
         status: 200,
         outcome: "response",
         durationMs: 400,
@@ -286,7 +300,7 @@ const apiServer = createHttpServer({ maxHeaderSize: 8192, requestTimeout: 2000 }
 apiServer.keepAliveTimeout = 1000;
 await new Promise((resolveApi, reject) => {
   apiServer.once("error", reject);
-  apiServer.listen(13001, "127.0.0.1", resolveApi);
+  apiServer.listen(Number(apiUrl.port), apiUrl.hostname, resolveApi);
 });
 apiServer.on("error", error => recordServer(serverUnexpected, { error: error.message.slice(0, 4096) }));
 const next = spawn(
@@ -388,17 +402,21 @@ try {
     assert(Date.now() < deadline, `Next startup timed out: ${serverLog}`);
     await new Promise(resolveDelay => setTimeout(resolveDelay, 200));
   }
-  for (const [name, engine, mobile] of [
+  for (const [name, engine, mobile, viewport] of [
     ["chromium-desktop", chromium, false],
     ["chromium-mobile", chromium, true],
+    ["chromium-tablet-touch", chromium, true, { width: 1000, height: 1000 }],
     ["firefox-desktop", firefox, false],
+    ["firefox-mobile", firefox, true],
+    ["webkit-desktop", webkit, false],
     ["webkit-mobile", webkit, true],
   ]) {
     const browser = await engine.launch({ headless: true });
     const result = {
       name,
       browser: browser.version(),
-      mobileEmulation: mobile,
+      mobileEmulation: mobile && engine !== firefox,
+      compactTouchLayout: mobile,
       errors: [],
       warnings: [],
       apiCalls: [],
@@ -410,14 +428,20 @@ try {
     report.cases.push(result);
     let page;
     try {
+      // Firefox supports touch + a compact viewport, but not isMobile emulation.
+      const { isMobile, ...phone } = devices["iPhone 13"];
       const context = await browser.newContext({
-        ...(mobile ? devices["iPhone 13"] : { viewport: { width: 1440, height: 1000 } }),
+        ...(mobile
+          ? { ...phone, ...(engine === firefox ? {} : { isMobile }) }
+          : { viewport: { width: 1440, height: 1000 } }),
+        ...(viewport ? { viewport } : {}),
         locale: "en-US",
         timezoneId: "UTC",
         colorScheme: "dark",
         serviceWorkers: "block",
       });
       page = await context.newPage();
+      result.viewport = page.viewportSize();
       page.setDefaultTimeout(15000);
       const record = (key, value) => {
         if (result[key].length >= 256) {
@@ -499,11 +523,80 @@ try {
         );
         if (mobile) assert(await outer.isVisible(), "Nested action must retain outer mobile drawer");
       };
-      const requests = page.getByRole("dialog", { name: "Requests", exact: true });
-      await activate(player.getByRole("button", { name: "Requests", exact: true }));
-      await requests.getByRole("link", { name: "Logs in Grafana" }).waitFor();
-      assert.match(await requests.innerText(), /0:20/);
-      assert.match(await requests.innerText(), /400 ms/);
+      assert.equal(await player.getByRole("button", { name: "Requests", exact: true }).count(), 0);
+      assert.equal(await page.getByRole("dialog", { name: "Requests", exact: true }).count(), 0);
+      const timelineToggle = outer.getByRole("button", { name: "Timeline", exact: true });
+      if (mobile) {
+        await activate(timelineToggle);
+        await outer.getByRole("region", { name: "Timeline", exact: true }).waitFor({ state: "visible" });
+        assert.equal(await timelineToggle.getAttribute("aria-expanded"), "true");
+        await retained();
+      }
+      const detailLevel = page.getByRole("radiogroup", { name: "Event detail level", exact: true });
+      const keyOption = detailLevel.getByRole("radio", { name: "Key", exact: true });
+      const requestsOption = detailLevel.getByRole("radio", { name: "Requests", exact: true });
+      const allOption = detailLevel.getByRole("radio", { name: "All", exact: true });
+      assert.deepEqual(await detailLevel.getByRole("radio").allTextContents(), ["Key", "Requests", "All"]);
+      const timeline = mobile
+        ? outer.getByRole("region", { name: "Timeline", exact: true })
+        : detailLevel.locator("xpath=../..");
+      const nativeSessionStart = timeline.getByText("Session started", { exact: true });
+      const nativeFullSnapshot = timeline.getByText("Full Snapshot", { exact: true });
+      assert.equal(await keyOption.getAttribute("aria-checked"), "true");
+      const requestRow = page.getByRole("button", { name: `Requests: GET ${requestPath}`, exact: true });
+      await nativeSessionStart.waitFor({ state: "visible" });
+      assert.equal(await requestRow.count(), 0, "Native Key must not mix in request correlation rows");
+      await activate(allOption);
+      await nativeFullSnapshot.waitFor({ state: "visible" });
+      await requestRow.waitFor({ state: "hidden" });
+      assert.equal(await allOption.getAttribute("aria-checked"), "true");
+      await activate(requestsOption);
+      await requestRow.waitFor({ state: "visible" });
+      assert.equal(await requestsOption.getAttribute("aria-checked"), "true");
+      assert.equal(await nativeSessionStart.count(), 0, "Requests must be separate from native Key interactions");
+      assert.equal(await requestRow.getAttribute("aria-expanded"), "false");
+      assert.match(await requestRow.innerText(), /0:20/);
+      assert.match(await requestRow.innerText(), /400 ms/);
+      const collapsedRequest = await requestRow.boundingBox();
+      assert(collapsedRequest && collapsedRequest.height <= 48, "Long request must remain a compact two-line row");
+      const endpointLabel = requestRow.locator("span[title]").filter({ hasText: requestPath });
+      assert.equal(await endpointLabel.getAttribute("title"), `https://api.example.test${requestPath}`);
+      const endpointStyle = await endpointLabel.evaluate(element => {
+        const style = getComputedStyle(element);
+        return {
+          whiteSpace: style.whiteSpace,
+          overflowX: style.overflowX,
+          textOverflow: style.textOverflow,
+          clientWidth: element.clientWidth,
+          scrollWidth: element.scrollWidth,
+          height: element.getBoundingClientRect().height,
+          lineHeight: Number.parseFloat(style.lineHeight),
+        };
+      });
+      assert.equal(endpointStyle.whiteSpace, "nowrap");
+      assert.equal(endpointStyle.overflowX, "hidden");
+      assert.equal(endpointStyle.textOverflow, "ellipsis");
+      assert(endpointStyle.height <= endpointStyle.lineHeight + 1, "Request method/path must stay on one line");
+      if (endpointStyle.clientWidth < 600) {
+        assert(endpointStyle.scrollWidth > endpointStyle.clientWidth, "Long fixture must exercise endpoint truncation");
+      }
+      if (mobile) await activate(requestRow);
+      else await requestRow.press("Enter");
+      // Keep this relative to the live virtual row. Hiding the mobile pane can
+      // legitimately unmount/recreate a virtual item and therefore its useId.
+      const requests = requestRow.locator("xpath=following-sibling::div[@id][1]");
+      await requests.getByRole("link", { name: "Logs in Grafana" }).waitFor({ state: "visible" });
+      assert.equal(await requestRow.getAttribute("aria-expanded"), "true");
+      assert.equal(await requests.getAttribute("id"), await requestRow.getAttribute("aria-controls"));
+      assert.match(await requests.innerText(), new RegExp(correlationId));
+      assert.match(await requests.innerText(), new RegExp(traceId));
+      assert.equal(await requests.getByText("Endpoint", { exact: true }).count(), 0);
+      assert(!(await requests.innerText()).includes(requestPath), "Expanded details must not duplicate the endpoint");
+      assert(
+        !(await requests.innerText()).includes("https://api.example.test"),
+        "Full URL belongs only in the header title"
+      );
+      assert.deepEqual(await requests.locator("dt").allTextContents(), ["correlationId", "traceId"]);
       for (const [kind, label] of [
         ["logs", "Logs in Grafana"],
         ["trace", "Trace in Grafana"],
@@ -513,58 +606,111 @@ try {
         assert.equal(await link.getAttribute("target"), "_blank");
         assert.equal(await link.getAttribute("rel"), "noopener noreferrer");
       }
-      if (mobile) {
-        await requests.evaluate(el =>
-          Promise.all(el.getAnimations().map(animation => animation.finished.catch(() => {})))
-        );
-        const dialogBox = await requests.boundingBox();
+      {
+        const paneBox = await timeline.boundingBox();
         const viewport = page.viewportSize();
-        assert(dialogBox && viewport);
-        const endpoint = await requests.locator("tbody tr td").nth(1).boundingBox();
-        assert(endpoint && endpoint.width >= 250, "Mobile endpoint must remain a readable full-width cell");
+        assert(paneBox && viewport);
+        const endpoint = await endpointLabel.boundingBox();
+        const expandedRequest = await requestRow.locator("xpath=..").boundingBox();
+        assert(endpoint && expandedRequest);
+        assert(expandedRequest.height <= 240, "Expanded request must remain compact");
         const actions = [
           requests.getByRole("button", { name: "Go to request" }),
           requests.getByRole("link", { name: "Logs in Grafana" }),
           requests.getByRole("link", { name: "Trace in Grafana" }),
         ];
+        assert.deepEqual(await Promise.all(actions.map(action => action.innerText())), ["Seek", "Logs", "Trace"]);
         const actionBoxes = [];
         for (const action of actions) {
           const box = await action.boundingBox();
           assert(box && box.width > 0 && box.height > 0);
           assert(
-            box.x >= Math.max(0, dialogBox.x) - 1 &&
-              box.x + box.width <= Math.min(viewport.width, dialogBox.x + dialogBox.width) + 1,
-            "Every mobile action must fit the dialog/viewport without horizontal scrolling"
+            box.x >= Math.max(0, paneBox.x) - 1 &&
+              box.x + box.width <= Math.min(viewport.width, paneBox.x + paneBox.width) + 1,
+            "Every request action must fit the timeline/viewport without horizontal scrolling"
           );
           assert(
-            box.y >= Math.max(0, dialogBox.y) - 1 &&
-              box.y + box.height <= Math.min(viewport.height, dialogBox.y + dialogBox.height) + 1,
-            "Every mobile action must be visible inside the dialog/viewport"
+            box.y >= Math.max(0, paneBox.y) - 1 &&
+              box.y + box.height <= Math.min(viewport.height, paneBox.y + paneBox.height) + 1,
+            "Every request action must be visible inside the timeline/viewport"
           );
           actionBoxes.push(box);
         }
-        const overflow = await requests.evaluate(el => ({
-          dialog: el.scrollWidth - el.clientWidth,
-          table:
-            el.querySelector("table").parentElement.scrollWidth - el.querySelector("table").parentElement.clientWidth,
-        }));
-        assert(overflow.dialog <= 1 && overflow.table <= 1, "Mobile Requests must not require horizontal scrolling");
-        result.mobileRequestsLayout = { viewport, dialog: dialogBox, endpoint, actions: actionBoxes, overflow };
-        result.operations.push("mobile-fullwidth-endpoint-and-all-actions-without-horizontal-scroll");
+        const overflow = {
+          pane: await timeline.evaluate(el => el.scrollWidth - el.clientWidth),
+          details: await requests.evaluate(el => el.scrollWidth - el.clientWidth),
+          page: await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth),
+        };
+        assert(
+          Object.values(overflow).every(value => value <= 1),
+          "Inline requests must not cause horizontal scrolling"
+        );
+        result.inlineRequestsLayout = {
+          viewport,
+          pane: paneBox,
+          collapsedRequest,
+          expandedRequest,
+          endpoint,
+          endpointStyle,
+          actions: actionBoxes,
+          overflow,
+        };
+        result.operations.push(
+          "compact-request-truncated-endpoint-no-duplicate-url-and-actions-without-horizontal-scroll"
+        );
       }
       await page.screenshot({ path: join(output, `${name}-requests.png`), animations: "disabled" });
-      await page.keyboard.press("Escape");
-      await requests.waitFor({ state: "hidden" });
+      if (name === "chromium-desktop") {
+        await requestRow.locator("xpath=..").screenshot({
+          path: join(output, "chromium-desktop-request-row.png"),
+          animations: "disabled",
+        });
+      }
+      if (mobile) await activate(requestRow);
+      else await requestRow.press("Space");
+      await requests.waitFor({ state: "detached" });
+      assert.equal(await requestRow.getAttribute("aria-expanded"), "false");
       await retained();
       result.operations.push(
         "clan-logo-loaded",
         "exact-grafana-profile-id-range-basepath",
-        "nested-Escape-retains-player"
+        "no-header-requests-button-or-dialog",
+        "native-key-requests-all-radio-order-and-separated-content",
+        "inline-expansion-collapse-retains-player"
       );
-      await activate(player.getByRole("button", { name: "Requests", exact: true }));
-      await activate(requests.getByRole("button", { name: "Go to request" }));
-      await requests.waitFor({ state: "hidden" });
+      await activate(requestRow);
+      await requests.getByRole("button", { name: "Go to request" }).waitFor({ state: "visible" });
+      // Leaving Requests must reset expansion, without changing native Key/All.
+      await activate(keyOption);
+      await nativeSessionStart.waitFor({ state: "visible" });
+      assert.equal(await requestRow.count(), 0);
+      await activate(allOption);
+      await nativeFullSnapshot.waitFor({ state: "visible" });
+      assert.equal(await requestRow.count(), 0);
+      await activate(requestsOption);
+      await requestRow.waitFor({ state: "visible" });
+      assert.equal(await requestRow.getAttribute("aria-expanded"), "false");
       await retained();
+      result.operations.push("requests-tab-roundtrip-resets-expansion-preserves-native-key-and-all");
+      await activate(requestRow);
+      await requests.getByRole("button", { name: "Go to request" }).waitFor({ state: "visible" });
+      assert.equal(await requests.getAttribute("id"), await requestRow.getAttribute("aria-controls"));
+      await activate(requests.getByRole("button", { name: "Go to request" }));
+      assert.equal(await requestRow.getAttribute("aria-expanded"), "true");
+      await retained();
+      if (mobile) {
+        await page.keyboard.press("Escape");
+        await page.locator(".rr-player iframe").waitFor({ state: "visible" });
+        assert.equal(await timelineToggle.getAttribute("aria-expanded"), "false");
+        await retained();
+        await activate(timelineToggle);
+        await requests.waitFor({ state: "visible" });
+        assert.equal(await requests.getAttribute("id"), await requestRow.getAttribute("aria-controls"));
+        await activate(timelineToggle);
+        await page.locator(".rr-player iframe").waitFor({ state: "visible" });
+        await retained();
+        result.operations.push("mobile-timeline-access-escape-and-toggle-return-retain-player");
+      }
       const slider = player.getByRole("slider");
       await page.waitForFunction(
         () => Math.abs(Number(document.querySelector('[role="slider"]')?.getAttribute("aria-valuenow")) - 100 / 3) < 0.2

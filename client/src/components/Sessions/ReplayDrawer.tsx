@@ -1,11 +1,15 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { ListTree } from "lucide-react";
+import { useExtracted } from "next-intl";
+import { useEffect, useId, useRef, useState } from "react";
+import { Button } from "@/components/ui/button";
 import { Drawer, DrawerContent, DrawerTitle } from "@/components/ui/drawer";
 import { ReplayPlayer } from "@/components/replay/player/ReplayPlayer";
 import { useReplayStore } from "@/components/replay/replayStore";
 import { ReplayBreadcrumbs } from "@/components/replay/ReplayBreadcrumbs";
 import { VisuallyHidden } from "@radix-ui/react-visually-hidden";
+import { cn } from "@/lib/utils";
 
 interface ReplayDrawerProps {
   sessionId: string;
@@ -14,8 +18,12 @@ interface ReplayDrawerProps {
 }
 
 export function ReplayDrawer({ sessionId, open, onOpenChange }: ReplayDrawerProps) {
+  const t = useExtracted();
   const setSessionId = useReplayStore(s => s.setSessionId);
   const containerRef = useRef<HTMLDivElement>(null);
+  const timelineToggleRef = useRef<HTMLButtonElement>(null);
+  const timelineId = useId();
+  const [timelineOpen, setTimelineOpen] = useState(false);
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
 
   // Set sessionId in store when drawer opens
@@ -64,21 +72,61 @@ export function ReplayDrawer({ sessionId, open, onOpenChange }: ReplayDrawerProp
 
   return (
     <Drawer open={open} onOpenChange={onOpenChange}>
-      <DrawerContent className="h-[90vh]">
+      <DrawerContent
+        className="h-[90vh]"
+        onEscapeKeyDown={event => {
+          if (timelineOpen && !window.matchMedia("(min-width: 1024px)").matches) {
+            event.preventDefault();
+            setTimelineOpen(false);
+            timelineToggleRef.current?.focus();
+          }
+        }}
+      >
         <VisuallyHidden>
           <DrawerTitle>Session Replay</DrawerTitle>
         </VisuallyHidden>
-        <div className="flex gap-2 p-2 h-[97%]">
-          {/* Player */}
-          <div ref={containerRef} className="relative flex-1" style={{ height: "calc(90vh - 40px)" }}>
-            {dimensions.width > 0 && dimensions.height > 0 && (
-              <ReplayPlayer width={dimensions.width} height={dimensions.height} isDrawer={true} />
-            )}
+        <div className="flex min-h-0 flex-1 flex-col gap-2 p-2">
+          <div className="flex justify-end lg:hidden">
+            <Button
+              ref={timelineToggleRef}
+              variant="outline"
+              size="sm"
+              aria-controls={timelineId}
+              aria-expanded={timelineOpen}
+              onClick={() => setTimelineOpen(value => !value)}
+              onKeyDown={event => {
+                // Native button activation must not reach the player's Space hotkey.
+                if (event.key !== "Escape") event.stopPropagation();
+              }}
+            >
+              <ListTree className="size-4" />
+              {t("Timeline")}
+            </Button>
           </div>
+          <div className="relative flex min-h-0 flex-1 gap-2">
+            {/* Keep the native player mounted and measured beneath the mobile pane. */}
+            <div ref={containerRef} className={cn("relative min-w-0 flex-1", timelineOpen && "invisible lg:visible")}>
+              {dimensions.width > 0 && dimensions.height > 0 && (
+                <ReplayPlayer width={dimensions.width} height={dimensions.height} isDrawer={true} />
+              )}
+            </div>
 
-          {/* Timeline sidebar */}
-          <div className="w-[300px] hidden lg:block h-[calc(90vh - 40px)]">
-            <ReplayBreadcrumbs />
+            {/* One timeline instance: mobile overlay and desktop sidebar share state/data. */}
+            <div
+              id={timelineId}
+              role="region"
+              aria-label={t("Timeline")}
+              onKeyDown={event => {
+                // Timeline radios and actions own their keys; Escape still returns to replay.
+                if (event.key !== "Escape") event.stopPropagation();
+              }}
+              className={cn(
+                "absolute inset-0 min-w-0 bg-background lg:static lg:block lg:w-[300px] lg:shrink-0",
+                timelineOpen ? "block" : "hidden"
+              )}
+            >
+              <ReplayBreadcrumbs />
+            </div>
           </div>
         </div>
       </DrawerContent>
