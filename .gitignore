@@ -40,6 +40,11 @@ coverage/
 *.temp
 .cache/
 
+# Python operational-tool bytecode
+__pycache__/
+*.pyc
+*.pyo
+
 # Production
 .env.production 
 
