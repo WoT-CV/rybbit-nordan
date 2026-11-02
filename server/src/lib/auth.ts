@@ -71,7 +71,7 @@ const apiKeyRateLimit = { enabled: false };
 
 const pluginList = [
   admin(),
-  ...createOAuthPlugins(getAuthBaseUrl()),
+  ...createOAuthPlugins(getAuthBaseUrl(), getServiceConfiguration().publicUrl || getAuthBaseUrl()),
   apiKey([
     {
       // User-owned keys. Pre-existing rows (NULL configId) resolve here.

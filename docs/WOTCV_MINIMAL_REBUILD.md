@@ -725,3 +725,178 @@ Plan implementacji:
   prerequisites i fizyczny iPhone niezweryfikowane. Nie uruchomiono migracji,
   backfill, restore, kontenerów ani Nginx; lokalne Next/API fixture zakończone.
   Nie wykonano push. Stare worktrees i ich pliki pozostają bez zmian.
+
+## Całościowe review integracyjne i audyt SSH — 2026-11-02
+
+Zakres po siedmiu etapach: ponowny pełny diff vs U, niezależne review replay,
+FE/profili i backend/ops oraz read-only SSH rzeczywistej produkcji. Bez deploy,
+restartów, migracji, backfill, restore, root bypass ani modyfikowania live env.
+Poprawki po tym review należą do jednego końcowego commitu; bez push.
+
+Plan przed poprawkami:
+
+1. Związać health z rzeczywistymi image IDs/digests, Compose ownership,
+   timestamp/start/restart i wykazać, czy kandydat w ogóle działa na serwerze.
+2. Zweryfikować rzeczywisty kontrakt FE identify, CORS response IDs, istniejące
+   etykiety Loki/trace sampling, Grafana adres/UID (tylko dostępne non-secret
+   config/API), noindex origin/public i runtime storage/metadata modes.
+3. Nie uruchamiać nowych realnych sesji ani POST do aplikacji. Katalogi DB
+   i minimalne zanonimizowane/przetworzone próbki tylko z limitem czasu/scan
+   i bez wypisywania nagrań, body, cookies, emaili czy identyfikatorów klientów.
+4. Rozstrzygnąć znalezione luki całości: dwie aplikacje w różnych originach
+   i namespace Docker, API unsubscribe/auth callback vs link do interfejsu;
+   client-only sesja nie może inicjalizować autoryzacji w globalnym SSR store.
+   Dodać testy rozdzielonego FE/API i SSR bez działającego API, nie maskować
+   wymagania fixture listenerem. Zachować native player i izolację uprawnień.
+5. Usunąć znalezione crash paths w nowych powierzchniach profili (np. nie-string
+   email trait) i dodać regresję; nie przebudowywać niepowiązanego native UI.
+6. Wszystkie dalsze konkretne findings zweryfikować przez test/repro przed
+   poprawką. Powtórzyć review, pełne testy, buildy, lint delta, browser matrix
+   oraz końcowy SSH snapshot. Nie utożsamiać sprawnego starego runtime ani
+   syntetycznego testu z dowodem działania niewdrożonego kandydata na prod.
+7. Zapisać dowody i ograniczenia, jednoznaczny werdykt korzyść/ryzyko/HOLD,
+   commit poprawek i czysty worktree. Bez samodzielnego rozszerzania wdrożenia.
+
+### Review całości — odtworzone błędy i wykonane poprawki
+
+1. **Split FE/API:** znaleziono rzeczywiste linki auth/unsubscribe kierujące na
+   frontend bez odpowiedniej trasy API. Dodano walidowany `apiUrl`, zachowując
+   osobny `publicUrl` dla dashboardu, login/consent i treści maili. Jawny błędny
+   SERVER_URL nie daje cichego fallbacku. Test z prawdziwym BetterAuth i adapterem
+   pamięciowym generuje verification/reset URL, przechodzi callback API→FE oraz
+   odrzuca obcy callback. Bez SMTP, baz i uruchamiania natywnego entrypointa.
+2. **SSR/session:** natywny moduł userStore pobierał sesję przy SSR, pod browser-only
+   originem i do współdzielonego procesu. Bootstrap jest browser-only, kończy
+   pending także po błędzie i nie nadpisuje nowszego logowania. Dodatkowy review
+   wychwycił realne `{user}` bez `isPending:false` w natywnych ścieżkach — regresja
+   obejmuje także ten kształt, nie tylko wygodny kształt testowy.
+3. **Logout:** rzeczywisty hook nie czyścił userStore. Wspólna ścieżka dla sidebar,
+   account i zmiany konta transferu czyści store/cache dopiero po potwierdzonym
+   signOut. Odrzucony/niepotwierdzony logout pozostawia stan i pokazuje istniejący
+   przetłumaczony błąd. Test rzeczywistego hooka z opóźnionym bootstrapem dowodzi,
+   że stara odpowiedź nie przywróci użytkownika po wylogowaniu.
+4. **People:** gotowa poczta ukrywała Create User przy DISABLE_SIGNUP=true, choć
+   wysłane zaproszenie nie obchodzi zakazu rejestracji. Przywrócono lokalne
+   tworzenie kont, zachowując Invite dla istniejących użytkowników oraz wszystkie
+   role/grants/uprawnienia. Macierz cloud/mail/signup/loading ma regresje.
+5. **Mobile People:** realny WebKit i Chromium mobile ujawniły RED: search+Invite+
+   Create User przekraczały viewport. Jedna zmiana ograniczeń grupy akcji w Ledger
+   pozwala jej się zwężać i zawijać; po rebuild ten sam test jest GREEN. Bez
+   restylowania kontrolek ani zmiany ich logiki. Oba dialogi otwarto i zamknięto.
+6. **Profile:** nie-string email trait mógł wywrócić UserHeader przy renderowaniu
+   React. Renderowany jest tylko niepusty string. Regresje obejmują obiekty,
+   tablice, liczby, blank i zachowanie niezmienionego opaque ID `000123`.
+7. **Observer:** odtworzono dodatkową konwersję URL zmieniającą wysyłany endpoint
+   (`conversion-1` → `conversion-2`), opóźniony odczyt mutowanego URL XHR, złą
+   bazę URL względem `<base>` i przedwczesną refleksję RequestInit. Poprawki
+   używają bezpiecznych intrinsic snapshots, document.baseURI i snapshotu przy
+   XHR.open; refleksja init jest po zużyciu przez native fetch. Nietypowe wejścia
+   są pomijane, dowolny dynamiczny Proxy pozostaje jawnie best-effort, a nie
+   autorytatywnym źródłem HTTP. 22 porównania native/observer na każdy silnik,
+   w tym prawdziwy proxy trap oraz getter metody uruchamiany tylko przez native.
+8. **Admin:** pusty/missing rollup nie oznacza zera historycznych zdarzeń.
+   Brak wyniku jest null/UNAVAILABLE; jawne zmierzone zero zostaje zerem.
+   Częściowa organizacja nie tworzy kompletnej sumy, a obecne dane nadal mają
+   NOT_VERIFIED. Bez surowego skanu, backfillu i twierdzeń o pełnej historii.
+9. **Clock skew:** native korekta nie usuwa np. +10 minut, więc padding 120s może
+   minąć istniejący log. Panel i wszystkie 12 języków ostrzegają o zakresie
+   czasu; dokumentacja opisuje ręczne sprawdzenie w Grafanie. Nie zwiększono
+   limitów/padding ani nie przebudowano natywnej osi czasu/protokołu.
+
+### SSH read-only — fakty z 2026-11-02, 00:13–00:33 UTC
+
+- Health lokalny i publiczny HTTP200, rzeczywisty backend image ID/digest
+  `16194ebd3552a4d4f6ce223f1471524cde57180814787abd333a3540889a0715`
+  i checkout wskazują **stary** dade9a932e0c5854d2f9bcf5c11d91efece5036f.
+  Client image ID `09ad41da4aa44a45fc4d440ab7dae2669e3439b3fb72c2fc3735f5b67c79456b`.
+  Checkout clean. Nie działa tu jeszcze kandydat minimal.
+- Pięć kontenerów running, backend/PG/Redis/CH healthy; client nie ma healthcheck,
+  więc jego running nie jest osobnym dowodem health. RestartCount=0, StartAt
+  wszystkich pozostaje 2026-10-29T21:51:48Z. Powtórzony snapshot 00:33:36Z
+  potwierdził niezmienione IDs/start/restart; logging json-file 50m/5.
+- Kontrolny GET API z rzeczywistym Origin https://wot-cv.com zwrócił 401 dla
+  chronionej trasy oraz CORS pozwalający odczytać X-Correlation-Id/X-Trace-Id.
+  To NIE oznacza awarii health. Dla jego ID w ograniczonym dwuminutowym oknie
+  znaleziono **2 wpisy Loki** (22 przeskanowane linie, 11 513 B) i **1 span Tempo**
+  z service.name=wot-cv-be-prod, deployment.environment=prod i zgodnym trace ID.
+  Nie wypisywano body, cookies ani surowych logów/atrybutów osobowych.
+- Publiczny Grafana health200/database ok, wersja13.3.0; Loki3.7.9, Tempo3.1.1.
+  Czysta funkcja konfiguracji działającego starego backendu potwierdza dla site2:
+  dashboard.wot-cv.com, org1, Loki bet3mn133whkwd, Tempo df0rqhtz9e3uoa,
+  requestOrigin api.wot-cv.com, service wot-cv-be-prod, env prod, padding120000.
+  Stary env profili jest pusty i korzysta z domyślnych wartości — NIE jest to
+  błędny JSON. Nowy fork wymaga jawnego WOTCV_REPLAY_CORRELATION_JSON, nie
+  dziedziczy starej nazwy/defaultów. Uwierzytelnione Grafana datasource API
+  zwraca401 bez konta; root-only provisioning nie był obchodzony. UID-y powyżej
+  są potwierdzone w działającej konfiguracji, nie przez zalogowany datasource API.
+- Noindex: 18 bounded probes GET/HEAD, origin z --resolve na127.0.0.1 oraz
+  publiczna domena. `/`, `/login`, health i script200; brakująca trasa404;
+  wszystkie z noindex. Robots/sitemap GET/HEAD mają410, 0B, Cache-Control:no-store.
+  Nie wykonano nginx -t/reload ani edycji konfiguracji podczas tego audytu.
+- PG17.4: read-only transakcje, statement_timeout3s/lock_timeout500ms.
+  25 hashy w live drizzle journal dokładnie odpowiada kolejności SQL starego
+  checkouta; NIE jest to zgodność z nowym natywnym journalem. user_aliases ma
+  source/updated_at. W ograniczonej próbce20 profili username/name/avatarUrl/
+  clanTag są string, avatar jest HTTPS, customerId jest number, email brak.
+  Nie odczytywano/wypisywano ich wartości. Liczba146 z katalogu jest estymatą,
+  nie policzoną/zweryfikowaną populacją; próbka nie dowodzi pełnego pokrycia.
+- CH: najpierw katalogi/typy/sorting key, następnie EXPLAIN i próba20 wierszy
+  site2 wyłącznie z flagami has_replay_data/identified. Odczyty readonly2,
+  max_execution_time3s, max_rows_to_read10000, max_bytes_to_read10000000,
+  result LIMIT. Dane istnieją w replay_metadata v1; tabela v2 istnieje, ale
+  nie miała aktywnych parts w snapshot. Fizyczne rows system.parts: v1=4044,
+  replay_events=7872661, hourly rollup=1182. To NIE są logiczne liczby sesji ani
+  dowód kompletności historii. Brak FINAL, skanu event_data lub migracji.
+- Konfiguracja starego runtime: Identityv2=true, metadata=v1, custom upload
+  gzip=true. R2/mail/OpenRouter nie są skonfigurowane, GSC client/secret/redirect
+  są obecne. Sama obecność nie dowodzi prawidłowego OAuth/token refresh.
+
+### Korzyść, pomiary i granice potwierdzenia
+
+Powyższy live kontrakt potwierdza sens małego mostka correlation→Grafana i zgodność
+typów traits/avatara. Nie potwierdza wdrożenia nowego playera, auth, maili ani
+transferu danych. Realna zalogowana sesja Grafana i fizyczny iPhone pozostają
+osobnymi bramkami. Na produkcji nie wykonano POST, restartu, deploy, migracji/backfill/restore,
+zmian env/Nginx ani testów obciążenia na produkcji.
+
+Zmierzone lokalnie script.js: natywny U37351B, stary produkcyjny source67665B,
+kandydat46480B; porównawcze gzip odpowiednio11823/20703/14566B i Brotli
+10599/18361/13070B (lokalne zlib, nie wynik transferu HTTP). Minimalny tracker
+jest mniejszy od starego forka, ale większy od czystego U. Nie utożsamiać tego
+z pomiarem CPU ani całkowitego uploadu replay. Rezygnacja z działającego na
+prod custom gzip może ZWIĘKSZYĆ upload DOM replay; ten tradeoff jest świadomą
+konsekwencją zatwierdzonego powrotu do native, nie obiecaną oszczędnością.
+Przed wydaniem wymaga reprezentatywnego porównania bajtów/CPU bez zmiany limitów.
+
+Niezależny końcowy review backendu i klienta nie wskazał dalszego konkretnego
+blokera źródłowego po poprawkach. Source/operational HOLD nie jest uchylony:
+wybór strategii danych A/B/C, restore drill, v1/v2 i identity continuity,
+opublikowane źródła/obrazy oraz odbiór izolowanego kandydata pozostają wymagane.
+
+### Końcowa walidacja review
+
+- Client: 160 files, **1678 PASS**, bez skip; pełny rerun po mobile Ledger fix.
+- Server: 201 files PASS, **3191 PASS**, 41 native SKIP w czterech integracyjnych
+  plikach ClickHouse (Pages, siteCards, lite/siteCards, userQueries). Nie użyto
+  produkcji do tych fixtures, nie traktujemy skip jako walidacji integracyjnej.
+- Shared68 PASS, Node ops74 PASS; oba buildy i oba typecheck PASS.
+- Pełny preset Next lint delta vs U: 93 client files, **0 nowych errors**,
+  14 odziedziczonych errors, 9 warnings. To nie jest repo-wide clean lint.
+- Chromium156 desktop/mobile, Firefox157 desktop, WebKit27.2 mobile:4/4 PASS.
+  Prawdziwy built Next zwraca HTTP200, clan logo załadowane, wszystkie prędkości,
+  seek i 4x postęp zachowują ten sam player/iframe; nested Escape nie zamyka
+  replay. People oba dialogi i toolbar w viewport PASS, zero browser errors,
+  zero unexpected/external API, zero SSR API calls. Własne procesy/listenery
+  zatrzymane. Dowody: TEMP/rybbit-minimal-ui-XM26oq/report.json i screenshots.
+- Observer we wszystkich trzech silnikach:10 rows/lifecycle +22 porównania
+  transportu na silnik, body i natywne unhandledrejection zachowane.
+- Faktyczny Compose5.6.1 z oficjalnie zweryfikowanym SHA256: config-only na
+  syntetycznym env PASS,5services/startupGate=CLOSED. Żaden image digest z fixture
+  nie jest obrazem wydania, runtime/source publication pozostają NOT_VERIFIED.
+- Po ostatnim extract/build przywrócono kolejność i oba nieużywane klucze U
+  w12 katalogach. Dokładnie jeden nowy klucz d6CJqN z tłumaczeniem w każdym
+  języku; bez zmiany/usunięcia wcześniejszych wartości i bez sortowania całego diffu.
+- Source preflight nadal HOLD/exit2: 11 native boundaries zgodnych z U,
+  journals25/25, różnice10–14. Stare worktrees i ich wcześniejsze pliki niezmienione.
+- Przed commitem Git diff whitespace i format zmienionych TS/TSX/scripts PASS.
+  Ostatni read-only upstream ls-remote master nadal wskazuje U. Bez push/deploy.

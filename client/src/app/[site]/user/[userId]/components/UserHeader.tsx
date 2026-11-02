@@ -96,7 +96,8 @@ export function UserHeader({ userId, displayName, data, isLoading, latestReplayS
   const { formatRelative, formatDateTime, hour12 } = useDateTimeFormat();
 
   const isIdentified = !!data?.identified_user_id;
-  const traitsEmail = data?.traits?.email as string | undefined;
+  const traitsEmail =
+    typeof data?.traits?.email === "string" && data.traits.email.trim() ? data.traits.email : undefined;
   // The Users list has no trait filter to link to, so these are plain chips.
   const chips = isIdentified ? headlineTraits(data?.traits) : [];
 

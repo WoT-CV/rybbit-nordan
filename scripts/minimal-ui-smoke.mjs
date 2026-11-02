@@ -71,11 +71,11 @@ const organization = {
   slug: "qa",
   createdAt: "2026-10-01T00:00:00Z",
   role: "owner",
-  permissions,
+  permissions: [...permissions, "members:manage"],
   members: [],
   invitations: [],
   teams: [],
-  assignableRoles: [],
+  assignableRoles: ["admin", "member", "viewer"],
 };
 const user = { id: "qa-user", email: "qa@example.test", name: "Synthetic QA", emailVerified: true, role: "user" };
 const authSession = {
@@ -208,7 +208,7 @@ const configs = {
   disableSignup: true,
   liteDashboard: false,
   mapboxToken: "",
-  emailEnabled: false,
+  emailEnabled: true,
   gscEnabled: false,
   weeklyReportsEnabled: false,
   sourceCodeUrl: "",
@@ -220,6 +220,9 @@ const apiFixtures = new Map([
   ["/api/user/organizations", [organization]],
   ["/api/auth/organization/list-teams", []],
   ["/api/auth/organization/list-user-teams", []],
+  ["/api/auth/organization/list-invitations", []],
+  ["/api/organizations/qa-org/members", { data: [] }],
+  ["/api/organizations/qa-org/teams", { teams: [] }],
   ["/api/config", configs],
   ["/api/version", { version: "2.9.1" }],
   ["/api/sites/2/is-public", { isPublic: false }],
@@ -269,22 +272,16 @@ const recordServer = (collection, value) => {
   }
   collection.push(value);
 };
-// Native userStore initializes its session at module scope during SSR too.
-// This is an isolated fixture listener, not the application backend.
+// Negative SSR sentinel: never serve session/config fixtures to the Next
+// process. Browser API reads are intercepted below. Any server-side API call
+// is a failure, even if the browser would subsequently recover from it.
 const apiServer = createHttpServer({ maxHeaderSize: 8192, requestTimeout: 2000 }, (request, response) => {
   const path = new URL(request.url, api).pathname;
   recordServer(serverApiCalls, { method: request.method, path });
-  const fixture =
-    request.headers.host === new URL(api).host && request.url.startsWith("/") && apiFixture(request.method, path);
-  if (!fixture) {
-    recordServer(serverUnexpected, { method: request.method, path });
-    request.resume();
-    response.writeHead(404, { "content-type": "application/json" });
-    response.end('{"error":"No synthetic fixture"}');
-    return;
-  }
-  response.writeHead(fixture.status, { ...fixture.headers, "content-type": fixture.contentType });
-  response.end(fixture.body);
+  recordServer(serverUnexpected, { method: request.method, path });
+  request.resume();
+  response.writeHead(503, { "content-type": "application/json" });
+  response.end('{"error":"SSR API is intentionally unavailable"}');
 });
 apiServer.keepAliveTimeout = 1000;
 await new Promise((resolveApi, reject) => {
@@ -333,6 +330,7 @@ const report = {
   browserPlugin: "Browser plugin not available",
   syntheticOnly: true,
   nativePlayer: true,
+  ssrApiUnavailable: true,
   serverApiCalls,
   serverUnexpected,
   cases: [],
@@ -616,6 +614,36 @@ try {
         "4x-real-playback-progress",
         "same-player-and-iframe-retained"
       );
+      await page.screenshot({ path: join(output, `${name}-playback.png`), animations: "disabled" });
+      const peopleResponse = await page.goto(`${app}/settings/organization`, { waitUntil: "networkidle" });
+      assert.equal(peopleResponse.status(), 200);
+      const people = page
+        .locator("section")
+        .filter({ has: page.getByRole("heading", { name: "People", exact: true }) });
+      const createUser = people.getByRole("button", { name: "Create User", exact: true });
+      const invite = people.getByRole("button", { name: "Invite people", exact: true });
+      await createUser.waitFor({ state: "visible" });
+      await invite.waitFor({ state: "visible" });
+      await createUser.scrollIntoViewIfNeeded();
+      for (const control of [people.getByRole("searchbox", { name: "Search people" }), createUser, invite]) {
+        const bounds = await control.boundingBox();
+        assert(
+          bounds && bounds.width > 0 && bounds.x >= 0 && bounds.x + bounds.width <= page.viewportSize().width + 1,
+          "People toolbar controls must fit the viewport with closed signup and mail enabled"
+        );
+      }
+      await page.screenshot({ path: join(output, `${name}-people.png`), animations: "disabled" });
+      for (const [button, title] of [
+        [createUser, "Create a new user"],
+        [invite, "Invite a new member"],
+      ]) {
+        await activate(button);
+        const dialog = page.getByRole("dialog", { name: title, exact: true });
+        await dialog.waitFor({ state: "visible" });
+        await activate(dialog.getByRole("button", { name: "Cancel", exact: true }));
+        await dialog.waitFor({ state: "hidden" });
+      }
+      result.operations.push("closed-signup-mail-ready-both-native-people-dialogs", "people-toolbar-fits-viewport");
       assert.equal(await page.locator("nextjs-portal").filter({ hasText: /error/i }).count(), 0);
       assert.equal(result.documentStatus, 200, "The real replay document must not rely on client recovery from SSR500");
       assert.deepEqual(result.errors, []);
@@ -626,7 +654,6 @@ try {
         "Unknown external requests must fail, not silently pass after stubbing"
       );
       assert(!result.captureOverflow, "Evidence capture must not overflow its bounded arrays");
-      await page.screenshot({ path: join(output, `${name}-playback.png`), animations: "disabled" });
       result.result = "PASS";
       console.log(
         JSON.stringify({ name, result: "PASS", operations: result.operations, blockedExternal: result.blockedExternal })
@@ -663,6 +690,7 @@ try {
     }
   }
   assert.deepEqual(serverUnexpected, []);
+  assert.deepEqual(serverApiCalls, [], "SSR must not depend on the browser API origin");
   assert(!serverCaptureOverflow, "Server fixture evidence must not overflow");
   assert(!serverLogTruncated, "Server logs must remain complete within the evidence cap");
   assert(

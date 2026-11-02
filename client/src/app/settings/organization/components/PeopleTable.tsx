@@ -82,8 +82,11 @@ export function PeopleTable({
   const canEditMember = (member: MemberData) => assignableRoles.some(role => role === member.role);
   // Resending needs a configured transport and the right to give the invited role.
   const { configs } = useConfigs();
+  const canInviteByEmail = IS_CLOUD || !!configs?.emailEnabled;
+  // Mail readiness must not remove local provisioning when public signup is closed or still unknown.
+  const canCreateUser = !IS_CLOUD && (!configs?.emailEnabled || configs.disableSignup !== false);
   const canResend = (invitation: Invitation) =>
-    (IS_CLOUD || !!configs?.emailEnabled) && canManageMembers && assignableRoles.some(role => role === invitation.role);
+    canInviteByEmail && canManageMembers && assignableRoles.some(role => role === invitation.role);
 
   const needle = query.trim().toLowerCase();
   const matches = (...values: (string | null | undefined)[]) =>
@@ -117,21 +120,17 @@ export function PeopleTable({
               className="h-8 text-sm"
             />
           </div>
-          {canManageMembers &&
-            (IS_CLOUD || configs?.emailEnabled ? (
-              <InviteMemberDialog
-                organizationId={organizationId}
-                onSuccess={onRefresh}
-                memberCount={members.length}
-                assignableRoles={assignableRoles}
-              />
-            ) : (
-              <CreateUserDialog
-                organizationId={organizationId}
-                onSuccess={onRefresh}
-                assignableRoles={assignableRoles}
-              />
-            ))}
+          {canManageMembers && canInviteByEmail && (
+            <InviteMemberDialog
+              organizationId={organizationId}
+              onSuccess={onRefresh}
+              memberCount={members.length}
+              assignableRoles={assignableRoles}
+            />
+          )}
+          {canManageMembers && canCreateUser && (
+            <CreateUserDialog organizationId={organizationId} onSuccess={onRefresh} assignableRoles={assignableRoles} />
+          )}
         </>
       }
     >

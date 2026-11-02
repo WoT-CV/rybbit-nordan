@@ -11,4 +11,10 @@ describe("admin observations", () => {
     expect(formatEventCount(0)).toBe("0");
     expect(sumEventCounts([12, 7])).toBe(19);
   });
+  it("renders missing rollup history as unavailable and does not fabricate partial totals", () => {
+    expect(formatEventCount(sumEventCounts([null, null]))).toBe("—");
+    expect(formatEventCount(sumEventCounts([9, null]))).toBe("—");
+    expect(sumEventCounts([0, null])).toBeNull();
+    expect(formatEventCount(sumEventCounts([0, 0]))).toBe("0");
+  });
 });

@@ -76,6 +76,9 @@ export const ReplayRequestCorrelation = memo(function ReplayRequestCorrelation({
             )}
           </DialogDescription>
         </DialogHeader>
+        <p className="text-xs text-muted-foreground">
+          {t("Grafana links use the recording clock. If results are missing, verify the time range in Grafana.")}
+        </p>
         {!authorized ? (
           <p className="text-sm text-muted-foreground">{t("Sign in with replay access to view correlation links.")}</p>
         ) : isLoading ? (

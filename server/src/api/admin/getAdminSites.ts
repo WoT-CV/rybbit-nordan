@@ -128,6 +128,12 @@ export async function getAdminSites(request: FastifyRequest, reply: FastifyReply
     const subscription = site.organizationId
       ? orgSubscriptionMap.get(site.organizationId)
       : { planName: IS_CLOUD ? "free" : "self-hosted", status: IS_CLOUD ? "free" : "active" };
+    // An absent aggregate is not a measured zero: the view may have been
+    // created after the historical events and is deliberately not backfilled.
+    const eventsLast24Hours =
+      eventCountsAvailable && siteEventMap24h.has(site.siteId) ? Number(siteEventMap24h.get(site.siteId)) : null;
+    const eventsLast30Days =
+      eventCountsAvailable && siteEventMap30d.has(site.siteId) ? Number(siteEventMap30d.get(site.siteId)) : null;
 
     return {
       siteId: site.siteId,
@@ -137,9 +143,9 @@ export async function getAdminSites(request: FastifyRequest, reply: FastifyReply
       organizationId: site.organizationId,
       createdAt: site.createdAt,
       public: site.public,
-      eventsLast24Hours: eventCountsAvailable ? Number(siteEventMap24h.get(site.siteId) ?? 0) : null,
-      eventsLast30Days: eventCountsAvailable ? Number(siteEventMap30d.get(site.siteId) ?? 0) : null,
-      eventCountCoverage: eventCountsAvailable ? "NOT_VERIFIED" : "UNAVAILABLE",
+      eventsLast24Hours,
+      eventsLast30Days,
+      eventCountCoverage: eventsLast24Hours === null || eventsLast30Days === null ? "UNAVAILABLE" : "NOT_VERIFIED",
       goalsCount: siteGoalCountMap.get(site.siteId) || 0,
       funnelsCount: siteFunnelCountMap.get(site.siteId) || 0,
       sessionReplay: site.sessionReplay ?? false,

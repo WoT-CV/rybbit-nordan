@@ -2730,5 +2730,6 @@
   "zwhI6a": "此目标无需转化事件代码。Rybbit 会根据用户行为自动追踪。",
   "zxvhnE": "每日",
   "zyLiWQ": "删除开关",
-  "zz0om1": "IP 排除"
+  "zz0om1": "IP 排除",
+  "d6CJqN": "Grafana 链接使用录制时的时钟。如果缺少结果，请检查 Grafana 中的时间范围。"
 }

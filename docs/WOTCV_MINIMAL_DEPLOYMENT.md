@@ -57,6 +57,20 @@ nieoczekiwany external origin podczas syntetycznego smoke. Fizyczny dostęp
 do portów loopback z innego komputera wymaga świadomego tunelu; nie otwierać
 portów na 0.0.0.0 jako obejścia błędnego builda.
 
+Rozdzielenie FE/API obowiązuje również poza przeglądarką: backendowy SERVER_URL
+to adres publicznego API, a BASE_URL to interfejs. BetterAuth, GSC callback oraz
+podpisany unsubscribe używają API; login/consent i dashboard w mailach — FE.
+Jawny błędny SERVER_URL nie może cicho przejść na BASE_URL. Przykład kandydata
+jest rozdzielony, produkcyjny reverse proxy może mieć oba pod jednym originem.
+Client nie pobiera sesji przy SSR: 127.0.0.1:13001 wewnątrz kontenera klienta
+NIE oznacza backend:3001. Smoke wymusza zero takich żądań, odmawiając obsługi
+jakiegokolwiek API z procesu Next; przeglądarka korzysta z osobnych fixtures.
+
+Przy DISABLE_SIGNUP=true email Invite nie tworzy nowemu użytkownikowi ścieżki
+omijającej zakaz rejestracji. People zachowuje Create User również przy gotowej
+poczcie, obok zapraszania istniejących kont. Odbiór konta i maili to oddzielne
+testy; gotowy transport lub widoczny przycisk nie potwierdzają onboardingu.
+
 Natywny server entrypoint i nowy guard mają eol=lf, również w checkout Windows.
 Sprawdzić plik i shebang w gotowym obrazie. Nie testować tego przez uruchomienie
 normalnego entrypointa na produkcyjnych połączeniach.

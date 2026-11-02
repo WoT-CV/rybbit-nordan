@@ -221,9 +221,10 @@ export const sendTrialGraceEmail = async (email: string, props: TrialGraceEmailP
  * marketing link: it has to keep working from old emails.
  */
 export const weeklyReportUnsubscribeUrl = (userId: string): string => {
+  const { weeklyReportsEnabled, apiUrl } = getServiceConfiguration();
+  if (!weeklyReportsEnabled) throw new Error("Weekly report email is not configured");
   const { exp, sig } = signExpiringPayload(`unsubscribe-reports:${userId}`, 2 * 365 * 24 * 3600);
-  if (!getServiceConfiguration().weeklyReportsEnabled) throw new Error("Weekly report email is not configured");
-  return `${getServiceConfiguration().publicUrl}/api/user/unsubscribe-reports-oneclick?userId=${encodeURIComponent(userId)}&exp=${exp}&sig=${sig}`;
+  return `${apiUrl}/api/user/unsubscribe-reports-oneclick?userId=${encodeURIComponent(userId)}&exp=${exp}&sig=${sig}`;
 };
 
 const listUnsubscribeHeaders = (unsubscribeUrl: string) => ({

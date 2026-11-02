@@ -71,6 +71,7 @@ describe("native replay request correlation dialog", () => {
     render(<ReplayRequestCorrelation siteId={7} sessionId="session" events={events} />);
     expect(screen.queryByRole("dialog")).toBeNull();
     open();
+    expect(screen.getByText(/Grafana links use the recording clock/)).not.toBeNull();
     expect(screen.getByText(/\/players\/<img>/).querySelector("img")).toBeNull();
     expect(screen.getByRole("link", { name: "Logs in Grafana" }).getAttribute("rel")).toBe("noopener noreferrer");
     expect(screen.getByRole("link", { name: "Trace in Grafana" }).getAttribute("target")).toBe("_blank");

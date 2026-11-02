@@ -2730,5 +2730,6 @@
   "zwhI6a": "Für dieses Ziel wird kein Konversionsevent-Code benötigt. Rybbit erfasst es automatisch basierend auf dem Nutzerverhalten.",
   "zxvhnE": "Täglich",
   "zyLiWQ": "Flag löschen",
-  "zz0om1": "IP-Ausschlüsse"
+  "zz0om1": "IP-Ausschlüsse",
+  "d6CJqN": "Grafana-Links verwenden die Uhrzeit der Aufzeichnung. Wenn Ergebnisse fehlen, prüfen Sie den Zeitbereich in Grafana."
 }

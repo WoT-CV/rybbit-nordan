@@ -182,8 +182,10 @@ export async function getAdminOrganizations(request: FastifyRequest, reply: Fast
           domain: site.domain,
           type: site.type,
           createdAt: site.createdAt,
-          eventsLast24Hours: eventCountsAvailable ? Number(siteEventMap24h.get(site.siteId) ?? 0) : null,
-          eventsLast30Days: eventCountsAvailable ? Number(siteEventMap30d.get(site.siteId) ?? 0) : null,
+          eventsLast24Hours:
+            eventCountsAvailable && siteEventMap24h.has(site.siteId) ? Number(siteEventMap24h.get(site.siteId)) : null,
+          eventsLast30Days:
+            eventCountsAvailable && siteEventMap30d.has(site.siteId) ? Number(siteEventMap30d.get(site.siteId)) : null,
         });
       }
     }
@@ -194,13 +196,17 @@ export async function getAdminOrganizations(request: FastifyRequest, reply: Fast
     // Build the final response with subscription data
     const enrichedOrganizations: AdminOrganizationData[] = organizationsData.map(org => {
       const subscriptionData = orgSubscriptionMap.get(org.id)!; // Non-null assertion since service always returns data
+      const observedSites = orgSitesMap.get(org.id) || [];
+      const hasMissingCounts =
+        !eventCountsAvailable ||
+        observedSites.some(site => site.eventsLast24Hours === null || site.eventsLast30Days === null);
 
       return {
         id: org.id,
         name: org.name,
         createdAt: org.createdAt,
         monthlyEventCount: IS_CLOUD ? (org.monthlyEventCount ?? 0) : null,
-        eventCountCoverage: eventCountsAvailable ? "NOT_VERIFIED" : "UNAVAILABLE",
+        eventCountCoverage: hasMissingCounts ? "UNAVAILABLE" : "NOT_VERIFIED",
         overMonthlyLimit: IS_CLOUD && (org.overMonthlyLimit || false),
         subscription: subscriptionData,
         planOverride: IS_CLOUD ? org.planOverride : null,
@@ -210,7 +216,7 @@ export async function getAdminOrganizations(request: FastifyRequest, reply: Fast
           IS_CLOUD && org.stripeCustomerId
             ? `https://dashboard.stripe.com/${process.env.STRIPE_SECRET_KEY?.startsWith("sk_live") ? "" : "test/"}customers/${org.stripeCustomerId}`
             : null,
-        sites: orgSitesMap.get(org.id) || [],
+        sites: observedSites,
         members: orgMembersMap.get(org.id) || [],
       };
     });

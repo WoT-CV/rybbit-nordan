@@ -38,6 +38,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { authClient } from "@/lib/auth";
+import { useSignout } from "@/hooks/useSignout";
 import { getTimezone } from "@/lib/store";
 
 // The recipient's side of a site transfer (see server/src/api/sites/siteTransfers.ts):
@@ -93,15 +94,17 @@ function SignInToAccept({ transferId }: { transferId: string }) {
 
 function WrongAccount({ recipientEmail, currentEmail }: { recipientEmail: string; currentEmail: string }) {
   const t = useExtracted();
-  const queryClient = useQueryClient();
+  // Stay on this transfer after signing out so the correct account can accept it.
+  const signout = useSignout(() => window.location.reload());
   const [isSigningOut, setIsSigningOut] = useState(false);
 
   const signOut = async () => {
     setIsSigningOut(true);
-    queryClient.clear();
-    await authClient.signOut();
-    // Back to this page signed out, where the sign-in form returns here.
-    window.location.reload();
+    try {
+      await signout();
+    } finally {
+      setIsSigningOut(false);
+    }
   };
 
   return (

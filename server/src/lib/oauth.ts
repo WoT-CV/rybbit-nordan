@@ -4,12 +4,21 @@ import { createAuthEndpoint, createAuthMiddleware } from "better-auth/api";
 import { jwt } from "better-auth/plugins";
 import { z } from "zod";
 import { ALL_SCOPE_STRINGS, OIDC_STANDARD_SCOPES } from "./scopes.js";
+import { getServiceConfiguration } from "./serviceConfiguration.js";
 
 export function getAuthBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
-  return (env.BASE_URL || env.BETTER_AUTH_URL || "http://localhost:3002")
+  if (env.SERVER_URL !== undefined || env.BASE_URL?.trim()) {
+    const { apiUrl } = getServiceConfiguration(env);
+    if (!apiUrl) throw new Error("SERVER_URL or BASE_URL must be a valid HTTP(S) origin");
+    return apiUrl;
+  }
+  const fallback = (env.BETTER_AUTH_URL || "http://localhost:3002")
     .trim()
     .replace(/\/+$/, "")
     .replace(/\/api\/auth$/, "");
+  const { apiUrl } = getServiceConfiguration({ BASE_URL: fallback });
+  if (!apiUrl) throw new Error("BETTER_AUTH_URL must be a valid HTTP(S) origin");
+  return apiUrl;
 }
 
 function hasNonHttpsRedirectUri(redirectUris: unknown): boolean {
@@ -25,7 +34,7 @@ function hasNonHttpsRedirectUri(redirectUris: unknown): boolean {
   });
 }
 
-export function createOAuthPlugins(baseUrl: string) {
+export function createOAuthPlugins(baseUrl: string, frontendUrl = baseUrl) {
   const resource = `${baseUrl}/api/mcp`;
   const url = new URL(baseUrl);
   const supportsOAuth =
@@ -33,8 +42,8 @@ export function createOAuthPlugins(baseUrl: string) {
     (url.protocol === "http:" &&
       (url.hostname === "localhost" || url.hostname === "[::1]" || /^127\./.test(url.hostname)));
   const options = {
-    loginPage: `${baseUrl}/login`,
-    consentPage: `${baseUrl}/auth/consent`,
+    loginPage: `${frontendUrl}/login`,
+    consentPage: `${frontendUrl}/auth/consent`,
     resource,
     resources: [resource],
     // Separate stores let the migration preserve 1.6 tokens and consent for

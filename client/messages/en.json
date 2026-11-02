@@ -2730,5 +2730,6 @@
   "zwhI6a": "No conversion event code is needed for this goal. Rybbit tracks it automatically based on user behavior.",
   "zxvhnE": "Daily",
   "zyLiWQ": "Delete flag",
-  "zz0om1": "IP Exclusions"
+  "zz0om1": "IP Exclusions",
+  "d6CJqN": "Grafana links use the recording clock. If results are missing, verify the time range in Grafana."
 }

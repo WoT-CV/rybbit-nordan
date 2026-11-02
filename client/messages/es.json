@@ -2730,5 +2730,6 @@
   "zwhI6a": "No se necesita código de evento de conversión para este objetivo. Rybbit lo rastrea automáticamente según el comportamiento del usuario.",
   "zxvhnE": "Diariamente",
   "zyLiWQ": "Eliminar bandera",
-  "zz0om1": "Exclusiones de IP"
+  "zz0om1": "Exclusiones de IP",
+  "d6CJqN": "Los enlaces a Grafana usan el reloj de la grabación. Si faltan resultados, comprueba el intervalo de tiempo en Grafana."
 }

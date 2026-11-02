@@ -138,6 +138,167 @@ describe("replay-owned response metadata observer", () => {
     expect(emit).not.toHaveBeenCalled();
   });
 
+  it("preserves native URL conversion counts and skips overridden URL inputs", async () => {
+    const input = new URL(`${ORIGIN}/initial`);
+    const stringify = vi.fn(() => `${ORIGIN}/conversion-${stringify.mock.calls.length}`);
+    input.toString = stringify;
+    original.mockImplementation(async input => response(String(input)));
+    const baseline = await window.fetch(input);
+    expect(baseline.url).toBe(`${ORIGIN}/conversion-1`);
+    stringify.mockClear();
+    observer.start();
+    const instrumented = await window.fetch(input);
+    expect(instrumented.url).toBe(baseline.url);
+    expect(stringify).toHaveBeenCalledOnce();
+    expect(emit).not.toHaveBeenCalled();
+  });
+
+  it("does not let post-consumption init reflection change the native wire URL or method", async () => {
+    const wires: Array<{ url: string; method: string }> = [];
+    original.mockImplementation(async (input, init) => {
+      const wire = { url: String(input), method: init.method };
+      wires.push(wire);
+      return response(wire.url);
+    });
+    const run = async () => {
+      const input = new URL(`${ORIGIN}/initial`);
+      const target = { method: "POST" };
+      const init = new Proxy(target, {
+        getOwnPropertyDescriptor(object, key) {
+          target.method = "DELETE";
+          input.pathname = "/mutated";
+          return Reflect.getOwnPropertyDescriptor(object, key);
+        },
+      });
+      return window.fetch(input, init);
+    };
+    await run();
+    observer.start();
+    await run();
+    expect(wires).toEqual([
+      { url: `${ORIGIN}/initial`, method: "POST" },
+      { url: `${ORIGIN}/initial`, method: "POST" },
+    ]);
+    expect(emit).not.toHaveBeenCalled();
+  });
+
+  it("skips inherited method accessors without evaluating them in addition to native fetch", async () => {
+    const method = vi.fn(() => "POST");
+    const previous = Object.getOwnPropertyDescriptor(Object.prototype, "method");
+    Object.defineProperty(Object.prototype, "method", { configurable: true, get: method });
+    original.mockImplementation(async (_input, init) => {
+      void init.method;
+      return response();
+    });
+    try {
+      observer.start();
+      await window.fetch(`${ORIGIN}/players`, {});
+    } finally {
+      if (previous) Object.defineProperty(Object.prototype, "method", previous);
+      else Reflect.deleteProperty(Object.prototype, "method");
+    }
+    expect(method).toHaveBeenCalledOnce();
+    expect(emit).not.toHaveBeenCalled();
+  });
+
+  it("captures an ordinary inherited data method from the native plain prototype chain", async () => {
+    const previous = Object.getOwnPropertyDescriptor(Object.prototype, "method");
+    Object.defineProperty(Object.prototype, "method", { configurable: true, writable: true, value: "POST" });
+    try {
+      observer.start();
+      await window.fetch(`${ORIGIN}/players`, {});
+    } finally {
+      if (previous) Object.defineProperty(Object.prototype, "method", previous);
+      else Reflect.deleteProperty(Object.prototype, "method");
+    }
+    expect(emit.mock.calls[0][0].data.payload.method).toBe("POST");
+  });
+
+  it("never reads an overridden URL href getter or Request fields", async () => {
+    const href = vi.fn(() => `${ORIGIN}/wrong`);
+    const url = vi.fn(() => `${ORIGIN}/wrong`);
+    const method = vi.fn(() => "DELETE");
+    const inputUrl = new URL(`${ORIGIN}/url`);
+    Object.defineProperty(inputUrl, "href", { get: href });
+    const inputRequest = new Request(`${ORIGIN}/request`, { method: "POST" });
+    Object.defineProperties(inputRequest, { url: { get: url }, method: { get: method } });
+    const nativeUrl = Object.getOwnPropertyDescriptor(Request.prototype, "url")!.get!;
+    original.mockImplementation(async input =>
+      response(input instanceof Request ? nativeUrl.call(input) : String(input))
+    );
+    observer.start();
+    expect((await window.fetch(inputUrl)).url).toBe(`${ORIGIN}/url`);
+    expect((await window.fetch(inputRequest)).url).toBe(`${ORIGIN}/request`);
+    expect(href).not.toHaveBeenCalled();
+    expect(url).not.toHaveBeenCalled();
+    expect(method).not.toHaveBeenCalled();
+    expect(emit).not.toHaveBeenCalled();
+  });
+
+  it("still captures ordinary primitive, URL and Request inputs with native request methods", async () => {
+    const nativeUrl = Object.getOwnPropertyDescriptor(Request.prototype, "url")!.get!;
+    original.mockImplementation(async input =>
+      response(input instanceof Request ? nativeUrl.call(input) : String(input))
+    );
+    observer.start();
+    await window.fetch(`${ORIGIN}/string`);
+    await window.fetch(new URL(`${ORIGIN}/url`));
+    await window.fetch(new Request(`${ORIGIN}/request`, { method: "POST" }));
+    expect(emit.mock.calls.map(([event]) => [event.data.payload.pathname, event.data.payload.method])).toEqual([
+      ["/string", "GET"],
+      ["/url", "GET"],
+      ["/request", "POST"],
+    ]);
+  });
+
+  it("freezes XHR URL metadata at open without another native conversion at send", () => {
+    vi.spyOn(FakeXHR.prototype, "open").mockImplementation(function (this: FakeXHR, ...args: unknown[]) {
+      this.openArguments = args;
+      this.responseURL = new URL(String(args[1]), window.location.href).href;
+      this.sent = false;
+    });
+    observer.start();
+    const input = new URL(`${ORIGIN}/initial`);
+    const xhr = new XMLHttpRequest() as unknown as FakeXHR;
+    xhr.open("GET", input);
+    input.pathname = "/mutated";
+    xhr.send();
+    xhr.dispatchEvent(new Event("load"));
+    expect(xhr.responseURL).toBe(`${ORIGIN}/initial`);
+    expect(emit.mock.calls[0][0].data.payload.pathname).toBe("/initial");
+    const stringify = vi.fn(() => `${ORIGIN}/conversion-${stringify.mock.calls.length}`);
+    input.toString = stringify;
+    xhr.open("GET", input);
+    xhr.send();
+    xhr.dispatchEvent(new Event("load"));
+    expect(stringify).toHaveBeenCalledOnce();
+    expect(xhr.responseURL).toBe(`${ORIGIN}/conversion-1`);
+    expect(emit).toHaveBeenCalledOnce();
+  });
+
+  it("resolves relative fetch and XHR inputs against the document base, freezing XHR at open", async () => {
+    const base = document.createElement("base");
+    base.href = `${ORIGIN}/v1/`;
+    document.head.appendChild(base);
+    original.mockImplementation(async input => response(new URL(String(input), document.baseURI).href));
+    vi.spyOn(FakeXHR.prototype, "open").mockImplementation(function (this: FakeXHR, ...args: unknown[]) {
+      this.responseURL = new URL(String(args[1]), document.baseURI).href;
+      this.sent = false;
+    });
+    try {
+      observer.start();
+      await window.fetch("players");
+      const xhr = new XMLHttpRequest();
+      xhr.open("GET", "players");
+      base.href = `${ORIGIN}/changed/`;
+      xhr.send();
+      xhr.dispatchEvent(new Event("load"));
+      expect(emit.mock.calls.map(([event]) => event.data.payload.pathname)).toEqual(["/v1/players", "/v1/players"]);
+    } finally {
+      base.remove();
+    }
+  });
+
   it("ignores unknown origins, own tracking and cross-origin redirects even when both origins are configured", async () => {
     observer.stop();
     observer = new RequestCorrelationObserver(

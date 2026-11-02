@@ -55,6 +55,13 @@ skonfigurowanego tempoDatasourceUid.
   pending/rows i nadal podlega natywnym ograniczeniom ingest/storage.
   Nie jest kompletnym HAR ani dowodem, że wszystkie żądania zostały zapisane.
 
+Zwykłe string/URL/Request i plain-data RequestInit są obsługiwane bez dodatkowej
+konwersji URL ani odczytu getterów metody. Nietypowe/przedefiniowane wejścia są
+pomijane konserwatywnie. Dowolny dynamiczny Proxy RequestInit może sfałszować
+deskryptory po zużyciu przez natywny fetch; metadane są best-effort, nie
+autorytatywnym audytem HTTP. Refleksja init następuje dopiero po natywnym
+wywołaniu, aby nie zmieniać wysyłanego żądania. Źródłem prawdy pozostaje backend.
+
 ## Co oznaczają brakujące odnośniki
 
 Brak correlationId/traceId nie oznacza pustego body ani sukcesu logowania.
@@ -65,7 +72,14 @@ tego custom eventu. UI nie dopisuje brakujących ID z innych żądań.
 Loki otrzymuje dokładny selector service/env i correlation filter, a Tempo
 trace ID. Zakres czasu wyliczany jest z poprawionego przez natywny replay
 timestampu zakończenia minus durationMs, z ograniczonym padding. To obejście
-typowego clock skew, nie gwarancja zgodności zegarów i retencji.
+skrajnego clock skew, nie gwarancja zgodności zegarów i retencji. Natywna
+korekta nie usuwa mniejszych przesunięć: np. zegar przeglądarki +10 minut
+pozostaje przesunięty i przy padding 120 sekund odnośnik Loki może nie znaleźć
+istniejącego wpisu. Panel jawnie informuje o zegarze nagrania. W takim przypadku
+trzeba skorygować zakres w Grafanie i użyć widocznego correlation/trace ID;
+brak wyników NIE jest dowodem braku logu/body. Nie zwiększamy automatycznie
+padding, nie zmieniamy natywnej osi czasu ani nie obiecujemy kompletności
+historycznych nagrań. Odbiór obejmuje poprawne zegary i taki negatywny scenariusz.
 Równoległe żądania z tym samym correlation ID pozostają osobnymi wierszami.
 
 ## Odbiór przed produkcją
@@ -112,3 +126,34 @@ a pending request nadal opisuje API i jego faktyczny czas zakończenia, nie
 stronę inicjującą. Zmiana użytkownika lub granicy sesji/full snapshot
 unieważnia stare completion. Przy redirect do innego originu capture pomija
 żądanie nawet wtedy, gdy oba origins są dozwolone — nie zgaduje usługi ID.
+
+## Dopasowanie do istniejącej instalacji WoT-CV — audyt 2026-11-02
+
+Read-only odczyt czystej funkcji konfiguracji działającego starego backendu
+potwierdził poniższe niesekretne wartości. Nowa nazwa env to
+`WOTCV_REPLAY_CORRELATION_JSON`; stary `WOTCV_REPLAY_OBSERVABILITY_PROFILES`
+nie jest automatycznie interpretowany. Bez nowego env mostek pozostaje wyłączony.
+Do przygotowania przyszłej, zatwierdzonej konfiguracji (NIE polecenie dla prod):
+
+```json
+[
+  {
+    "siteIds": [2],
+    "requestOrigin": "https://api.wot-cv.com",
+    "grafanaUrl": "https://dashboard.wot-cv.com",
+    "orgId": 1,
+    "lokiDatasourceUid": "bet3mn133whkwd",
+    "tempoDatasourceUid": "df0rqhtz9e3uoa",
+    "serviceName": "wot-cv-be-prod",
+    "environment": "prod",
+    "timePaddingMs": 120000
+  }
+]
+```
+
+Nie kopiować site2 do pustej bazy bez sprawdzenia jej rzeczywistego siteId.
+Profile nie są danymi logowania ani przyznaniem dostępu do Grafany. Audyt
+potwierdził publiczne health Grafany i rzeczywiste logi/trace dla kontrolnego
+GET oraz CORS, ale datasource API bez zalogowania odmawia401. Końcowy odbiór
+obejmuje zalogowane konto, jego org/datasource permissions, link z prawdziwego
+nowego replay i retencję. Nie stosowano root bypass do odczytu provisioningu.

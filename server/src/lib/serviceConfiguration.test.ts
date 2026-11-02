@@ -11,6 +11,55 @@ const configured = {
 };
 
 describe("service readiness", () => {
+  it("separates candidate frontend and API origins for callbacks and auth links", () => {
+    expect(
+      getServiceConfiguration(
+        { ...configured, BASE_URL: "http://127.0.0.1:13002/", SERVER_URL: "http://127.0.0.1:13001/" },
+        false
+      )
+    ).toMatchObject({
+      publicUrl: "http://127.0.0.1:13002",
+      apiUrl: "http://127.0.0.1:13001",
+      gscRedirectUri: "http://127.0.0.1:13001/api/gsc/callback",
+      emailEnabled: true,
+      weeklyReportsEnabled: true,
+      gscEnabled: true,
+    });
+  });
+  it("preserves the same-origin cloud and self-hosted fallback when SERVER_URL is absent", () => {
+    for (const cloud of [true, false])
+      expect(getServiceConfiguration(configured, cloud)).toMatchObject({
+        publicUrl: configured.BASE_URL,
+        apiUrl: configured.BASE_URL,
+        gscRedirectUri: `${configured.BASE_URL}/api/gsc/callback`,
+        emailEnabled: true,
+      });
+  });
+  it.each([
+    "",
+    " ",
+    "file:///tmp",
+    "https://api.example.com/path",
+    "https://user:secret@api.example.com",
+    "https://api.example.com/?query=1",
+    "https://api.example.com/#fragment",
+  ])("invalid explicit API origin fails all callback-dependent readiness closed: %s", SERVER_URL => {
+    const result = getServiceConfiguration({ ...configured, SERVER_URL }, false);
+    expect(result).toMatchObject({
+      publicUrl: configured.BASE_URL,
+      apiUrl: "",
+      gscRedirectUri: "",
+      emailEnabled: false,
+      weeklyReportsEnabled: false,
+      gscEnabled: false,
+    });
+    expect(
+      getServiceConfiguration(
+        { ...configured, SERVER_URL, GOOGLE_REDIRECT_URI: "https://api.example.com/api/gsc/callback" },
+        false
+      ).gscEnabled
+    ).toBe(false);
+  });
   it("preserves the exact path slash of an explicitly registered OAuth callback", () => {
     const redirect = "https://analytics.example.com/api/gsc/callback/";
     expect(getServiceConfiguration({ ...configured, GOOGLE_REDIRECT_URI: redirect }, false).gscRedirectUri).toBe(

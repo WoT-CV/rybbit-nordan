@@ -16,7 +16,15 @@ const mocks = vi.hoisted(() => ({
   createOrganization: vi.fn(),
   setActive: vi.fn(),
   signOut: vi.fn(),
+  signoutCallback: undefined as (() => void) | undefined,
   sendVerificationEmail: vi.fn(async () => ({ error: null })),
+}));
+
+vi.mock("@/hooks/useSignout", () => ({
+  useSignout: (onSuccess: () => void) => {
+    mocks.signoutCallback = onSuccess;
+    return mocks.signOut;
+  },
 }));
 
 vi.mock("next-intl", () => ({
@@ -92,6 +100,30 @@ afterEach(() => {
 });
 
 describe("site transfer page", () => {
+  it("uses confirmed logout and releases the transfer button after a failed attempt", async () => {
+    mocks.incoming = {
+      data: undefined,
+      error: new ApiError("Wrong account", 403, { reason: "wrong_account", recipientEmailHint: "g••@example.com" }),
+      isLoading: false,
+    };
+    let finish!: (success: boolean) => void;
+    mocks.signOut.mockReturnValue(
+      new Promise<boolean>(resolve => {
+        finish = resolve;
+      })
+    );
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    expect(mocks.signOut).toHaveBeenCalledOnce();
+    expect(typeof mocks.signoutCallback).toBe("function");
+    expect(screen.getByRole("button", { name: "Signing out..." }).getAttribute("aria-busy")).toBe("true");
+    finish(false);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Sign out" }).getAttribute("aria-busy")).not.toBe("true")
+    );
+    expect(screen.getByText("Signed in as ada@example.com")).not.toBeNull();
+    expect(mocks.push).not.toHaveBeenCalled();
+  });
   it("asks a signed-out visitor to sign in, then brings them back to the link", () => {
     mocks.session = { data: null, isPending: false };
     renderPage();

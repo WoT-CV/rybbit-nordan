@@ -541,6 +541,46 @@
   var MAX_PENDING = 64;
   var MAX_ROWS = 2e3;
   var OWNER = Symbol.for("wotcv/request-correlation-owner");
+  var urlPrototype = URL.prototype;
+  var urlHref = Object.getOwnPropertyDescriptor(urlPrototype, "href")?.get;
+  var urlToString = Object.getOwnPropertyDescriptor(urlPrototype, "toString")?.value;
+  var requestPrototype = typeof Request === "undefined" ? void 0 : Request.prototype;
+  var requestUrl = requestPrototype && Object.getOwnPropertyDescriptor(requestPrototype, "url")?.get;
+  var requestMethod = requestPrototype && Object.getOwnPropertyDescriptor(requestPrototype, "method")?.get;
+  function safeUrl(input) {
+    if (typeof input === "string") return input;
+    try {
+      const href = urlHref?.call(input);
+      if (typeof href !== "string" || Object.getPrototypeOf(input) !== urlPrototype || Object.getPrototypeOf(urlPrototype) !== Object.prototype || Object.getOwnPropertyDescriptor(urlPrototype, "href")?.get !== urlHref || Object.getOwnPropertyDescriptor(urlPrototype, "toString")?.value !== urlToString || ["href", "toString", "valueOf", Symbol.toPrimitive].some((key) => Object.getOwnPropertyDescriptor(input, key)) || Object.getOwnPropertyDescriptor(urlPrototype, Symbol.toPrimitive) || Object.getOwnPropertyDescriptor(Object.prototype, Symbol.toPrimitive))
+        return;
+      return href;
+    } catch {
+      return;
+    }
+  }
+  function safeInput(input) {
+    const url = safeUrl(input);
+    if (url !== void 0) return { input: url, method: "GET" };
+    try {
+      const url2 = requestUrl?.call(input);
+      const method = requestMethod?.call(input);
+      if (typeof url2 !== "string" || typeof method !== "string" || Object.getPrototypeOf(input) !== requestPrototype || Object.getOwnPropertyDescriptor(requestPrototype, "url")?.get !== requestUrl || Object.getOwnPropertyDescriptor(requestPrototype, "method")?.get !== requestMethod || ["url", "method", "toString", Symbol.toPrimitive].some((key) => Object.getOwnPropertyDescriptor(input, key)))
+        return;
+      return { input: url2, method };
+    } catch {
+      return;
+    }
+  }
+  function initMethod(init, fallback) {
+    if (init == null) return fallback;
+    const prototype = Object.getPrototypeOf(init);
+    if (prototype !== Object.prototype && prototype !== null) return;
+    const own = Object.getOwnPropertyDescriptor(init, "method");
+    const descriptor = own ?? (prototype === Object.prototype ? Object.getOwnPropertyDescriptor(Object.prototype, "method") : void 0);
+    if (descriptor && !("value" in descriptor)) return;
+    const method = descriptor?.value;
+    return method === void 0 ? fallback : typeof method === "string" ? method : void 0;
+  }
   var RequestCorrelationObserver = class {
     constructor(origins, analyticsHost, emit) {
       this.emit = emit;
@@ -561,7 +601,7 @@
         })
       );
       try {
-        this.analyticsUrl = new URL(analyticsHost, window.location.href);
+        this.analyticsUrl = new URL(analyticsHost, document.baseURI);
       } catch {
       }
     }
@@ -573,11 +613,11 @@
         (path) => path.endsWith("/") ? url.pathname.startsWith(`${prefix}${path}`) : url.pathname === `${prefix}${path}`
       );
     }
-    begin(input, method, epoch) {
+    begin(input, method, epoch, started = performance.now()) {
       if (!this.running || epoch !== this.epoch || this.pending.size >= MAX_PENDING || this.rows >= MAX_ROWS) return;
       try {
-        if (typeof input !== "string" && !(input instanceof URL)) return;
-        const url = new URL(input, window.location.href);
+        if (typeof input !== "string") return;
+        const url = new URL(input, document.baseURI);
         if (!this.origins.has(url.origin) || url.username || url.password || this.ownTransport(url)) return;
         if (typeof method !== "string") return;
         const normalizedMethod = method.toUpperCase();
@@ -585,7 +625,7 @@
         if (url.pathname.length > 2048) return;
         url.search = "";
         url.hash = "";
-        const request = { url, method: normalizedMethod, started: performance.now(), epoch };
+        const request = { url, method: normalizedMethod, started, epoch };
         this.pending.add(request);
         return request;
       } catch {
@@ -648,28 +688,25 @@
       const originalSend = prototype?.send;
       const observer = this;
       const wrappedFetch = function(...args) {
-        let pending;
+        if (!observer.running || epoch !== observer.epoch || observer.rows >= MAX_ROWS || observer.pending.size >= MAX_PENDING)
+          return Reflect.apply(originalFetch, this, args);
+        const started = performance.now();
+        let input;
         try {
-          const input = args[0];
-          const isRequest = typeof Request !== "undefined" && input instanceof Request;
-          const init = args[1];
-          const descriptor = init && Object.getOwnPropertyDescriptor(init, "method");
-          const plain = !init || Object.getPrototypeOf(init) === Object.prototype || Object.getPrototypeOf(init) === null;
-          if (plain && (!descriptor || "value" in descriptor)) {
-            pending = observer.begin(
-              isRequest ? input.url : input,
-              descriptor?.value === void 0 ? isRequest ? input.method : "GET" : descriptor.value,
-              epoch
-            );
-          }
+          const metadata = safeInput(args[0]);
+          if (metadata) input = { ...metadata, input: new URL(metadata.input, document.baseURI).href };
         } catch {
         }
-        let promise;
+        const promise = Reflect.apply(originalFetch, this, args);
+        let pending;
         try {
-          promise = Reflect.apply(originalFetch, this, args);
-        } catch (error) {
-          if (pending) observer.finish(pending, "fetch", "network-error");
-          throw error;
+          if (input) {
+            const method = initMethod(args[1], input.method);
+            const current = safeInput(args[0]);
+            if (method !== void 0 && current && current.method === input.method && new URL(current.input, document.baseURI).href === input.input)
+              pending = observer.begin(input.input, method, epoch, started);
+          }
+        } catch {
         }
         if (pending) {
           const request = pending;
@@ -727,8 +764,19 @@
           }
         }
         states.delete(this);
+        let metadata;
+        try {
+          const input = safeUrl(args[1]);
+          if (input !== void 0 && typeof args[0] === "string") {
+            const url = new URL(input, document.baseURI);
+            url.search = "";
+            url.hash = "";
+            metadata = { method: args[0], input: url.href };
+          }
+        } catch {
+        }
         const result = Reflect.apply(originalOpen, this, args);
-        if (observer.running && epoch === observer.epoch) states.set(this, { method: args[0], input: args[1] });
+        if (observer.running && epoch === observer.epoch && metadata) states.set(this, metadata);
         return result;
       };
       const wrappedSend = function(...args) {

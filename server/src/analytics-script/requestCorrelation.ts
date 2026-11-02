@@ -11,6 +11,73 @@ const MAX_PENDING = 64;
 const MAX_ROWS = 2000;
 const OWNER = Symbol.for("wotcv/request-correlation-owner");
 type Pending = { url: URL; method: string; started: number; epoch: number; cancel?: () => void };
+type InputMetadata = { input: string; method: string };
+
+const urlPrototype = URL.prototype;
+const urlHref = Object.getOwnPropertyDescriptor(urlPrototype, "href")?.get;
+const urlToString = Object.getOwnPropertyDescriptor(urlPrototype, "toString")?.value;
+const requestPrototype = typeof Request === "undefined" ? undefined : Request.prototype;
+const requestUrl = requestPrototype && Object.getOwnPropertyDescriptor(requestPrototype, "url")?.get;
+const requestMethod = requestPrototype && Object.getOwnPropertyDescriptor(requestPrototype, "method")?.get;
+
+// Never stringify an object in addition to native fetch/open. Brand getters
+// reject proxies without invoking their property traps; exact prototypes and
+// own descriptors conservatively exclude overridden/subclass/cross-realm inputs.
+function safeUrl(input: unknown): string | undefined {
+  if (typeof input === "string") return input;
+  try {
+    const href = urlHref?.call(input);
+    if (
+      typeof href !== "string" ||
+      Object.getPrototypeOf(input) !== urlPrototype ||
+      Object.getPrototypeOf(urlPrototype) !== Object.prototype ||
+      Object.getOwnPropertyDescriptor(urlPrototype, "href")?.get !== urlHref ||
+      Object.getOwnPropertyDescriptor(urlPrototype, "toString")?.value !== urlToString ||
+      ["href", "toString", "valueOf", Symbol.toPrimitive].some(key => Object.getOwnPropertyDescriptor(input, key)) ||
+      Object.getOwnPropertyDescriptor(urlPrototype, Symbol.toPrimitive) ||
+      Object.getOwnPropertyDescriptor(Object.prototype, Symbol.toPrimitive)
+    )
+      return;
+    return href;
+  } catch {
+    return;
+  }
+}
+
+function safeInput(input: unknown): InputMetadata | undefined {
+  const url = safeUrl(input);
+  if (url !== undefined) return { input: url, method: "GET" };
+  try {
+    const url = requestUrl?.call(input);
+    const method = requestMethod?.call(input);
+    if (
+      typeof url !== "string" ||
+      typeof method !== "string" ||
+      Object.getPrototypeOf(input) !== requestPrototype ||
+      Object.getOwnPropertyDescriptor(requestPrototype!, "url")?.get !== requestUrl ||
+      Object.getOwnPropertyDescriptor(requestPrototype!, "method")?.get !== requestMethod ||
+      ["url", "method", "toString", Symbol.toPrimitive].some(key => Object.getOwnPropertyDescriptor(input, key))
+    )
+      return;
+    return { input: url, method };
+  } catch {
+    return;
+  }
+}
+
+// Best effort for ordinary plain data init objects only. A dynamic proxy can
+// forge post-consumption descriptors, so this is not authoritative wire metadata.
+function initMethod(init: RequestInit | undefined, fallback: string): string | undefined {
+  if (init == null) return fallback;
+  const prototype = Object.getPrototypeOf(init);
+  if (prototype !== Object.prototype && prototype !== null) return;
+  const own = Object.getOwnPropertyDescriptor(init, "method");
+  const descriptor =
+    own ?? (prototype === Object.prototype ? Object.getOwnPropertyDescriptor(Object.prototype, "method") : undefined);
+  if (descriptor && !("value" in descriptor)) return;
+  const method = descriptor?.value;
+  return method === undefined ? fallback : typeof method === "string" ? method : undefined;
+}
 
 /** Read-only response metadata observer, owned by one active replay recorder. */
 export class RequestCorrelationObserver {
@@ -42,7 +109,7 @@ export class RequestCorrelationObserver {
       })
     );
     try {
-      this.analyticsUrl = new URL(analyticsHost, window.location.href);
+      this.analyticsUrl = new URL(analyticsHost, document.baseURI);
     } catch {
       /* No valid transport URL. */
     }
@@ -57,11 +124,11 @@ export class RequestCorrelationObserver {
     );
   }
 
-  private begin(input: unknown, method: unknown, epoch: number): Pending | undefined {
+  private begin(input: unknown, method: unknown, epoch: number, started = performance.now()): Pending | undefined {
     if (!this.running || epoch !== this.epoch || this.pending.size >= MAX_PENDING || this.rows >= MAX_ROWS) return;
     try {
-      if (typeof input !== "string" && !(input instanceof URL)) return;
-      const url = new URL(input, window.location.href);
+      if (typeof input !== "string") return;
+      const url = new URL(input, document.baseURI);
       if (!this.origins.has(url.origin) || url.username || url.password || this.ownTransport(url)) return;
       if (typeof method !== "string") return;
       const normalizedMethod = method.toUpperCase();
@@ -69,7 +136,7 @@ export class RequestCorrelationObserver {
       if (url.pathname.length > 2048) return;
       url.search = "";
       url.hash = "";
-      const request = { url, method: normalizedMethod, started: performance.now(), epoch };
+      const request = { url, method: normalizedMethod, started, epoch };
       this.pending.add(request);
       return request;
     } catch {
@@ -150,31 +217,41 @@ export class RequestCorrelationObserver {
     const originalSend = prototype?.send;
     const observer = this;
     const wrappedFetch: typeof fetch = function (this: unknown, ...args: Parameters<typeof fetch>) {
+      if (
+        !observer.running ||
+        epoch !== observer.epoch ||
+        observer.rows >= MAX_ROWS ||
+        observer.pending.size >= MAX_PENDING
+      )
+        return Reflect.apply(originalFetch, this, args);
+      const started = performance.now();
+      let input: InputMetadata | undefined;
+      try {
+        const metadata = safeInput(args[0]);
+        if (metadata) input = { ...metadata, input: new URL(metadata.input, document.baseURI).href };
+      } catch {
+        /* Only trusted intrinsic input metadata is read before native fetch. */
+      }
+      // RequestInit reflection can execute proxy traps. It must happen only
+      // AFTER native fetch has consumed the original URL/init, never before.
+      const promise: ReturnType<typeof fetch> = Reflect.apply(originalFetch, this, args);
       let pending: Pending | undefined;
       try {
-        const input = args[0];
-        const isRequest = typeof Request !== "undefined" && input instanceof Request;
-        const init = args[1];
-        // Reading an accessor twice could change the native request. Only
-        // observe a plain init's data property; never inspect headers/body.
-        const descriptor = init && Object.getOwnPropertyDescriptor(init, "method");
-        const plain = !init || Object.getPrototypeOf(init) === Object.prototype || Object.getPrototypeOf(init) === null;
-        if (plain && (!descriptor || "value" in descriptor)) {
-          pending = observer.begin(
-            isRequest ? input.url : input,
-            descriptor?.value === undefined ? (isRequest ? input.method : "GET") : descriptor.value,
-            epoch
-          );
+        if (input) {
+          const method = initMethod(args[1], input.method);
+          const current = safeInput(args[0]);
+          if (
+            method !== undefined &&
+            current &&
+            current.method === input.method &&
+            new URL(current.input, document.baseURI).href === input.input
+          )
+            pending = observer.begin(input.input, method, epoch, started);
         }
       } catch {
-        /* Ignore unusual request descriptors. */
-      }
-      let promise: ReturnType<typeof fetch>;
-      try {
-        promise = Reflect.apply(originalFetch, this, args);
-      } catch (error) {
-        if (pending) observer.finish(pending, "fetch", "network-error");
-        throw error;
+        /* Dynamic/proxy init metadata is unsupported and never authoritative.
+           Skip accessors, foreign prototype chains and visibly mutated inputs;
+           post-consumption descriptors cannot prove arbitrary proxy behavior. */
       }
       if (pending) {
         const request = pending;
@@ -230,8 +307,22 @@ export class RequestCorrelationObserver {
         }
       }
       states.delete(this);
+      let metadata: InputMetadata | undefined;
+      try {
+        const input = safeUrl(args[1]);
+        if (input !== undefined && typeof args[0] === "string") {
+          const url = new URL(input, document.baseURI);
+          url.search = "";
+          url.hash = "";
+          metadata = { method: args[0], input: url.href };
+        }
+      } catch {
+        /* Optional metadata must not change native open errors. */
+      }
       const result = Reflect.apply(originalOpen!, this, args);
-      if (observer.running && epoch === observer.epoch) states.set(this, { method: args[0], input: args[1] });
+      // Freeze safe URL metadata at open rather than retaining a mutable URL
+      // until send. The native call above still receives the original arguments.
+      if (observer.running && epoch === observer.epoch && metadata) states.set(this, metadata);
       return result;
     } as XMLHttpRequest["open"];
     const wrappedSend = function (this: XMLHttpRequest, ...args: Parameters<XMLHttpRequest["send"]>) {

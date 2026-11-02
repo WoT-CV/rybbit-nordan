@@ -10,13 +10,26 @@ export const userStore = create<{
 }>(set => ({
   user: null,
   isPending: true,
-  setSession: user => set({ user }),
+  setSession: user => set({ user, isPending: false }),
   setIsPending: isPending => set({ isPending }),
 }));
 
-authClient.getSession().then(({ data: session }) => {
-  userStore.setState({
-    user: session?.user,
-    isPending: false,
-  });
-});
+// This module is also evaluated by Next during SSR. A browser session must not
+// be fetched into a process-wide server store (or through a browser-only URL).
+if (typeof window !== "undefined") {
+  const initialState = userStore.getState();
+  const finishBootstrap = (user: User | null) => {
+    // A login/logout or other explicit session update wins over this older read.
+    if (userStore.getState() === initialState) {
+      userStore.setState({ user, isPending: false });
+    } else if (userStore.getState().isPending) {
+      // Native login/signup paths may write only `user`. Complete this initial
+      // read without replacing their more recent identity.
+      userStore.setState({ isPending: false });
+    }
+  };
+  void Promise.resolve()
+    .then(() => authClient.getSession())
+    .then(({ data: session }) => finishBootstrap(session?.user ?? null))
+    .catch(() => finishBootstrap(null));
+}
