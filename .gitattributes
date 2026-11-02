@@ -1,2 +1,3 @@
 ops/minimal/*.sh text eol=lf
 server/docker-entrypoint.sh text eol=lf
+scripts/wotcv-branch-build-deploy.sh text eol=lf

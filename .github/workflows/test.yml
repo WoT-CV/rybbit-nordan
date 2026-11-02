@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - master
-      - feat/wotcv-minimal-*
+      - feat/wotcv
   pull_request:
     branches:
       - master
