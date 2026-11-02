@@ -649,3 +649,79 @@ czteroprzeglądarkowy smoke z widocznymi linkami mieszczącymi się w mobile.
 - Fizyczny iPhone, live Grafana/retencja/CORS, real SQL query-user provisioning,
   mail delivery/GSC, Nginx/CDN, obrazy/provenance i przejście danych pozostają
   osobnymi release gates. Fixture/browser emulation nie zamyka tych bramek.
+
+## Etap 7 — ponowna pełna analiza i plan przed implementacją
+
+Etap 6 zakończono commitem b90988a6, czysty worktree. Niezależna analiza
+porównała raw SQL Git blobs starego dade9a932 i U, nie tylko nazwy plików.
+Oba journals mają 25 entries, ale indeksy 10–14 mają różne lineage i hash SQL.
+Native 0014_huge_dagger usuwa siedem tabel Uptime; ostatnie snapshots mają
+47 vs 40 tabel. Równa długość journal i identyczne końcowe 0024 nie dowodzą
+kompatybilności. Drizzle nie zastępuje walidacji całej historii.
+
+Old browser alias hash ma NUL separators i 32 hex, native ':' i 12 hex.
+Old source/updated_at/no-steal/409-rotate i dictionary read-time resolution
+nie odpowiadają native alias reassignment i identityBackfillQueue. Nie można
+przeliczyć starego hash bez oryginalnego wejścia ani obiecać ciągłości anon IDs.
+Old replay default v1 / dual / v2, native wyłącznie metadata_v2. Równe source
+DDL v2 nie dowodzi runtime populate/coverage; ślepy cumulative v1 backfill
+może zawyżyć agregaty. Native R2 ma CLOUD gate, więc stara object-backed
+historia na self-hosted może być nieczytelna. Nie odczytano live env/storage.
+
+Granica mutacji jest PRZED pierwszym startupem: native entrypoint uruchamia
+Drizzle, initPostgres może promować najstarszego użytkownika do admina, CH
+init tworzy/zmienia struktury. Sam powrót obrazów po tym kroku nie jest
+bezstratnym rollback. Stare cached trackery/gzip/writers wymagają osobnego
+fixture testu i planu quiesce; nie przełączamy ich milcząco na nowe ingest.
+
+Plan implementacji:
+
+1. Mały Node read-only inventory committed source obu jawnie wskazanych repo.
+   Wyłącznie git rev-parse/show/cat-file, bez fetch/status/env/DB/Docker/start.
+   Pin U, SHA256 SQL i stałych native boundary files, walidowany/bounded journal,
+   zestaw różnic po idx/tag/time/hash. Nigdy interpretacja SQL ani źródeł jako kod.
+2. Wynik JSON ze snapshot time/SHA, oddzielnym source equality i zawsze HOLD,
+   runtime/schema/backup/storage/provenance/source publication NOT_VERIFIED.
+   Nawet identyczne źródła nie odblokowują deploy. HOLD exit2, błąd odczytu exit1
+   sanitizowany; brak sekretów/treści SQL/identyfikatorów z live danych w raporcie.
+3. Node fixtures: identyczne/different tags/time/SQL/missing entries, malicious
+   tags/duplicate idx/oversized journal/missing blobs/unknown args, zachowanie
+   HOLD niezależnie od braku różnic. Testy nie tworzą/migrują baz.
+4. Rozszerzyć istniejący deployment runbook: trzy strategie danych z kosztami,
+   bez autonomicznego wyboru. Osobno native capabilities prerequisites,
+   odzyskanie historycznych danych i stary write/archive routing. Żadnego
+   polecenia up/update/migrate dla produkcji ani automatycznego convertera.
+5. Sekwencja dopiero zatwierdzonej przyszłej operacji: live read-only inventory,
+   verified restore drill, izolowany candidate, funkcjonalna macierz/real iPhone,
+   Grafana/CORS/retention, obrazy/source provenance, dedicated Nginx/CDN,
+   explicit owner/window/RPO/quiesce, rollback przed/po pierwszych zapisach.
+6. Uruchomić inventory na obu lokalnych committed sources i potwierdzić 10–14
+   divergence oraz native boundary equality; jawnie NIE runtime proof. Review
+   własny i niezależny, wszystkie Node fixtures + lint delta + diff/cleanliness.
+   Etap 7 docs/tool bez zmiany runtime, zależności i natywnych schematów.
+7. Osobny commit etapu 7; potem końcowe SHA/status/inventory, bez push/deploy.
+
+### Etap 7 — wykonanie, review i werdykt
+
+- Dodano source-only inventory i rozszerzono istniejący deployment runbook,
+  bez kolejnego deployment frameworka i bez zmian runtime aplikacji.
+  Wszystkie 74 Node fixtures PASS, w tym 10 nowych inventory tests.
+- Realny lokalny odczyt committed HEAD obu repo: journals 25/25, różnice
+  dokładnie idx10,11,12,13,14; 11 native boundary files oraz journal kandydata
+  zgodne z U. Raport sanitizowany, brak SQL/env/live danych, HOLD exit2.
+- Własne review wymusiło raw journal hash (nie tylko parsed entries) i valid
+  boundary hash przed uznaniem equality; brak pliku nie daje false equality.
+  Niezależne review wykryło Git replacement refs. Dodano --no-replace-objects,
+  no-lazy-fetch, wyłączenie fsmonitor/optional locks/prompt i usunięcie
+  dziedziczonych GIT_* routing variables. Regresja sprawdza faktycznie używane
+  argumenty i environment runnera. Żadne refs/replace nie zostały zmienione.
+- Poprawiono kolejność runbooka: przypięte obrazy/publiczne źródła przed
+  pierwszym startupem; runtime digest/browser origins po zatwierdzonym starcie.
+  Przed/po pierwszych zapisach są osobne warunki rollback, RPO i reconciliation.
+- Końcowy niezależny review: oba findings zamknięte, brak pozostałych source
+  blockers; osobny rerun 10/10 PASS i inventory HOLD/all NOT_VERIFIED.
+- Implementacja siedmiu etapów jest zakończona lokalnie. Produkcja pozostaje
+  HOLD: A/B/C niewybrane, runtime/data coverage/restore/obrazy/publication/live
+  prerequisites i fizyczny iPhone niezweryfikowane. Nie uruchomiono migracji,
+  backfill, restore, kontenerów ani Nginx; lokalne Next/API fixture zakończone.
+  Nie wykonano push. Stare worktrees i ich pliki pozostają bez zmian.
