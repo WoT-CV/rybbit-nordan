@@ -279,8 +279,8 @@ export function ReplayBreadcrumbs() {
 
       {/* Timeline */}
       <div className="rounded-lg border border-neutral-100 dark:border-neutral-800 flex flex-col flex-1 min-h-0 bg-white dark:bg-neutral-900">
-        <div className="flex items-center justify-between gap-2 p-2 border-b border-neutral-100 dark:border-neutral-800 shrink-0">
-          <div className="text-xs text-neutral-600 dark:text-neutral-400 truncate">
+        <div className="flex items-center justify-end gap-2 p-2 border-b border-neutral-100 dark:border-neutral-800 shrink-0">
+          <div className="sr-only">
             {isLoading || !data
               ? t("Timeline")
               : showTechnical

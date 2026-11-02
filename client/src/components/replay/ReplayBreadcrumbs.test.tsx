@@ -95,7 +95,7 @@ describe("separate replay request tab", () => {
     render(<ReplayBreadcrumbs />);
     expect(screen.getAllByRole("radio").map(radio => radio.textContent)).toEqual(["Klucz", "Requests", "Wszystko"]);
     fireEvent.click(screen.getByRole("radio", { name: "Requests" }));
-    expect(screen.getByText("Requests (1)")).toBeTruthy();
+    expect(screen.getByText("Requests (1)").className).toBe("sr-only");
     expect(screen.queryByText("Żądania")).toBeNull();
     expect(screen.getByRole("button", { name: "Requests: GET /players/123" })).toBeTruthy();
   });
@@ -103,12 +103,12 @@ describe("separate replay request tab", () => {
   it("keeps Key native and places Requests between Key and All, loading Grafana config only when expanded", () => {
     render(<ReplayBreadcrumbs />);
     expect(screen.getByText("Session started")).toBeTruthy();
-    expect(screen.getByText("1 key events")).toBeTruthy();
+    expect(screen.getByText("1 key events").className).toBe("sr-only");
     expect(screen.getAllByRole("radio").map(radio => radio.textContent)).toEqual(["Key", "Requests", "All"]);
     expect(screen.queryByRole("button", { name: "Requests: GET /players/123" })).toBeNull();
     fireEvent.click(screen.getByRole("radio", { name: "Requests" }));
     expect(screen.queryByText("Session started")).toBeNull();
-    expect(screen.getByText("Requests (1)")).toBeTruthy();
+    expect(screen.getByText("Requests (1)").className).toBe("sr-only");
     const request = screen.getByRole("button", { name: "Requests: GET /players/123" });
     expect(request.getAttribute("aria-expanded")).toBe("false");
     expect(vi.mocked(useReplayCorrelation).mock.lastCall).toEqual([1, false]);
@@ -125,6 +125,7 @@ describe("separate replay request tab", () => {
     fireEvent.click(screen.getByRole("radio", { name: "All" }));
     expect(screen.queryByRole("button", { name: "Requests: GET /players/123" })).toBeNull();
     expect(screen.getByText("Custom")).toBeTruthy();
+    expect(screen.getByText("2 groups").className).toBe("sr-only");
     expect(vi.mocked(useReplayCorrelation).mock.lastCall).toEqual([1, false]);
     fireEvent.click(screen.getByRole("radio", { name: "Key" }));
     expect(screen.getByText("Session started")).toBeTruthy();
