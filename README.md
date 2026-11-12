@@ -44,6 +44,106 @@ There are two ways to start using Rybbit:
 
 To work on the client and backend locally, see the [pnpm workspace setup](CONTRIBUTE.md#local-development).
 
+## WoT-CV fork
+
+This repository is the [WoT-CV fork of Rybbit](https://github.com/WoT-CV/rybbit-wotcv).
+It retains the upstream applications and adds integration between activity in
+[wot-cv-fe](https://github.com/WoT-CV/wot-cv-fe), native session replay, and
+observability for [wot-cv-be](https://github.com/WoT-CV/wot-cv-be).
+The feature list and screenshots below describe Rybbit; available features also
+depend on the deployment configuration.
+
+The application is a pnpm workspace: `client/` is the Next.js dashboard,
+`server/` is the Fastify API and browser tracker, and `shared/` contains shared
+contracts. PostgreSQL stores application and authentication data; in self-hosted
+mode, ClickHouse stores analytics and recordings, and Redis supports session
+tracking and shared caches. The documentation site in `docs/` and the React Native SDK in
+`react-native/` have separate tooling.
+
+| WoT-CV integration | Source |
+| --- | --- |
+| Observe response metadata from allowed API origins during replay, including method, path, status, duration, correlation ID and trace ID. This observer excludes query strings, fragments and request/response bodies. | [Tracker observer](server/src/analytics-script/requestCorrelation.ts), [shared event contract](shared/src/requestCorrelation.ts) |
+| Show request events beside a recording and open matching Loki logs or Tempo traces in Grafana, using the site's configured profile. | [Replay request panel](client/src/components/replay/correlation/ReplayRequestCorrelation.tsx), [Grafana links](client/src/components/replay/correlation/observabilityLinks.ts) |
+| Configure self-hosted service URLs, optional email/Search Console integration and a link to the published source revision. | [Service configuration](server/src/lib/serviceConfiguration.ts), [source URL](server/src/lib/sourceCodeUrl.ts) |
+
+### Local development and checks
+
+Use Node.js 24 from [.nvmrc](.nvmrc) and the pnpm version pinned in
+[package.json](package.json). Follow [Local development](CONTRIBUTE.md#local-development)
+to prepare the local PostgreSQL, ClickHouse and Redis instances, `server/.env`
+from its example, `client/.env.local`, and the explicit initial database migration.
+The API listens on port 3001 and the dashboard on port 3002.
+
+Run these commands from the repository root after preparing that environment:
+
+```bash
+corepack enable
+pnpm install --frozen-lockfile
+pnpm dev
+```
+
+`pnpm dev` builds shared code and starts its watcher alongside both applications.
+The backend compiles once when started; restart it after backend changes.
+The root also provides `pnpm dev:client` and `pnpm dev:server`.
+
+```bash
+pnpm typecheck
+pnpm test
+pnpm build
+node --test scripts/*.test.mjs
+```
+
+The root test command builds shared code and runs the application suites one
+package at a time with four workers. `pnpm build:client` and `pnpm build:server`
+build individual applications with their shared dependency; the backend build
+also regenerates the browser tracker. Builds and tests do not apply database
+migrations. `pnpm lint` currently has no configured client rules; CI checks new
+lint errors with `node scripts/lint-minimal-delta.cjs` against its pinned baseline.
+See [the test workflow](.github/workflows/test.yml) for package-level CI commands.
+
+### Configuration and deployment boundaries
+
+Use [.env.example](.env.example) for the root Compose configuration and
+[server/.env.example](server/.env.example) for local backend development.
+Additional fork settings are read by the source files linked above:
+
+| Setting | Purpose |
+| --- | --- |
+| `CLOUD=false`, `NEXT_PUBLIC_CLOUD=false` | Select self-hosted behavior in the API and dashboard. |
+| `BASE_URL`, `SERVER_URL` | Public dashboard and API origins. `SERVER_URL` defaults to `BASE_URL` when omitted. |
+| `NEXT_PUBLIC_BACKEND_URL` | API URL compiled into the dashboard. Set it when building the client image. |
+| `DISABLE_SIGNUP` | Server-side signup policy, also returned by `/api/config` for the dashboard UI. |
+| `WOTCV_REPLAY_CORRELATION_JSON` | Per-site API origins and Grafana profiles; an empty array disables correlation. See the [configuration parser](server/src/lib/replayCorrelation.ts). |
+| `SOURCE_CODE_URL` | Public source revision linked from the dashboard. |
+
+For containers, ensure the selected Compose configuration passes each setting
+into the service; the base file does not pass all fork settings.
+
+A correlation profile includes `siteIds`, `requestOrigin`, `grafanaUrl`, `orgId`,
+`lokiDatasourceUid`, `serviceName`, `environment` and `timePaddingMs`;
+`tempoDatasourceUid` is optional. Request observation requires session replay to
+be enabled for the site. Grafana links require matching response identifiers and
+access to the configured Grafana instance. Profiles are served through the
+authenticated replay API; the public tracking configuration exposes only allowed
+API origins. The WoT-CV frontend owns its tracker loading and privacy controls.
+
+Both [client/Dockerfile](client/Dockerfile) and [server/Dockerfile](server/Dockerfile)
+use the repository root as their build context. Client `NEXT_PUBLIC_*` settings
+must be supplied at build time; changing container environment variables alone
+does not rewrite the compiled bundle.
+
+The [candidate overlay](docker-compose.wotcv-minimal.yml) and
+[fresh native overlay](ops/minimal/compose.fresh.yml) are separate configurations
+applied after the base Compose file; do not combine them. They require Compose
+2.24.4 or newer for `!override`. The native backend's entrypoint applies database
+migrations on startup, so use an isolated, explicitly prepared environment.
+The [native updater](scripts/wotcv-native-update.py) is tied to an existing
+installation and accepts only frontend/static-asset updates under its source
+guards. The [legacy updater bridge](scripts/wotcv-branch-build-deploy.sh) refuses
+deployment with exit code 78. These scripts are not a general fresh-install guide.
+Proxy examples for private noindex responses and public tracker caching are in
+[ops/nginx/](ops/nginx/).
+
 <hr>
 
 ## ✨ Key Features
