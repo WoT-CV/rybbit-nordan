@@ -2,14 +2,15 @@
 // Lint every integration guide against content/partials/guides/README.md.
 // Usage: node scripts/check-guides.mjs   (exit 1 on any violation)
 import { readdirSync, readFileSync, existsSync, statSync } from "node:fs";
-import { join, relative, dirname, resolve } from "node:path";
+import { join, relative, dirname, resolve, basename, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { bundledLanguagesInfo } from "shiki";
 
 // Shiki throws at build time for an unknown fence language, which 500s EVERY docs page.
 const knownLangs = new Set(["text", "txt", "plain"]);
 for (const l of bundledLanguagesInfo) { knownLangs.add(l.id); for (const a of l.aliases ?? []) knownLangs.add(a); }
 
-const root = resolve(new URL("..", import.meta.url).pathname);
+const root = fileURLToPath(new URL("..", import.meta.url));
 const guidesDir = join(root, "content/docs/(docs)/guides");
 const partialsDir = join(root, "content/partials/guides");
 const categories = JSON.parse(readFileSync(join(root, "src/lib/guide-categories.json"), "utf8")).map(c => c.key);
@@ -36,13 +37,13 @@ function frontmatter(src) {
   return fm;
 }
 
-const guides = walk(guidesDir).filter(p => !p.endsWith("/index.mdx"));
+const guides = walk(guidesDir).filter(p => basename(p) !== "index.mdx");
 const slugs = new Set();
 
 for (const file of guides) {
-  const src = readFileSync(file, "utf8");
+  const src = readFileSync(file, "utf8").replace(/\r\n/g, "\n");
   const fm = frontmatter(src);
-  const rel = relative(guidesDir, file).replace(/\.mdx$/, "");
+  const rel = relative(guidesDir, file).split(sep).join("/").replace(/\.mdx$/, "");
   slugs.add(rel);
   const depth = rel.split("/").length; // 1 for top-level, 2 for react/next-js
   const up = "../".repeat(depth + 2);
