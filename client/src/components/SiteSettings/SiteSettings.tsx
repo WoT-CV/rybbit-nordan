@@ -4,6 +4,7 @@ import {
   Ban,
   Code,
   Download,
+  FileDown,
   Gauge,
   LayoutDashboard,
   LayoutTemplate,
@@ -24,6 +25,7 @@ import { cn } from "@/lib/utils";
 
 import { ScriptBuilder } from "./ScriptBuilder";
 import { ImportManager } from "./ImportManager";
+import { ExportTab } from "./ExportTab";
 import { GeneralTab } from "./GeneralTab";
 import { TrackingTab } from "./TrackingTab";
 import { ExclusionsTab } from "./ExclusionsTab";
@@ -85,6 +87,7 @@ type TabKey =
   | "integrations"
   | "script"
   | "import"
+  | "export"
   | "widget-embeds"
   | "dashboard-embed"
   | "usage";
@@ -157,6 +160,7 @@ function SiteSettingsInner({
     { key: "widget-embeds", label: t("Widget Embeds"), icon: LayoutTemplate },
     { key: "dashboard-embed", label: t("Dashboard Embed"), icon: LayoutDashboard },
     { key: "import", label: t("Import"), icon: Download },
+    { key: "export", label: t("Export"), icon: FileDown },
     { key: "usage", label: t("Usage"), icon: Gauge },
   ];
 
@@ -219,7 +223,7 @@ function SiteSettingsInner({
               )}
             </header>
             <div className="flex-1 overflow-y-auto px-6 py-5">
-              {!canConfigure && activeTab !== "script" && activeTab !== "usage" && (
+              {!canConfigure && activeTab !== "script" && activeTab !== "usage" && activeTab !== "export" && (
                 <p className="mb-4 rounded-md border border-neutral-200 px-3 py-2 text-xs text-muted-foreground dark:border-neutral-800">
                   {t("You can view these settings, but your role can't change them.")}
                 </p>
@@ -263,6 +267,7 @@ function SiteSettingsInner({
               {activeTab === "import" && (
                 <ImportManager siteId={siteMetadata.siteId} disabled={!can("imports:write")} />
               )}
+              {activeTab === "export" && <ExportTab siteId={siteMetadata.siteId} />}
               {activeTab === "usage" && <UsageTab siteId={siteMetadata.siteId} />}
             </div>
           </main>

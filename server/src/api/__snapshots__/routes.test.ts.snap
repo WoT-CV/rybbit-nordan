@@ -2,6 +2,7 @@
 
 exports[`API route table > pins the access each route requires 1`] = `
 [
+  "DELETE /api/admin/api-keys/:keyId → system-admin",
   "DELETE /api/admin/organizations/:organizationId/members/:memberId → system-admin",
   "DELETE /api/mcp → public",
   "DELETE /api/organizations/:organizationId/teams/:teamId → org teams:manage [admin+]",
@@ -18,6 +19,7 @@ exports[`API route table > pins the access each route requires 1`] = `
   "DELETE /api/sites/:siteId/session-replay/:sessionId → site replay:delete [editor+]",
   "DELETE /api/sites/:siteId/transfer → site sites:transfer [admin+]",
   "DELETE /api/sites/:siteId/users/:userId → site users:delete [editor+]",
+  "GET    /api/admin/api-keys → system-admin",
   "GET    /api/admin/clickhouse-query-log → system-admin",
   "GET    /api/admin/clickhouse-stats → system-admin",
   "GET    /api/admin/organization-options → system-admin",
@@ -73,6 +75,8 @@ exports[`API route table > pins the access each route requires 1`] = `
   "GET    /api/sites/:siteId/experiments → site experiments:read [viewer+]",
   "GET    /api/sites/:siteId/experiments/:experimentId/results → site experiments:read [viewer+]",
   "GET    /api/sites/:siteId/experiments/:experimentId/timeseries → site experiments:read [viewer+]",
+  "GET    /api/sites/:siteId/export/events → site events:read [viewer+]",
+  "GET    /api/sites/:siteId/export/events/count → site events:read [viewer+]",
   "GET    /api/sites/:siteId/export/pdf → site analytics:read [viewer+]",
   "GET    /api/sites/:siteId/feature-flags → site flags:read [viewer+]",
   "GET    /api/sites/:siteId/funnels → site funnels:read [viewer+] (or public)",
@@ -135,6 +139,7 @@ exports[`API route table > pins the access each route requires 1`] = `
   "GET    /api/user/unsubscribe-marketing-oneclick → public",
   "GET    /api/user/unsubscribe-reports-oneclick → public",
   "GET    /api/version → public",
+  "PATCH  /api/admin/api-keys/:keyId → system-admin",
   "PATCH  /api/admin/organizations/:organizationId/members/:memberId → system-admin",
   "POST   /api/admin/telemetry → public",
   "POST   /api/as/activate → authenticated",
