@@ -24,6 +24,12 @@ INVENTORY = ARTIFACTS | {'postgres.dump.stderr', 'postgres-globals.sql.stderr', 
 FIELDS = {'version', 'failedOperation', 'failedReleaseSha', 'failedPendingSha256', 'failedFailureSha256',
           'priorPacketDirectory', 'priorUpdaterSha256', 'priorBackupSha256', 'runtimeSha256',
           'restartContractSha256', 'failedDrill'}
+VERIFIED_FIELDS = {'originOperation', 'originReleaseSha', 'priorDrillRecoverySha256',
+                   'priorDrillRecoveryContractSha256', 'diagnosticDirectory', 'diagnosticReportSha256'}
+RESUMED_INVENTORY = (INVENTORY - {'postgres.dump.stderr', 'postgres-globals.sql.stderr'}) | {
+    'drill-status.json', 'drill-failure.json'} | {
+    tag + suffix for tag in ('postgres-create-database', 'postgres-restore')
+    for suffix in ('.stdout.log', '.stderr.log', '.result.json')}
 
 
 def sha256(raw):
@@ -52,8 +58,9 @@ def contract_for(native, packet_root, manifest):
     native.require(len(raw) <= 131072 and sha256(raw) == manifest['files']['drillRecoveryContract'],
                    'Reviewed drill recovery contract size or hash changed')
     contract = native.reconciliation_json(raw)
-    native.require(isinstance(contract, dict) and set(contract) == FIELDS and
-                   type(contract['version']) is int and contract['version'] == 1 and
+    native.require(isinstance(contract, dict) and type(contract.get('version')) is int and
+                   contract['version'] in (1, 2) and
+                   set(contract) == (FIELDS if contract['version'] == 1 else FIELDS | {'verifiedCapture'}) and
                    isinstance(contract['failedOperation'], str) and OPERATION.fullmatch(contract['failedOperation']) and
                    isinstance(contract['failedReleaseSha'], str) and SHA.fullmatch(contract['failedReleaseSha']) and
                    isinstance(contract['priorPacketDirectory'], str) and Path(contract['priorPacketDirectory']).is_absolute() and
@@ -67,7 +74,8 @@ def contract_for(native, packet_root, manifest):
                    isinstance(target['container'], str) and HEX.fullmatch(target['container']) and
                    target['volume'] == 'wotcv-native-drill-' + target['token'] + '-postgres-data' and
                    isinstance(target['image'], str) and IMAGE.fullmatch(target['image']) and
-                   type(target['exitCode']) is int and target['exitCode'] == 137 and target['oomKilled'] is False,
+                   type(target['exitCode']) is int and target['exitCode'] == (137 if contract['version'] == 1 else 0) and
+                   target['oomKilled'] is False,
                    'Invalid reviewed failed PostgreSQL clone')
     native.require(contract['restartContractSha256'] == manifest['files']['restartContract'] and
                    contract['priorUpdaterSha256'] == manifest['files']['updater'] and
@@ -79,6 +87,20 @@ def contract_for(native, packet_root, manifest):
                                ('wotcv-native-update.py', contract['priorUpdaterSha256'])):
         native.require(sha256(native.receipt_file(prior / filename)) == expected,
                        'Retained failed packet tool bytes changed')
+    if contract['version'] == 2:
+        proof = contract['verifiedCapture']
+        native.require(isinstance(proof, dict) and set(proof) == VERIFIED_FIELDS and
+                       isinstance(proof['originOperation'], str) and OPERATION.fullmatch(proof['originOperation']) and
+                       proof['originOperation'] != contract['failedOperation'] and
+                       isinstance(proof['originReleaseSha'], str) and SHA.fullmatch(proof['originReleaseSha']) and
+                       all(isinstance(proof[key], str) and HEX.fullmatch(proof[key]) for key in
+                           ('priorDrillRecoverySha256', 'priorDrillRecoveryContractSha256', 'diagnosticReportSha256')) and
+                       isinstance(proof['diagnosticDirectory'], str) and Path(proof['diagnosticDirectory']).is_absolute(),
+                       'Invalid reviewed PostgreSQL verification provenance')
+        for filename, key in (('wotcv-native-drill-recovery.py', 'priorDrillRecoverySha256'),
+                              ('drill-recovery-20261117.json', 'priorDrillRecoveryContractSha256')):
+            native.require(sha256(native.receipt_file(prior / filename)) == proof[key],
+                           'Prior drill recovery packet bytes changed')
     return contract
 
 
@@ -143,9 +165,10 @@ def artifact_hash(native, path, expected):
                    (metadata.st_size, metadata.st_mtime_ns, metadata.st_ino), 'Retained capture artifact changed')
 
 
-def captured_files(native, capture, live, state, restart):
+def captured_files(native, capture, live, state, restart, *, resumed=False):
     native.receipt_directory(capture)
-    native.require({path.name for path in capture.iterdir()} == INVENTORY, 'Retained capture inventory changed')
+    native.require({path.name for path in capture.iterdir()} == (RESUMED_INVENTORY if resumed else INVENTORY),
+                   'Retained capture inventory changed')
     artifacts_raw, artifacts = read_json(native, capture / 'artifacts.json')
     native.require(isinstance(artifacts, dict) and set(artifacts) == ARTIFACTS, 'Retained artifact manifest changed')
     for name in sorted(ARTIFACTS):
@@ -153,8 +176,9 @@ def captured_files(native, capture, live, state, restart):
         native.require(isinstance(expected, dict) and set(expected) == {'path', 'bytes', 'sha256'} and
                        expected['path'] == name, 'Retained artifact entry changed')
         artifact_hash(native, capture / name, expected)
-    for filename in ('postgres.dump.stderr', 'postgres-globals.sql.stderr'):
-        native.require(native.receipt_file(capture / filename) == b'', 'Captured PostgreSQL stream reported diagnostics')
+    if not resumed:
+        for filename in ('postgres.dump.stderr', 'postgres-globals.sql.stderr'):
+            native.require(native.receipt_file(capture / filename) == b'', 'Captured PostgreSQL stream reported diagnostics')
     native.require(sha256(native.receipt_file(capture / 'previous.env')) == restart['envSha256'],
                    'Captured deployment environment changed')
     source = native.ROOT / 'source'
@@ -239,6 +263,170 @@ def preserved_clone(native, status, live, target):
                    'Preserved clone volume has another consumer')
 
 
+def verified_capture_origin(native, original, contract, state, active_hash, success_hash, live, restart_raw, restart):
+    """Link the resumed operation to its unchanged, previously reviewed capture."""
+    proof = contract['verifiedCapture']
+    prior = Path(contract['priorPacketDirectory'])
+    _, previous = read_json(native, prior / 'drill-recovery-20261117.json')
+    native.require(isinstance(previous, dict) and set(previous) == FIELDS and previous['version'] == 1 and
+                   previous['failedOperation'] == proof['originOperation'] and
+                   previous['failedReleaseSha'] == proof['originReleaseSha'] and
+                   previous['priorUpdaterSha256'] == contract['priorUpdaterSha256'] and
+                   previous['restartContractSha256'] == contract['restartContractSha256'],
+                   'Prior capture recovery contract provenance changed')
+    origin = native.STATE / 'release-operations' / proof['originOperation']
+    native.receipt_directory(origin)
+    native.require({path.name for path in origin.iterdir()} == {
+        'failure.json', 'reconciliation.json', 'recovery.json', 'backup', 'superseded-pending.json', 'superseded.json'},
+        'Capture origin operation inventory changed')
+    attestation_hash = historical_attestation(native, origin, state, active_hash, success_hash, live,
+                                             previous, restart_raw, restart)
+    native.require(native.receipt_file(original / 'reconciliation.json') ==
+                   native.receipt_file(origin / 'reconciliation.json'), 'Resumed restart reconciliation differs from origin')
+    pending_raw, pending = read_json(native, origin / 'superseded-pending.json')
+    failure_raw = native.receipt_file(origin / 'failure.json')
+    raw, report = read_json(native, original / 'drill-recovery.json')
+    native.require(raw == native.receipt_file(origin / 'superseded.json') and
+                   sha256(pending_raw) == previous['failedPendingSha256'] and
+                   pending == {'operation': proof['originOperation'], 'releaseSha': proof['originReleaseSha']} and
+                   sha256(failure_raw) == previous['failedFailureSha256'] and
+                   isinstance(report, dict) and set(report) == {
+                       'operation', 'phase', 'failedOperation', 'newOperation', 'releaseSha', 'failedReleaseSha',
+                       'priorCapture', 'activeReceiptSha256', 'historicalAttestationSha256', 'runtimeSha256',
+                       'artifactsManifestSha256', 'capturedChecksSha256', 'failedPendingSha256', 'failedFailureSha256',
+                       'preservedFailedClone', 'drillRecoveryContractSha256', 'drillRecoveryToolSha256',
+                       'sourceApplicationStop', 'activation'} and
+                   report['operation'] == 'supersede-failed-isolated-pg-drill' and
+                   report['phase'] == 'drill-recovery-preflight-verified' and
+                   report['failedOperation'] == proof['originOperation'] and
+                   report['newOperation'] == contract['failedOperation'] and
+                   report['releaseSha'] == contract['failedReleaseSha'] and
+                   report['failedReleaseSha'] == proof['originReleaseSha'] and
+                   report['priorCapture'] == str(origin / 'backup') and
+                   report['activeReceiptSha256'] == active_hash and
+                   report['historicalAttestationSha256'] == attestation_hash and
+                   report['runtimeSha256'] == contract['runtimeSha256'] and
+                   report['failedPendingSha256'] == previous['failedPendingSha256'] and
+                   report['failedFailureSha256'] == previous['failedFailureSha256'] and
+                   report['preservedFailedClone'] == previous['failedDrill'] and
+                   report['drillRecoveryContractSha256'] == proof['priorDrillRecoveryContractSha256'] and
+                   report['drillRecoveryToolSha256'] == proof['priorDrillRecoverySha256'] and
+                   report['sourceApplicationStop'] == report['activation'] == 'NOT_PERFORMED',
+                   'Resumed capture recovery history changed')
+    capture, origin_capture = original / 'backup', origin / 'backup'
+    native.receipt_directory(capture)
+    native.receipt_directory(origin_capture)
+    native.require({path.name for path in origin_capture.iterdir()} == INVENTORY,
+                   'Capture origin backup inventory changed')
+    # Current artifact bytes are streamed by captured_files. Bind their manifest
+    # and all copied metadata to origin without re-reading large origin archives.
+    for name in ('artifacts.json', 'captured-checks.json', 'previous.env', 'compose-0.yml', 'compose-1.yml',
+                 'source-configs.json', 'stopped-apps.json'):
+        native.require(native.receipt_file(capture / name) == native.receipt_file(origin_capture / name),
+                       'Resumed capture metadata differs from origin')
+    native.require(sha256(native.receipt_file(capture / 'artifacts.json')) == report['artifactsManifestSha256'] and
+                   sha256(native.receipt_file(capture / 'captured-checks.json')) == report['capturedChecksSha256'],
+                   'Resumed capture does not match archived recovery hashes')
+    for name in ('postgres.dump.stderr', 'postgres-globals.sql.stderr'):
+        native.require(native.receipt_file(origin_capture / name) == b'', 'Original capture reported PostgreSQL diagnostics')
+    _, configs = read_json(native, capture / 'source-configs.json')
+    native.receipt_directory(origin_capture / 'source-configs')
+    native.require(isinstance(configs, list) and len(configs) <= 32 and all(
+        isinstance(entry, dict) and set(entry) == {'file', 'destination', 'sha256'} and
+        isinstance(entry['file'], str) and re.fullmatch(r'config-[0-9]{1,2}\.xml', entry['file']) and
+        isinstance(entry['destination'], str) and entry['destination'].startswith('/etc/clickhouse-server/') and
+        isinstance(entry['sha256'], str) and HEX.fullmatch(entry['sha256']) for entry in configs) and
+        len({entry['file'] for entry in configs}) == len(configs) and
+        {path.name for path in (origin_capture / 'source-configs').iterdir()} ==
+                   {entry['file'] for entry in configs}, 'Original captured configuration inventory changed')
+    for entry in configs:
+        native.require(native.receipt_file(capture / 'source-configs' / entry['file']) ==
+                       native.receipt_file(origin_capture / 'source-configs' / entry['file']),
+                       'Copied database configuration differs from origin')
+    return attestation_hash
+
+
+def diagnostic_check_shape(native, checks):
+    fields = {'columns': {'table_schema', 'table_name', 'column_name', 'ordinal_position', 'data_type',
+                           'udt_name', 'is_nullable', 'column_default'},
+              'constraints': {'schema', 'name', 'conname', 'definition'},
+              'indexes': {'schemaname', 'tablename', 'indexname', 'indexdef'},
+              'journal': {'id', 'hash', 'created_at'}}
+    native.require(isinstance(checks, dict) and set(checks) == {'inventory', 'counts'} and
+                   isinstance(checks['inventory'], dict) and set(checks['inventory']) == set(fields) and
+                   isinstance(checks['counts'], dict) and 0 < len(checks['counts']) <= 100 and
+                   all(isinstance(key, str) and type(value) is int and value >= 0
+                       for key, value in checks['counts'].items()), 'Invalid private diagnostic check scope')
+    for section, keys in fields.items():
+        rows = checks['inventory'][section]
+        native.require(isinstance(rows, list) and len(rows) <= 10000 and
+                       all(isinstance(row, dict) and set(row) == keys for row in rows),
+                       'Invalid private diagnostic catalog shape')
+
+
+def verified_diagnostic(native, original, capture, contract):
+    proof = contract['verifiedCapture']
+    parent = native.STATE / 'diagnostics'
+    directory = Path(proof['diagnosticDirectory'])
+    native.receipt_directory(parent)
+    native.require(directory.parent == parent and
+                   re.fullmatch(re.escape(contract['failedOperation']) + r'\.[0-9]{8}T[0-9]{6}Z\.[0-9a-f]{8}', directory.name),
+                   'Diagnostic directory is outside the reviewed operation scope')
+    native.receipt_directory(directory)
+    raw, report = read_json(native, directory / 'report.json')
+    native.require(digest_proof('pg-diagnostic', raw, proof['diagnosticReportSha256']) ==
+                   proof['diagnosticReportSha256'] and isinstance(report, dict) and set(report) == {
+        'phase', 'diagnosticOnly', 'acceptanceChanged', 'operation', 'diagnosticDirectory', 'inspectionComplete',
+        'comparison', 'cleanup', 'errorType', 'restore', 'activation', 'sourceWriterControl'} and
+        report['phase'] == 'HOLD' and report['diagnosticOnly'] is True and report['acceptanceChanged'] is False and
+        report['operation'] == contract['failedOperation'] and report['diagnosticDirectory'] == str(directory) and
+        report['inspectionComplete'] is True and report['cleanup'] == [] and report['errorType'] is None and
+        report['restore'] == report['activation'] == report['sourceWriterControl'] == 'NOT_PERFORMED',
+        'Pinned isolated PostgreSQL diagnostic is not complete')
+    comparison = report['comparison']
+    native.require(isinstance(comparison, dict) and set(comparison) == {
+        'phase', 'diagnosticOnly', 'acceptanceChanged', 'equal', 'sections',
+        'sameColumnRowsWithoutPhysicalOrdinal', 'columnVisibleOrderMatches'} and
+        comparison['phase'] == 'HOLD' and comparison['diagnosticOnly'] is True and
+        comparison['acceptanceChanged'] is False and comparison['equal'] is False and
+        comparison['sameColumnRowsWithoutPhysicalOrdinal'] is True and comparison['columnVisibleOrderMatches'] is True and
+        isinstance(comparison['sections'], dict) and set(comparison['sections']) == {
+            'columns', 'constraints', 'indexes', 'journal', 'counts'}, 'Diagnostic differs from ordinal-only review')
+    expected_raw, expected = read_json(native, directory / 'expected-checks.json')
+    native.require(expected_raw == native.receipt_file(capture / 'captured-checks.json') and
+                   isinstance(expected, dict) and set(expected) == {'postgres', 'clickhouse', 'redis', 'redisModules'},
+                   'Diagnostic expected checks differ from current capture')
+    _, actual = read_json(native, directory / 'actual-checks.json')
+    diagnostic_check_shape(native, expected['postgres'])
+    diagnostic_check_shape(native, actual)
+    for name, section in comparison['sections'].items():
+        left = expected['postgres']['counts'] if name == 'counts' else expected['postgres']['inventory'][name]
+        right = actual['counts'] if name == 'counts' else actual['inventory'][name]
+        native.require(isinstance(section, dict) and section.get('expectedSha256') == native.canonical_hash(left) and
+                       section.get('actualSha256') == native.canonical_hash(right) and
+                       section.get('expectedItems') == len(left) and section.get('actualItems') == len(right),
+                       'Diagnostic private catalog hashes differ from reviewed summary')
+        if name != 'columns':
+            native.require(left == right and section.get('equal') is True and section.get('differentItems') == 0,
+                           'Diagnostic contains a non-column difference')
+    columns = comparison['sections']['columns']
+    native.require(columns.get('equal') is False and type(columns.get('differentItems')) is int and
+                   0 < columns['differentItems'] <= 10 and len(columns.get('differences', [])) == columns['differentItems'] and
+                   all(item.get('fields') == ['ordinal_position'] and item.get('expectedPresent') is True and
+                       item.get('actualPresent') is True for item in columns['differences']),
+                   'Diagnostic contains differences beyond existing column ordinals')
+    for tag, step in (('postgres-create-database', 'postgres_create_database'), ('postgres-restore', 'postgres_restore')):
+        _, result = read_json(native, capture / (tag + '.result.json'))
+        native.require(result.get('step') == step and type(result.get('returnCode')) is int and result['returnCode'] == 0 and
+                       result.get('timedOut') is False, 'Prior CREATE or restore did not succeed')
+        for suffix in ('.stdout.log', '.stderr.log'):
+            native.receipt_file(capture / (tag + suffix))
+    _, drill = read_json(native, capture / 'drill-status.json')
+    _, cause = read_json(native, capture / 'drill-failure.json')
+    native.require(drill.get('phase') == 'running' and drill.get('step') == cause.get('phase') == 'postgres_verify' and
+                   cause.get('errorType') == 'Refused', 'Prior isolated failure is outside PostgreSQL verification')
+
+
 def supersede(native, packet_root, manifest, failed_op, new_op, new_transaction):
     """Caller holds native.locked(root=True); return validated prior capture Path."""
     packet_root, new_transaction = Path(packet_root), Path(new_transaction)
@@ -255,7 +443,9 @@ def supersede(native, packet_root, manifest, failed_op, new_op, new_transaction)
     native.require(not any(new_transaction.iterdir()), 'New drill recovery transaction must be empty')
     original = operations / failed_op
     native.receipt_directory(original)
-    native.require({path.name for path in original.iterdir()} == {'failure.json', 'reconciliation.json', 'recovery.json', 'backup'},
+    resumed = contract['version'] == 2
+    native.require({path.name for path in original.iterdir()} == {
+        'failure.json', 'reconciliation.json', 'drill-recovery.json' if resumed else 'recovery.json', 'backup'},
                    'Selected failed drill operation inventory changed')
     pending = operations / 'pending.json'
     pending_raw, marker = read_json(native, pending)
@@ -265,17 +455,20 @@ def supersede(native, packet_root, manifest, failed_op, new_op, new_transaction)
     failure_raw, failure = read_json(native, original / 'failure.json')
     native.require(digest_proof('failure', failure_raw, contract['failedFailureSha256']) ==
                    contract['failedFailureSha256'] and isinstance(failure, dict) and
-                   set(failure) == {'phase', 'errorType', 'sites', 'at', 'result'} and failure['phase'] == 'backup_preflight' and
+                   set(failure) == {'phase', 'errorType', 'sites', 'at', 'result'} and
+                   failure['phase'] == ('backup_restoring_isolated_databases' if resumed else 'backup_preflight') and
                    failure['errorType'] == 'Refused' and isinstance(failure['sites'], list) and
-                   {'file': 'wotcv-native-backup.py', 'line': 487} in failure['sites'] and
+                   {'file': 'wotcv-native-backup.py', 'line': 558 if resumed else 487} in failure['sites'] and
                    isinstance(failure['at'], str) and STAMP.fullmatch(failure['at']) and
                    failure['result'] == 'HOLD: inspect private transaction before retry', 'Pinned failed drill evidence changed')
     state, active_hash, success_hash, environment = native.reconciliation_context()
     live = native.snapshot()
     native.require(native.canonical_hash(live) == contract['runtimeSha256'], 'Source runtime changed since drill recovery review')
     restart_raw, restart = native.read_reconciliation_contract(packet_root / 'restart-20261116.json', contract['restartContractSha256'])
-    attestation_hash = historical_attestation(native, original, state, active_hash, success_hash, live,
-                                             contract, restart_raw, restart)
+    attestation_hash = (verified_capture_origin(native, original, contract, state, active_hash, success_hash,
+                                               live, restart_raw, restart) if resumed else
+                        historical_attestation(native, original, state, active_hash, success_hash, live,
+                                               contract, restart_raw, restart))
     native.code_runtime_guard(restart, live)
     native.require(all(type(live[name]['restarts']) is int and live[name]['restarts'] == 0 for name in ('backend', 'client')),
                    'Old source application restarted unexpectedly')
@@ -283,10 +476,14 @@ def supersede(native, packet_root, manifest, failed_op, new_op, new_transaction)
     native.require(seal['project'] == native.PROJECT and seal['source'] == native.BASELINE and
                    seal['sourceFiles'] == native.source_hashes(native.ROOT / 'source'), 'Sealed native source changed')
     capture = original / 'backup'
-    pairs, artifacts_hash, checks_hash = captured_files(native, capture, live, state, restart)
+    pairs, artifacts_hash, checks_hash = captured_files(native, capture, live, state, restart, resumed=resumed)
     status_raw, status = read_json(native, capture / 'status.json')
-    native.require(isinstance(status, dict) and set(status) == {'phase', 'at', 'targets', 'volumes'} and
-                   status['phase'] == 'drill_failed_old_apps_resumed' and isinstance(status['at'], str) and STAMP.fullmatch(status['at']),
+    native.require(isinstance(status, dict) and set(status) ==
+                   ({'phase', 'at', 'targets', 'volumes', 'step'} if resumed else {'phase', 'at', 'targets', 'volumes'}) and
+                   status['phase'] == ('existing_capture_drill_failed_source_not_controlled' if resumed else
+                                       'drill_failed_old_apps_resumed') and
+                   (not resumed or status['step'] == 'postgres_verify') and
+                   isinstance(status['at'], str) and STAMP.fullmatch(status['at']),
                    'Prior drill status changed')
     try:
         native.require(datetime.strptime(failed_op.split('-')[0], '%Y%m%dT%H%M%SZ') <=
@@ -295,6 +492,8 @@ def supersede(native, packet_root, manifest, failed_op, new_op, new_transaction)
     except ValueError:
         raise native.Refused('Invalid prior drill timestamp') from None
     preserved_clone(native, status, live, contract['failedDrill'])
+    if resumed:
+        verified_diagnostic(native, original, capture, contract)
     native.require(sha256(native.receipt_file(environment)) == restart['envSha256'], 'Current environment changed')
     model = native.config(environment)
     native.model_guard(model, live)
@@ -316,6 +515,12 @@ def supersede(native, packet_root, manifest, failed_op, new_op, new_transaction)
               'drillRecoveryContractSha256': manifest['files']['drillRecoveryContract'],
               'drillRecoveryToolSha256': manifest['files']['drillRecovery'],
               'sourceApplicationStop': 'NOT_PERFORMED', 'activation': 'NOT_PERFORMED'}
+    if resumed:
+        report['verifiedDiagnosticSha256'] = contract['verifiedCapture']['diagnosticReportSha256']
+        report['originalCaptureOperation'] = contract['verifiedCapture']['originOperation']
+        # Re-read pinned diagnostic metadata after all live/source checks and
+        # immediately before the first historical write/atomic pending switch.
+        verified_diagnostic(native, original, capture, contract)
     native.write(original / 'superseded-pending.json', pending_raw)
     native.write(original / 'superseded.json', json.dumps(report, indent=2) + '\n')
     native.fsync_directory(original)
