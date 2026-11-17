@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import shutil
 import stat
 import tarfile
 import tempfile
@@ -150,6 +151,14 @@ class OfflineTests(unittest.TestCase):
         (candidate / 'server/public/script.js.gz').write_bytes(b'new compressed asset')
         phase.source_guard(candidate)
 
+    def test_git_archives_use_canonical_lf_configuration_without_changing_checkout(self):
+        with patch.object(phase, 'run', return_value=b'archive') as run:
+            self.assertEqual(phase.git('archive', '--format=tar', phase.BASELINE), b'archive')
+        command = run.call_args.args[0]
+        self.assertIn('core.autocrlf=false', command)
+        self.assertIn('core.eol=lf', command)
+        self.assertEqual(command[-3:], ['archive', '--format=tar', phase.BASELINE])
+
     def test_source_guard_rejects_changed_or_added_backend_contracts(self):
         _, candidate = self.source_fixture()
         for name in ('server/src/index.ts', 'server/src/db/schema.ts', 'server/new-migration.sql',
@@ -205,6 +214,234 @@ class OfflineTests(unittest.TestCase):
             (original / 'server/src/db/schema.ts').write_text('tampered native baseline')
             with self.assertRaises(phase.Refused):
                 phase.source_guard(candidate)
+
+    def code_fixture(self):
+        original, candidate = self.source_fixture()
+        data = io.BytesIO()
+        with tarfile.open(fileobj=data, mode='w'):
+            pass
+        self.stack.enter_context(patch.object(phase, 'git', return_value=data.getvalue()))
+        name = 'server/src/api/reviewed.ts'
+        for base, data in ((original, b'original API\n'), (candidate, b'reviewed API\n')):
+            path = base / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        (original.parent / 'state.json').write_text(json.dumps({
+            'source': phase.BASELINE, 'project': phase.PROJECT,
+            'sourceFiles': phase.source_hashes(original)}))
+        contract = {'version': 1, 'baseline': phase.BASELINE, 'baseRevision': REVISION,
+                    'baseImages': {name: OLD_IMAGES[name] for name in ('backend', 'client')},
+                    'changes': {name: {'before': phase.digest(original / name),
+                                       'after': phase.digest(candidate / name)}}}
+        return original, candidate, contract
+
+    def write_contract(self, contract, path=None):
+        path = path or self.root / 'reviewed-code.json'
+        path.write_bytes((json.dumps(contract, indent=2, sort_keys=True) + '\n').encode())
+        return path, phase.digest(path)
+
+    def test_code_contract_accepts_exact_reviewed_delta_but_default_refuses_it(self):
+        _, candidate, contract = self.code_fixture()
+        with self.assertRaises(phase.Refused):
+            phase.source_guard(candidate)
+        phase.source_guard(candidate, contract)
+        path, expected = self.write_contract(contract)
+        raw, loaded = phase.read_code_contract(path, expected)
+        self.assertEqual(raw, path.read_bytes())
+        self.assertEqual(loaded, contract)
+
+    def test_code_contract_accepts_exact_added_api_file(self):
+        original, candidate, contract = self.code_fixture()
+        name = 'server/src/api/new.ts'
+        (candidate / name).write_bytes(b'new API\n')
+        contract['changes'][name] = {'before': None, 'after': phase.digest(candidate / name)}
+        self.assertFalse((original / name).exists())
+        phase.source_guard(candidate, contract)
+
+    def test_code_contract_refuses_malicious_or_out_of_scope_paths(self):
+        _, _, contract = self.code_fixture()
+        for name in ('../server/src/api/escape.ts', '/server/src/api/escape.ts',
+                     'server/src/api/../db/schema.ts', 'server/src/api/./test.ts',
+                     'server\\src\\api\\test.ts', 'server/src/api//test.ts',
+                     'server/src/api/test.ts\n', 'server/src/index.ts', 'server/src/db/schema.ts',
+                     'server/docker-entrypoint.sh', 'server/Dockerfile', 'server/package.json',
+                     'shared/index.ts', 'pnpm-lock.yaml', 'docker-compose.yml',
+                     'ops/minimal/compose.fresh.yml', 'server/src/api/arbitrary.sh'):
+            with self.subTest(name=name):
+                bad = deepcopy(contract)
+                bad['changes'] = {name: next(iter(contract['changes'].values()))}
+                with self.assertRaises(phase.Refused):
+                    phase.validate_code_contract(bad)
+
+    def test_code_contract_refuses_invalid_fields_hashes_deletions_and_duplicate_json(self):
+        _, _, contract = self.code_fixture()
+        name = next(iter(contract['changes']))
+        variants = []
+        for key, value in (('version', True), ('baseline', REVISION), ('baseRevision', 'bad'),
+                           ('baseImages', {'backend': 'latest'}), ('changes', {}), ('extra', 'ignored')):
+            bad = deepcopy(contract)
+            bad[key] = value
+            variants.append(bad)
+        for before, after in (('bad', 'a' * 64), (None, None), ('a' * 64, 'a' * 64),
+                              ('a' * 64, 'SHA256:' + 'b' * 64), (7, 'b' * 64)):
+            bad = deepcopy(contract)
+            bad['changes'][name] = {'before': before, 'after': after}
+            variants.append(bad)
+        for bad in variants:
+            with self.subTest(bad=bad), self.assertRaises(phase.Refused):
+                phase.validate_code_contract(bad)
+        path, _ = self.write_contract(contract)
+        path.write_bytes(b'{"version":1,"version":1}')
+        with self.assertRaises(phase.Refused):
+            phase.read_code_contract(path, phase.digest(path))
+
+    def test_code_contract_refuses_stale_before_after_extra_missing_or_deleted_delta(self):
+        _, candidate, contract = self.code_fixture()
+        name = next(iter(contract['changes']))
+        for side in ('before', 'after'):
+            bad = deepcopy(contract)
+            bad['changes'][name][side] = '0' * 64
+            with self.subTest(side=side), self.assertRaises(phase.Refused):
+                phase.source_guard(candidate, bad)
+        for extra in ('server/src/api/unreviewed.ts', 'server/src/db/schema.ts',
+                      'pnpm-lock.yaml', 'ops/minimal/compose.fresh.yml'):
+            path = candidate / extra
+            previous = path.read_bytes() if path.exists() else None
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'unreviewed change')
+            with self.subTest(extra=extra), self.assertRaises(phase.Refused):
+                phase.source_guard(candidate, contract)
+            if previous is None:
+                path.unlink()
+            else:
+                path.write_bytes(previous)
+        original_bytes = (candidate / name).read_bytes()
+        (candidate / name).write_bytes(b'original API\n')
+        with self.assertRaises(phase.Refused):
+            phase.source_guard(candidate, contract)
+        (candidate / name).write_bytes(original_bytes)
+        (candidate / name).unlink()
+        with self.assertRaises(phase.Refused):
+            phase.source_guard(candidate, contract)
+
+    def test_code_contract_requires_explicit_hash_and_rejects_changed_file(self):
+        _, _, contract = self.code_fixture()
+        path, expected = self.write_contract(contract)
+        for invalid in (None, 'bad', '0' * 64):
+            with self.subTest(invalid=invalid), self.assertRaises(phase.Refused):
+                phase.read_code_contract(path, invalid)
+        path.write_bytes(path.read_bytes() + b' ')
+        with self.assertRaises(phase.Refused):
+            phase.read_code_contract(path, expected)
+
+    def test_code_runtime_guard_requires_reviewed_images_and_revision_labels(self):
+        _, _, contract = self.code_fixture()
+        labels = {'Config': {'Labels': {'org.opencontainers.image.revision': REVISION}}}
+        with patch.object(phase, 'image_info', return_value=labels):
+            phase.code_runtime_guard(contract, live_state())
+            drifted = live_state()
+            drifted['backend']['image'] = NEW_IMAGES['backend']
+            with self.assertRaises(phase.Refused):
+                phase.code_runtime_guard(contract, drifted)
+        with patch.object(phase, 'image_info', return_value={'Config': {'Labels': {}}}), \
+                self.assertRaises(phase.Refused):
+            phase.code_runtime_guard(contract, live_state())
+
+    def prepared_code_fixture(self):
+        original, candidate, contract = self.code_fixture()
+        bundle = self.root / 'rybbit-native-update-20261117T010203Z.1234abcd'
+        bundle.mkdir()
+        candidate.rename(bundle / 'source')
+        path, expected = self.write_contract(contract, bundle / 'code-contract.json')
+        nginx = self.root / 'nginx.conf'
+        nginx.write_bytes(b'offline nginx')
+        plan = {'version': 1, 'sha': REVISION, 'project': phase.PROJECT,
+                'root': str(phase.ROOT), 'before': live_state(), 'images': NEW_IMAGES,
+                'files': phase.source_hashes(bundle / 'source'), 'toolSha256': phase.digest(SCRIPT),
+                'nginxSha256': phase.digest(nginx), 'phase': 'prepared', 'codeContractSha256': expected}
+        (bundle / 'plan.json').write_text(json.dumps(plan))
+        self.stack.enter_context(patch.object(phase, 'NGINX', nginx))
+        self.stack.enter_context(patch.object(phase, 'private'))
+        self.stack.enter_context(patch.object(phase, 'verify_images'))
+        actual_path = Path
+        self.stack.enter_context(patch.object(phase, 'Path', side_effect=lambda value:
+                                             self.root if str(value) == '/home/wotcv' else actual_path(value)))
+        original_stat = Path.stat
+        def bundle_stat(path, *args, **kwargs):
+            value = original_stat(path, *args, **kwargs)
+            return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700) if path == bundle else value
+        self.stack.enter_context(patch.object(Path, 'stat', bundle_stat))
+        return SimpleNamespace(bundle=bundle, contract=contract, path=path, expected=expected, plan=plan)
+
+    def test_prepared_code_plan_requires_same_explicit_hash_at_check_and_apply(self):
+        f = self.prepared_code_fixture()
+        self.assertEqual(phase.load_plan(f.bundle, f.expected), f.plan)
+        for invalid in (None, '0' * 64):
+            with self.subTest(invalid=invalid), self.assertRaises(phase.Refused):
+                phase.load_plan(f.bundle, invalid)
+        f.path.write_bytes(f.path.read_bytes() + b' ')
+        with self.assertRaises(phase.Refused):
+            phase.load_plan(f.bundle, f.expected)
+        with patch.object(phase, 'snapshot') as snapshot, patch.object(phase, 'compose') as compose:
+            with self.assertRaises(phase.Refused):
+                phase.apply(f.bundle, phase.ACK, f.expected)
+            snapshot.assert_not_called()
+            compose.assert_not_called()
+
+    def test_code_prepare_requires_paired_contract_options_and_pinned_commit_before_git(self):
+        _, _, contract = self.code_fixture()
+        path, expected = self.write_contract(contract)
+        for args in ((REVISION, path, None), (REVISION, None, expected), (None, path, expected)):
+            with self.subTest(args=args), patch.object(phase, 'git') as git, self.assertRaises(phase.Refused):
+                phase.prepare(*args)
+            git.assert_not_called()
+
+    def test_code_prepare_copies_exact_contract_into_plan_without_starting_apps(self):
+        _, candidate, contract = self.code_fixture()
+        path, expected = self.write_contract(contract)
+        empty_archive = phase.git()
+        def git(*args):
+            if args == ('remote', 'get-url', 'origin'):
+                return phase.REMOTE.encode()
+            if args[0] == 'fetch':
+                return b''
+            if args[0] == 'rev-parse':
+                return REVISION.encode()
+            self.assertEqual(args[0], 'archive')
+            return empty_archive
+        nginx = self.root / 'nginx.conf'
+        nginx.write_bytes(b'offline nginx')
+        actual_path = Path
+        with patch.object(phase, 'Path', side_effect=lambda value:
+                          self.root if str(value) == '/home/wotcv' else actual_path(value)), \
+                patch.object(phase, 'git', side_effect=git), \
+                patch.object(phase, 'unpack', side_effect=lambda data, target:
+                             shutil.copytree(candidate, target, dirs_exist_ok=True)), \
+                patch.object(phase, 'write', side_effect=lambda target, raw:
+                             target.write_bytes(raw.encode() if isinstance(raw, str) else raw)), \
+                patch.object(phase, 'snapshot', return_value=live_state()), \
+                patch.object(phase, 'image_info', return_value={
+                    'Config': {'Labels': {'org.opencontainers.image.revision': REVISION}}}), \
+                patch.object(phase, 'build_images', return_value=NEW_IMAGES), \
+                patch.object(phase, 'verify_images'), patch.object(phase, 'NGINX', nginx), \
+                patch.object(phase, 'compose') as compose:
+            bundle = phase.prepare(REVISION, path, expected)
+        plan = json.loads((bundle / 'plan.json').read_text())
+        self.assertEqual(plan['codeContractSha256'], expected)
+        self.assertEqual(plan['sha'], REVISION)
+        self.assertEqual(plan['toolSha256'], phase.digest(SCRIPT))
+        self.assertEqual((bundle / 'code-contract.json').read_bytes(), path.read_bytes())
+        compose.assert_not_called()
+
+    def test_apply_cli_passes_explicit_reviewed_hash_without_installing_tool(self):
+        expected = 'a' * 64
+        args = ['update.py', 'apply', '--bundle', str(self.root / 'bundle'), '--ack', phase.ACK,
+                '--code-contract-sha256', expected]
+        with patch('sys.argv', args), patch.object(phase, 'locked', return_value=nullcontext()), \
+                patch.object(phase, 'apply') as apply, patch.object(phase, 'install') as install:
+            phase.main()
+        apply.assert_called_once_with(self.root / 'bundle', phase.ACK, expected)
+        install.assert_not_called()
 
     def archive(self, name, kind=tarfile.REGTYPE):
         data = io.BytesIO()
@@ -646,6 +883,53 @@ class OfflineTests(unittest.TestCase):
         self.assertEqual(active['envSha256'], phase.digest(transaction / 'deployment.env'))
         self.assertFalse((f.state / 'pending.json').exists())
         self.assertTrue((transaction / 'completed-pending.json').is_file())
+
+    def code_application_fixture(self):
+        _, _, contract = self.code_fixture()
+        f = self.application_fixture()
+        f.bundle.mkdir(exist_ok=True)
+        f.contract_path, f.contract_hash = self.write_contract(contract, f.bundle / 'code-contract.json')
+        f.plan['codeContractSha256'] = f.contract_hash
+        self.stack.enter_context(patch.object(phase, 'image_info', return_value={
+            'Config': {'Labels': {'org.opencontainers.image.revision': REVISION}}}))
+        return f
+
+    def test_code_apply_preserves_runtime_guards_and_contract_identity_in_private_receipts(self):
+        f = self.code_application_fixture()
+        phase.apply(f.bundle, phase.ACK, f.contract_hash)
+        phase.load_plan.assert_called_once_with(f.bundle, f.contract_hash)
+        phase.receipt_guard.assert_called_once_with(f.before)
+        self.assert_app_only(f.compose.call_args)
+        transaction = f.state / f.bundle.name
+        self.assertEqual(phase.digest(transaction / 'code-contract.json'), f.contract_hash)
+        for path in (transaction / 'attempt.json', transaction / 'success.json', f.state / 'active.json'):
+            self.assertEqual(json.loads(path.read_text())['codeContractSha256'], f.contract_hash)
+        self.assertEqual((transaction / 'previous.env').read_bytes(), ENV)
+
+    def test_code_apply_refuses_unreviewed_runtime_base_before_transaction(self):
+        f = self.code_application_fixture()
+        manifest = json.loads(f.contract_path.read_text())
+        manifest['baseImages']['backend'] = NEW_IMAGES['backend']
+        _, expected = self.write_contract(manifest, f.contract_path)
+        f.plan['codeContractSha256'] = expected
+        with self.assertRaises(phase.Refused):
+            phase.apply(f.bundle, phase.ACK, expected)
+        f.compose.assert_not_called()
+        self.assertFalse(f.state.exists())
+
+    def test_reviewed_code_activation_failure_rolls_back_only_images_and_keeps_contract_pending(self):
+        f = self.code_application_fixture()
+        f.wait.side_effect = [phase.Refused('offline code activation failure'), f.before]
+        with self.assertRaises(phase.Refused):
+            phase.apply(f.bundle, phase.ACK, f.contract_hash)
+        self.assertEqual(f.compose.call_count, 2)
+        for call in f.compose.call_args_list:
+            self.assert_app_only(call)
+        pending = json.loads((f.state / 'pending.json').read_text())
+        self.assertEqual(pending['codeContractSha256'], f.contract_hash)
+        failure = json.loads((f.state / f.bundle.name / 'failure.json').read_text())
+        self.assertEqual(failure['phase'], 'application-images-restored')
+        self.assertFalse((f.state / 'active.json').exists())
 
     def install_fixture(self):
         f = self.application_fixture()
