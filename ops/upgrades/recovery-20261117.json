@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "failedOperation": "20261117T150812Z-033f7aea",
+  "failedReleaseSha": "dc128cdf2791ca6d3c5553165716ca8e8afe05be",
+  "failedPendingSha256": "21b3b155c7ff75686066063c76232f74808a12155caeb415f38b8bbcafa9da72",
+  "failedFailureSha256": "c8d84e56e9f0ac137af75246a2d60efdf4a7f272d338b36f8bf50c343039d7c3",
+  "priorUpdaterSha256": "7899a91fb36d1c006d30284fd9fa55a90708ea520eee80c83fb8df8dbe93a4af",
+  "runtimeSha256": "2ff5c6c653e8cccf80049fcd8114e4c6d5a6a8862afd919f6aba968b66ded65f",
+  "restartContractSha256": "f6ef0df140e77a5e15c73a9e8351051234ccfcfd0fcfc9d7e8be9a254b5e982e"
+}

@@ -44,6 +44,7 @@ class ReleaseTests(unittest.TestCase):
             path.write_text(json.dumps(value))
         self.native = SimpleNamespace(STATE=self.state, ACK='apply-ack', RECONCILE_ACK='reconcile-ack',
             locked=Mock(return_value=nullcontext()), receipt_directory=Mock(), write=write, record=record,
+            receipt_file=lambda path: path.read_bytes(),
             reconcile=Mock(return_value={'phase': 'attested'}),
             snapshot=Mock(side_effect=[self.before, self.before, self.before, self.live]),
             migration_pairs=Mock(side_effect=[[{'hash': 'same'}], [{'hash': 'same'}], [{'hash': 'same'}]]),
@@ -99,6 +100,49 @@ class ReleaseTests(unittest.TestCase):
                 self.native.reconcile.assert_not_called()
                 self.backup.capture_and_drill.assert_not_called()
                 (target / 'pending.json').unlink()
+
+    def test_explicit_reviewed_recovery_supersedes_before_normal_reconcile(self):
+        pending = self.state / 'release-operations/pending.json'
+        pending.parent.mkdir()
+        pending.write_text('failed-original-marker')
+        def supersede(native, root, manifest, failed, new, transaction):
+            self.events.append('supersede')
+            self.assertEqual(pending.read_text(), 'failed-original-marker')
+            self.assertEqual(failed, 'failed-operation')
+            self.assertEqual(new, self.progress.operation)
+            pending.write_text(json.dumps({'operation': new, 'releaseSha': manifest['releaseSha']}))
+        recovery = SimpleNamespace(supersede=Mock(side_effect=supersede))
+        release.execute(self.native, self.backup, self.root, self.manifest, self.progress,
+                        recovery, 'failed-operation')
+        self.assertLess(self.events.index('supersede'), self.events.index('reconciling_restart'))
+        recovery.supersede.assert_called_once()
+        self.assertFalse(pending.exists())
+
+    def test_failed_recovery_keeps_original_marker_and_never_reconciles_or_stops_apps(self):
+        pending = self.state / 'release-operations/pending.json'
+        pending.parent.mkdir()
+        pending.write_text('failed-original-marker')
+        recovery = SimpleNamespace(supersede=Mock(side_effect=release.Refused('unknown evidence')))
+        with self.assertRaises(release.Refused):
+            release.execute(self.native, self.backup, self.root, self.manifest, self.progress,
+                            recovery, 'failed-operation')
+        self.assertEqual(pending.read_text(), 'failed-original-marker')
+        self.native.reconcile.assert_not_called()
+        self.backup.capture_and_drill.assert_not_called()
+        self.native.apply.assert_not_called()
+
+    def test_recovery_noop_cannot_enter_normal_backup_with_old_marker(self):
+        pending = self.state / 'release-operations/pending.json'
+        pending.parent.mkdir()
+        original = json.dumps({'operation': 'failed-operation', 'releaseSha': 'c' * 40})
+        pending.write_text(original)
+        recovery = SimpleNamespace(supersede=Mock(return_value={'result': 'supposedly recovered'}))
+        with self.assertRaisesRegex(release.Refused, 'marker does not bind'):
+            release.execute(self.native, self.backup, self.root, self.manifest, self.progress,
+                            recovery, 'failed-operation')
+        self.assertEqual(pending.read_text(), original)
+        self.native.reconcile.assert_not_called()
+        self.backup.capture_and_drill.assert_not_called()
 
     def test_unverified_backup_blocks_prepare_and_apply_and_retains_pending(self):
         self.backup.capture_and_drill = Mock(return_value={'phase': 'verified', 'drill': {'phase': 'failed'}})

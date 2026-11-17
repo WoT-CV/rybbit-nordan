@@ -24,9 +24,11 @@ PHASES = {'validating', 'reconciling_restart', 'backup_preflight', 'backup_stopp
           'backup_capturing', 'backup_resuming_old_apps', 'backup_restoring_isolated_databases',
           'backup_verified', 'building_release', 'checking_release', 'activating',
           'verifying_activation', 'activated_awaiting_functional_acceptance',
-          'rolling_back', 'verifying_rollback', 'rolled_back_awaiting_functional_acceptance', 'hold'}
+          'rolling_back', 'verifying_rollback', 'rolled_back_awaiting_functional_acceptance',
+          'recovering_failed_operation', 'hold'}
 FILES = {'updater': 'wotcv-native-update.py', 'backup': 'wotcv-native-backup.py',
          'rollback': 'wotcv-native-rollback.py',
+         'recovery': 'wotcv-native-recovery.py', 'recoveryContract': 'recovery-20261117.json',
          'codeContract': 'reviewed-code-20261117.json', 'restartContract': 'restart-20261116.json'}
 HEX = re.compile(r'[0-9a-f]{64}\Z')
 
@@ -162,24 +164,36 @@ def contain_release(native, plan):
             'dataRestore': 'NOT_PERFORMED', 'automaticImageRollback': 'NOT_PERFORMED'}
 
 
-def execute(native, backup, root, manifest, progress):
+def execute(native, backup, root, manifest, progress, recovery=None, failed_operation=None):
     # The orchestration has one lock scope; component functions do not relock.
     with native.locked(root=True):
         native.receipt_directory(native.STATE)
-        require(not (native.STATE / 'pending.json').exists(), 'Pending activation requires inspection')
+        require(not (native.STATE / 'pending.json').exists() and not (native.STATE / 'pending.json').is_symlink(),
+                'Pending activation requires inspection')
         operations = native.STATE / 'release-operations'
         operations.mkdir(mode=0o700, exist_ok=True)
         private_directory(operations)
         pending = operations / 'pending.json'
-        require(not pending.exists() and not pending.is_symlink(), 'Previous release operation requires inspection')
+        if failed_operation is None:
+            require(not pending.exists() and not pending.is_symlink(), 'Previous release operation requires inspection')
+        else:
+            require(recovery is not None, 'Reviewed recovery module required')
         transaction = operations / progress.operation
         transaction.mkdir(mode=0o700)
         private_directory(transaction)
-        native.write(pending, json.dumps({'operation': progress.operation,
-                                         'releaseSha': manifest['releaseSha']}) + '\n')
-        stage = 'reconciling_restart'
+        stage = 'recovering_failed_operation' if failed_operation is not None else 'reconciling_restart'
         activated = False
         try:
+            if failed_operation is not None:
+                progress.publish(stage)
+                recovery.supersede(native, root, manifest, failed_operation, progress.operation, transaction)
+            else:
+                native.write(pending, json.dumps({'operation': progress.operation,
+                                                 'releaseSha': manifest['releaseSha']}) + '\n')
+            require(json.loads(native.receipt_file(pending)) == {
+                'operation': progress.operation, 'releaseSha': manifest['releaseSha']},
+                'Release operation marker does not bind this attempt')
+            stage = 'reconciling_restart'
             progress.publish(stage)
             reconciliation = native.reconcile(root / FILES['restartContract'],
                                               manifest['files']['restartContract'], native.RECONCILE_ACK)
@@ -267,7 +281,9 @@ def main():
     parser.add_argument('--manifest', required=True, type=Path)
     parser.add_argument('--manifest-sha256', required=True)
     parser.add_argument('--ack', required=True)
-    parser.add_argument('--rollback-operation')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--rollback-operation')
+    mode.add_argument('--resume-failed-operation')
     args = parser.parse_args()
     expected_ack = ROLLBACK_ACK if args.rollback_operation is not None else ACK
     require(hasattr(os, 'geteuid') and os.geteuid() == 0 and args.ack == expected_ack,
@@ -283,7 +299,9 @@ def main():
             result = rollback.rollback(native, root, manifest, args.rollback_operation, progress)
         else:
             backup = load_module(root / FILES['backup'], 'reviewed_native_backup')
-            result = execute(native, backup, root, manifest, progress)
+            recovery = (load_module(root / FILES['recovery'], 'reviewed_native_recovery')
+                        if args.resume_failed_operation is not None else None)
+            result = execute(native, backup, root, manifest, progress, recovery, args.resume_failed_operation)
     except BaseException:
         progress.publish('hold')
         raise
