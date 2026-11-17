@@ -7,6 +7,7 @@ import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -164,6 +165,99 @@ class OfflinePreflightTests(unittest.TestCase):
         self.assertTrue(report['result'].startswith('HOLD:'))
         self.assertNotIn('postgresAppliedMigrations', report)
         self.assertEqual(self.native.docker.call_count, 1)
+
+    def test_default_receipt_failure_names_the_stage_without_reading_configuration_or_journal(self):
+        self.native.receipt_guard.side_effect = RuntimeError(SECRET)
+        result, captured = self.run_preflight()
+        report = json.loads(captured)
+        self.assertEqual(result, 1)
+        self.assertEqual(report['failedStage'], 'receipt')
+        self.assertFalse(report['receiptMatchesRuntime'])
+        self.assertFalse(report['readyForActivation'])
+        self.native.current_env.assert_not_called()
+        self.native.docker.assert_not_called()
+
+    def test_receipt_diagnostic_collects_independent_checks_without_clearing_hold(self):
+        self.native.receipt_guard.side_effect = RuntimeError(SECRET)
+        with patch.object(preflight.sys, 'argv',
+                          ['preflight.py', '--expected-updater-sha256', TOOL_HASH, '--diagnose-receipt']), \
+                patch.object(preflight, 'receipt_diagnostic', return_value={'code': 'receipt.active.compared'}):
+            result, captured = self.run_preflight()
+        report = json.loads(captured)
+        self.assertEqual(result, 1)
+        self.assertTrue(report['diagnosticOnly'])
+        self.assertFalse(report['receiptMatchesRuntime'])
+        self.assertTrue(report['effectiveConfigurationMatchesRuntime'])
+        self.assertTrue(report['migrationJournalMatchesRuntimeFiles'])
+        self.assertFalse(report['readyForActivation'])
+        self.assertTrue(report['result'].startswith('HOLD:'))
+
+    def test_receipt_comparison_discloses_only_fixed_fields_and_validated_identities(self):
+        stored = {name: dict(self.live[name]) for name in self.live}
+        stored['postgres'].update({'id': SECRET, 'mounts': [SECRET], 'volume': {SECRET: SECRET},
+                                   'started': SECRET, 'restarts': SECRET, SECRET: SECRET})
+        receipt = {'phase': 'active', 'runtime': stored, 'images': {'backend': SECRET}}
+        report = preflight.compare_receipt(receipt, self.live)
+        self.assertNotIn(SECRET, json.dumps(report))
+        pg = report['databases']['postgres']
+        self.assertFalse(pg['exactMatch'])
+        self.assertIn('started', pg['differentFields'])
+        self.assertIn('mounts', pg['differentFields'])
+        self.assertEqual(pg['recorded']['id'], '[invalid]')
+        self.assertEqual(report['applications']['backend']['recordedImage'], '[invalid]')
+
+    def test_receipt_comparison_distinguishes_restart_metadata_from_persistent_identity(self):
+        stored = {name: dict(self.live[name]) for name in self.live}
+        stored['postgres']['started'] = '2026-11-16T00:00:00Z'
+        receipt = {'phase': 'active', 'runtime': stored,
+                   'images': {n: self.live[n]['image'] for n in ('backend', 'client')}}
+        report = preflight.compare_receipt(receipt, self.live)
+        self.assertEqual(report['databases']['postgres']['differentFields'], ['started'])
+        self.assertFalse(report['databases']['postgres']['exactMatch'])
+        self.assertTrue(report['applications']['backend']['imageMatches'])
+
+    def test_receipt_file_exception_is_sanitized(self):
+        (self.native.STATE / 'active.json').exists.return_value = True
+        self.native.private.side_effect = RuntimeError(SECRET)
+        report = preflight.receipt_diagnostic(self.native, self.live)
+        self.assertNotIn(SECRET, json.dumps(report))
+        self.assertEqual(report['code'], 'receipt.active.private_file_or_structure_check_failed')
+
+    def test_receipt_provenance_refuses_symlinked_unowned_or_public_directories(self):
+        for changes in ({'symlink': True}, {'canonical': False}, {'uid': 1000}, {'mode': 0o40755}):
+            with self.subTest(changes=changes):
+                values = {'symlink': False, 'canonical': True, 'uid': 0, 'mode': 0o40700, **changes}
+                directory = MagicMock()
+                directory.is_symlink.return_value = values['symlink']
+                directory.is_dir.return_value = True
+                directory.resolve.return_value = directory if values['canonical'] else Path('/elsewhere')
+                directory.stat.return_value = SimpleNamespace(st_uid=values['uid'], st_mode=values['mode'])
+                with self.assertRaises(ValueError):
+                    preflight.private_receipt_directory(directory)
+
+    def test_receipt_provenance_accepts_private_root_owned_canonical_directory(self):
+        directory = MagicMock()
+        directory.is_symlink.return_value = False
+        directory.is_dir.return_value = True
+        directory.resolve.return_value = directory
+        directory.stat.return_value = SimpleNamespace(st_uid=0, st_mode=0o40700)
+        preflight.private_receipt_directory(directory)
+
+    def test_receipt_provenance_rejects_real_symlink_in_an_ancestor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            target = base / 'actual'
+            (target / 'release').mkdir(parents=True)
+            alias = base / 'alias'
+            try:
+                alias.symlink_to(target, target_is_directory=True)
+            except OSError:
+                self.skipTest('This operating system does not permit directory symlinks')
+            candidate = alias / 'release'
+            self.assertFalse(candidate.is_symlink())
+            self.assertNotEqual(candidate.resolve(), candidate)
+            with self.assertRaisesRegex(ValueError, 'unexpected receipt directory$'):
+                preflight.private_receipt_directory(candidate)
 
 
 if __name__ == '__main__':
