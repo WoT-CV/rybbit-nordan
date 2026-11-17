@@ -25,10 +25,12 @@ PHASES = {'validating', 'reconciling_restart', 'backup_preflight', 'backup_stopp
           'backup_verified', 'building_release', 'checking_release', 'activating',
           'verifying_activation', 'activated_awaiting_functional_acceptance',
           'rolling_back', 'verifying_rollback', 'rolled_back_awaiting_functional_acceptance',
-          'recovering_failed_operation', 'hold'}
+          'recovering_failed_operation', 'recovering_failed_drill', 'hold'}
 FILES = {'updater': 'wotcv-native-update.py', 'backup': 'wotcv-native-backup.py',
          'rollback': 'wotcv-native-rollback.py',
          'recovery': 'wotcv-native-recovery.py', 'recoveryContract': 'recovery-20261117.json',
+         'drillRecovery': 'wotcv-native-drill-recovery.py',
+         'drillRecoveryContract': 'drill-recovery-20261117.json',
          'codeContract': 'reviewed-code-20261117.json', 'restartContract': 'restart-20261116.json'}
 HEX = re.compile(r'[0-9a-f]{64}\Z')
 
@@ -164,7 +166,8 @@ def contain_release(native, plan):
             'dataRestore': 'NOT_PERFORMED', 'automaticImageRollback': 'NOT_PERFORMED'}
 
 
-def execute(native, backup, root, manifest, progress, recovery=None, failed_operation=None):
+def execute(native, backup, root, manifest, progress, recovery=None, failed_operation=None,
+            drill_recovery=None, failed_drill=None):
     # The orchestration has one lock scope; component functions do not relock.
     with native.locked(root=True):
         native.receipt_directory(native.STATE)
@@ -174,17 +177,25 @@ def execute(native, backup, root, manifest, progress, recovery=None, failed_oper
         operations.mkdir(mode=0o700, exist_ok=True)
         private_directory(operations)
         pending = operations / 'pending.json'
-        if failed_operation is None:
+        require(failed_operation is None or failed_drill is None, 'Select only one recovery mode')
+        if failed_operation is None and failed_drill is None:
             require(not pending.exists() and not pending.is_symlink(), 'Previous release operation requires inspection')
-        else:
+        elif failed_operation is not None:
             require(recovery is not None, 'Reviewed recovery module required')
+        else:
+            require(drill_recovery is not None, 'Reviewed drill recovery module required')
         transaction = operations / progress.operation
         transaction.mkdir(mode=0o700)
         private_directory(transaction)
-        stage = 'recovering_failed_operation' if failed_operation is not None else 'reconciling_restart'
+        stage = ('recovering_failed_drill' if failed_drill is not None else
+                 'recovering_failed_operation' if failed_operation is not None else 'reconciling_restart')
         activated = False
         try:
-            if failed_operation is not None:
+            if failed_drill is not None:
+                progress.publish(stage)
+                prior_capture = drill_recovery.supersede(native, root, manifest, failed_drill,
+                                                        progress.operation, transaction)
+            elif failed_operation is not None:
                 progress.publish(stage)
                 recovery.supersede(native, root, manifest, failed_operation, progress.operation, transaction)
             else:
@@ -201,7 +212,8 @@ def execute(native, backup, root, manifest, progress, recovery=None, failed_oper
             capture = transaction / 'backup'
             capture.mkdir(mode=0o700)
             stage = 'backup_preflight'
-            evidence = backup.capture_and_drill(native, capture, progress.publish)
+            evidence = (backup.resume_drill(native, capture, prior_capture, progress.publish)
+                        if failed_drill is not None else backup.capture_and_drill(native, capture, progress.publish))
             require(evidence.get('phase') == 'verified' and evidence.get('drill', {}).get('phase') == 'passed',
                     'Backup and isolated engine restore must pass before release preparation')
             require(native.snapshot() == evidence['after'], 'Runtime changed after backup validation')
@@ -267,7 +279,9 @@ def execute(native, backup, root, manifest, progress, recovery=None, failed_oper
                 if filename in {'wotcv-native-release.py', 'wotcv-native-update.py', 'wotcv-native-backup.py'}:
                     frames.append({'file': filename, 'line': trace.tb_lineno})
                 trace = trace.tb_next
-            failure = {'phase': stage, 'errorType': type(error).__name__, 'sites': frames,
+            observed_stage = getattr(progress, 'last', stage) if stage == 'backup_preflight' else stage
+            failure = {'phase': observed_stage if observed_stage in PHASES else stage,
+                       'errorType': type(error).__name__, 'sites': frames,
                        'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                        'result': 'HOLD: inspect private transaction before retry'}
             native.record(transaction / 'failure.json', failure)
@@ -284,6 +298,7 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--rollback-operation')
     mode.add_argument('--resume-failed-operation')
+    mode.add_argument('--resume-failed-drill')
     args = parser.parse_args()
     expected_ack = ROLLBACK_ACK if args.rollback_operation is not None else ACK
     require(hasattr(os, 'geteuid') and os.geteuid() == 0 and args.ack == expected_ack,
@@ -301,7 +316,10 @@ def main():
             backup = load_module(root / FILES['backup'], 'reviewed_native_backup')
             recovery = (load_module(root / FILES['recovery'], 'reviewed_native_recovery')
                         if args.resume_failed_operation is not None else None)
-            result = execute(native, backup, root, manifest, progress, recovery, args.resume_failed_operation)
+            drill_recovery = (load_module(root / FILES['drillRecovery'], 'reviewed_native_drill_recovery')
+                              if args.resume_failed_drill is not None else None)
+            result = execute(native, backup, root, manifest, progress, recovery, args.resume_failed_operation,
+                             drill_recovery, args.resume_failed_drill)
     except BaseException:
         progress.publish('hold')
         raise

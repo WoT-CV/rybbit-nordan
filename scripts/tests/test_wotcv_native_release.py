@@ -144,6 +144,52 @@ class ReleaseTests(unittest.TestCase):
         self.native.reconcile.assert_not_called()
         self.backup.capture_and_drill.assert_not_called()
 
+    def test_failed_drill_resumes_validated_capture_without_stopping_source_again(self):
+        pending = self.state / 'release-operations/pending.json'
+        pending.parent.mkdir()
+        pending.write_text(json.dumps({'operation': 'failed-drill', 'releaseSha': 'c' * 40}))
+        prior = self.root / 'validated-prior-capture'
+        def supersede(native, root, manifest, failed, new, transaction):
+            self.assertEqual(failed, 'failed-drill')
+            pending.write_text(json.dumps({'operation': new, 'releaseSha': manifest['releaseSha']}))
+            return prior
+        def resume(native, path, prior_capture, progress):
+            self.assertEqual(prior_capture, prior)
+            return self.backup.capture_and_drill.side_effect(native, path, progress)
+        self.backup.resume_drill = Mock(side_effect=resume)
+        recovery = SimpleNamespace(supersede=Mock(side_effect=supersede))
+        release.execute(self.native, self.backup, self.root, self.manifest, self.progress,
+                        drill_recovery=recovery, failed_drill='failed-drill')
+        recovery.supersede.assert_called_once()
+        self.backup.resume_drill.assert_called_once()
+        self.backup.capture_and_drill.assert_not_called()
+        self.native.apply.assert_called_once()
+
+    def test_refused_drill_recovery_never_enters_resume_or_capture(self):
+        pending = self.state / 'release-operations/pending.json'
+        pending.parent.mkdir()
+        original = json.dumps({'operation': 'failed-drill', 'releaseSha': 'c' * 40})
+        pending.write_text(original)
+        self.backup.resume_drill = Mock()
+        recovery = SimpleNamespace(supersede=Mock(side_effect=release.Refused('unknown artifact')))
+        with self.assertRaises(release.Refused):
+            release.execute(self.native, self.backup, self.root, self.manifest, self.progress,
+                            drill_recovery=recovery, failed_drill='failed-drill')
+        self.assertEqual(pending.read_text(), original)
+        self.backup.resume_drill.assert_not_called()
+        self.backup.capture_and_drill.assert_not_called()
+        self.native.reconcile.assert_not_called()
+
+    def test_failure_records_observed_backup_phase_instead_of_generic_preflight(self):
+        def fail(*args):
+            self.progress.last = 'backup_restoring_isolated_databases'
+            raise release.Refused('private failure')
+        self.backup.capture_and_drill.side_effect = fail
+        with self.assertRaises(release.Refused):
+            self.execute()
+        failure = json.loads((self.state / 'release-operations/fixture-operation/failure.json').read_bytes())
+        self.assertEqual(failure['phase'], 'backup_restoring_isolated_databases')
+
     def test_unverified_backup_blocks_prepare_and_apply_and_retains_pending(self):
         self.backup.capture_and_drill = Mock(return_value={'phase': 'verified', 'drill': {'phase': 'failed'}})
         with self.assertRaises(release.Refused):

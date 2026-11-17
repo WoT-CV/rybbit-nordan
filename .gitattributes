@@ -5,3 +5,4 @@ scripts/wotcv-native-*.py text eol=lf
 ops/upgrades/reviewed-code-*.json text eol=lf
 ops/upgrades/restart-*.json text eol=lf
 ops/upgrades/recovery-*.json text eol=lf
+ops/upgrades/drill-recovery-*.json text eol=lf

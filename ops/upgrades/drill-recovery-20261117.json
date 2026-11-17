@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "failedOperation": "20261117T153454Z-eddd7ac6",
+  "failedReleaseSha": "19bc4ff1a37a083f36da082925e91dc919b89154",
+  "failedPendingSha256": "c3597d37339fa5720806c452134e5250628316087757bfb31aba6449ea4e4572",
+  "failedFailureSha256": "db19e077496c85236d8801a52581ea72c21ff6a0def3cc2666c8cceac1345444",
+  "priorPacketDirectory": "/var/tmp/rybbit-update-20261117/recovery-19bc4ff1",
+  "priorUpdaterSha256": "4857e4cf207064ebc71c28638a7b0e99f5780465047b2ca2d47a1974c2caeb99",
+  "priorBackupSha256": "92ed159c7e55d2cbdf2f92aa7be5d7c20e1cbc1f58dd5afd83585aac1d0be78b",
+  "runtimeSha256": "2e48b81f74d93de18f1034fcf62c4e1f22801deb56cac1f1bc145ea3e71abd14",
+  "restartContractSha256": "f6ef0df140e77a5e15c73a9e8351051234ccfcfd0fcfc9d7e8be9a254b5e982e",
+  "failedDrill": {
+    "token": "4f6fadc24b610ee2",
+    "container": "ba49091aceb0023a3e2c286922c64684cd22cbff4de1d54a695038213331787b",
+    "volume": "wotcv-native-drill-4f6fadc24b610ee2-postgres-data",
+    "image": "sha256:304ab813518754228f9f792f79d6da36359b82d8ecf418096c636725f8c930ad",
+    "exitCode": 137,
+    "oomKilled": false
+  }
+}
