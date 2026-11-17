@@ -905,6 +905,33 @@ class OfflineTests(unittest.TestCase):
         self.assertEqual(snapshot.call_count, 60)
         self.assertEqual(sleep.call_count, 60)
 
+    def test_wait_ready_retries_connection_reset_during_http_startup(self):
+        live = live_state()
+        with patch.object(phase, 'snapshot', return_value=live), \
+                patch.object(phase, 'readiness', side_effect=[ConnectionResetError(), None]) as ready, \
+                patch.object(phase.time, 'sleep') as sleep:
+            self.assertEqual(phase.wait_ready({name: live[name]['image'] for name in NEW_IMAGES}), live)
+        self.assertEqual(ready.call_count, 2)
+        sleep.assert_called_once_with(2)
+
+    def test_wait_ready_bounds_resets_and_does_not_swallow_other_os_errors(self):
+        live = live_state()
+        images = {name: live[name]['image'] for name in NEW_IMAGES}
+        with patch.object(phase, 'snapshot', return_value=live), \
+                patch.object(phase, 'readiness', side_effect=ConnectionResetError()) as ready, \
+                patch.object(phase.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(phase.Refused, 'timed out'):
+                phase.wait_ready(images)
+        self.assertEqual(ready.call_count, 60)
+        self.assertEqual(sleep.call_count, 60)
+        with patch.object(phase, 'snapshot', return_value=live), \
+                patch.object(phase, 'readiness', side_effect=PermissionError()) as ready, \
+                patch.object(phase.time, 'sleep') as sleep:
+            with self.assertRaises(PermissionError):
+                phase.wait_ready(images)
+        ready.assert_called_once_with()
+        sleep.assert_not_called()
+
     def application_fixture(self):
         state = self.root / 'state'
         bundle = self.root / 'candidate'
@@ -1252,6 +1279,26 @@ class ReconciliationTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(phase.Refused):
                 phase.receipt_guard(changed)
         self.assertEqual(self.reconcile(f)['attestationSha256'], report['attestationSha256'])
+
+    def test_new_reviewed_tool_requires_fresh_attestation_and_preserves_old_bytes(self):
+        f = self.fixture()
+        self.reconcile(f)
+        active_hash = phase.digest(f.state / 'active.json')
+        old_path = phase.reconciliation_path(active_hash, f.live)
+        old_bytes = old_path.read_bytes()
+        real_digest = phase.digest
+        def changed_tool(path):
+            return 'b' * 64 if path == Path(phase.__file__) else real_digest(path)
+        with patch.object(phase, 'digest', side_effect=changed_tool):
+            new_path = phase.reconciliation_path(active_hash, f.live)
+            self.assertNotEqual(new_path, old_path)
+            with self.assertRaises((phase.Refused, OSError)):
+                phase.receipt_guard(f.live)
+            self.reconcile(f)
+            phase.receipt_guard(f.live)
+            self.assertEqual(json.loads(new_path.read_bytes())['toolSha256'], 'b' * 64)
+        self.assertEqual(old_path.read_bytes(), old_bytes)
+        self.assertEqual(len(list(old_path.parent.glob('*.json'))), 2)
 
     def test_reconciliation_refuses_stable_drift_missing_fields_and_nonzero_restarts(self):
         f = self.fixture()

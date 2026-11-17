@@ -673,7 +673,10 @@ def database_runtime(live):
 
 
 def reconciliation_path(active_hash, live):
-    return STATE / 'reconciliations' / (active_hash + '.' + canonical_hash(database_runtime(live)) + '.json')
+    # A reviewed tool change needs its own freshly verified immutable evidence.
+    # Earlier attestations remain history and cannot authorize different bytes.
+    return STATE / 'reconciliations' / (active_hash + '.' + canonical_hash(database_runtime(live)) +
+                                      '.' + digest(Path(__file__)) + '.json')
 
 
 def reconciled_receipt_guard(state, live):
@@ -845,7 +848,7 @@ def wait_ready(images):
                     'Application restarted during activation')
             readiness()
             return live
-        except (Refused, urllib.error.URLError, TimeoutError, ValueError):
+        except (Refused, urllib.error.URLError, ConnectionResetError, TimeoutError, ValueError):
             time.sleep(2)
     raise Refused('Application readiness timed out')
 

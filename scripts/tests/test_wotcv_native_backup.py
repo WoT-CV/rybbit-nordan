@@ -62,6 +62,50 @@ class BackupTests(unittest.TestCase):
                 (events.append(m), v)[1]))
         return events
 
+    def mock_stops(self, client=143, backend=0, *, bad_service=None, oom=False, error=''):
+        def docker(*args, **kwargs):
+            if args[0] == 'stop':
+                return b''
+            self.assertEqual(args[0], 'inspect')
+            name = next(name for name in ('client', 'backend') if self.job.before[name]['id'] == args[1])
+            return json.dumps([{'Id': self.job.before[name]['id'], 'Image': self.job.before[name]['image'],
+                'State': {'Status': 'exited', 'ExitCode': client if name == 'client' else backend,
+                          'OOMKilled': oom if name == bad_service else False,
+                          'Error': error if name == bad_service else '', 'Running': False, 'Restarting': False,
+                          'FinishedAt': '2026-11-17T15:08:15.341822155Z'}}]).encode()
+        self.native.docker.side_effect = docker
+
+    def test_client_term_143_and_backend_drain_0_are_accepted_and_recorded(self):
+        self.mock_stops()
+        self.job.stop_apps()
+        self.assertEqual([call.args[-1] for call in self.native.docker.call_args_list if call.args[0] == 'stop'],
+                         ['client-source', 'backend-source'])
+        evidence = json.loads((self.path / 'stopped-apps.json').read_text())
+        self.assertEqual(evidence['client']['exitCode'], 143)
+        self.assertEqual(evidence['backend']['exitCode'], 0)
+        self.assertTrue(all(value['identityMatches'] and value['stateErrorEmpty'] for value in evidence.values()))
+
+    def test_backend_143_client_137_oom_and_nonempty_state_error_refuse_capture(self):
+        cases = [({'backend': 143}, 'backend'), ({'client': 137}, 'client'),
+                 ({'bad_service': 'client', 'oom': True}, 'client'),
+                 ({'bad_service': 'backend', 'oom': True}, 'backend'),
+                 ({'bad_service': 'client', 'error': 'SENSITIVE-STATE-DETAILS'}, 'client'),
+                 ({'bad_service': 'backend', 'error': 'SENSITIVE-STATE-DETAILS'}, 'backend')]
+        for options, service in cases:
+            with self.subTest(options=options):
+                self.job.stopped.clear()
+                self.job.stop_states.clear()
+                self.native.docker.reset_mock()
+                self.mock_stops(**options)
+                with self.assertRaisesRegex(Refused, 'shutdown was not clean'):
+                    self.job.stop_apps()
+                evidence = json.loads((self.path / 'stopped-apps.json').read_text())
+                self.assertIn(service, evidence)
+                self.assertNotIn('SENSITIVE-STATE-DETAILS', (self.path / 'stopped-apps.json').read_text())
+                if service == 'client':
+                    self.assertFalse(any(call.args[0] == 'stop' and call.args[-1] == 'backend-source'
+                                         for call in self.native.docker.call_args_list))
+
     def test_success_orders_capture_resume_drill_and_never_applies(self):
         events = self.mock_run_stages()
         report = self.job.run()
@@ -89,6 +133,51 @@ class BackupTests(unittest.TestCase):
         self.assertIn('resume_apps', events)
         self.job.capture.assert_not_called()
         self.job.drill.assert_not_called()
+
+    def test_primary_stop_failure_and_secondary_recovery_failure_are_both_preserved(self):
+        self.mock_run_stages()
+        primary = Refused('PRIMARY-SECRET-MESSAGE')
+        secondary = ConnectionResetError('RECOVERY-SECRET-MESSAGE')
+        self.job.stop_apps = Mock(side_effect=primary)
+        self.job.resume_apps = Mock(side_effect=secondary)
+        with self.assertRaises(ConnectionResetError) as caught:
+            self.job.run()
+        self.assertIs(caught.exception.__cause__, primary)
+        first = json.loads((self.path / 'capture-failure.json').read_text())
+        second = json.loads((self.path / 'recovery-failure.json').read_text())
+        self.assertEqual(first['errorType'], 'Refused')
+        self.assertEqual(second['errorType'], 'ConnectionResetError')
+        self.assertTrue(first['sites'])
+        self.assertTrue(second['sites'])
+        for value in (first, second):
+            self.assertEqual(set(value), {'phase', 'errorType', 'sites', 'at'})
+            self.assertNotIn('SECRET', json.dumps(value))
+            self.assertTrue(all(set(site) == {'file', 'line'} for site in value['sites']))
+        self.job.capture.assert_not_called()
+        self.job.drill.assert_not_called()
+
+    def test_primary_evidence_write_failure_never_suppresses_resume_or_original_failure(self):
+        events = self.mock_run_stages()
+        self.job.stop_apps = Mock(side_effect=Refused('primary stop refusal'))
+        record = self.native.record
+        def fail_primary(path, value):
+            if path.name == 'capture-failure.json':
+                raise OSError('evidence destination unavailable')
+            return record(path, value)
+        self.native.record = fail_primary
+        with self.assertRaisesRegex(Refused, 'primary stop refusal'):
+            self.job.run()
+        self.assertIn('resume_apps', events)
+        self.job.drill.assert_not_called()
+
+    def test_cleanup_failure_never_suppresses_resume_or_original_failure(self):
+        events = self.mock_run_stages()
+        self.job.stop_apps = Mock(side_effect=Refused('primary stop refusal'))
+        self.job.cleanup_source = Mock(side_effect=OSError('private cleanup error'))
+        with self.assertRaisesRegex(Refused, 'primary stop refusal'):
+            self.job.run()
+        self.assertIn('resume_apps', events)
+        self.assertEqual(json.loads((self.path / 'cleanup-failure.json').read_text())['errorType'], 'OSError')
 
     def test_reporting_failure_cannot_suppress_old_app_resume(self):
         events = self.mock_run_stages()

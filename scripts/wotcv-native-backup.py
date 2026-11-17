@@ -16,6 +16,7 @@ import secrets
 import shutil
 import subprocess
 import time
+import traceback
 import xml.etree.ElementTree as ET
 
 
@@ -65,6 +66,19 @@ def file_hash(path):
     return value.hexdigest()
 
 
+def failure_evidence(error, phase):
+    """Closed metadata only: never serialize exception messages or frame locals."""
+    kind = type(error).__name__
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,79}', kind):
+        kind = 'UnknownError'
+    sites = []
+    for frame in traceback.extract_tb(error.__traceback__)[-16:]:
+        name = Path(frame.filename).name
+        sites.append({'file': name if re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', name) else '[unknown]',
+                      'line': frame.lineno})
+    return {'phase': phase, 'errorType': kind, 'sites': sites, 'at': utc()}
+
+
 class Backup:
     def __init__(self, native, transaction, progress=None):
         self.n = native
@@ -83,6 +97,8 @@ class Backup:
         self.ch_backup_attempted = False
         self.progress = progress or (lambda phase: None)
         self.drill_history = []
+        self.stop_states = {}
+        self.capture_stage = 'stopping_apps'
 
     def require(self, condition, message):
         self.n.require(condition, message)
@@ -92,6 +108,13 @@ class Backup:
 
     def record(self, name, value):
         self.n.record(self.root / name, value)
+
+    def best_effort_record(self, name, value):
+        # Evidence I/O is subordinate to restoring the already stopped writers.
+        try:
+            self.record(name, value)
+        except BaseException:
+            pass
 
     def docker(self, *args, **kwargs):
         return self.n.docker(*args, **kwargs)
@@ -229,10 +252,34 @@ class Backup:
     def stop_apps(self):
         # Track attempts too: a failed command may already have stopped a source.
         for name in ('client', 'backend'):
+            self.capture_stage = 'stopping_' + name
             self.stopped.append(name)
             self.docker('stop', '--time', '60', self.before[name]['id'], timeout=90)
-            state = json.loads(self.docker('inspect', self.before[name]['id']))[0]['State']
-            self.require(state['Status'] == 'exited' and state['ExitCode'] == 0 and not state.get('OOMKilled'),
+            item = json.loads(self.docker('inspect', self.before[name]['id']))[0]
+            state = item['State']
+            finished = state.get('FinishedAt')
+            exit_code = state.get('ExitCode')
+            status = state.get('Status')
+            self.stop_states[name] = {
+                'id': self.before[name]['id'], 'image': self.before[name]['image'],
+                'identityMatches': item.get('Id') == self.before[name]['id'] and
+                                   item.get('Image') == self.before[name]['image'],
+                'status': status if status in {'created', 'running', 'paused', 'restarting', 'removing', 'exited', 'dead'}
+                          else '[invalid]',
+                'exitCode': exit_code if type(exit_code) is int else None,
+                'oomKilled': state.get('OOMKilled') is not False,
+                'running': bool(state.get('Running')), 'restarting': bool(state.get('Restarting')),
+                'stateErrorEmpty': state.get('Error', '') == '',
+                'finishedAt': finished if isinstance(finished, str) and
+                              re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z', finished) else None}
+            # Persist the stopped state before a possible refusal. In particular,
+            # the independently observed Next client exits 143 after clean TERM;
+            # backend drain still requires its explicit successful exit code 0.
+            self.record('stopped-apps.json', self.stop_states)
+            allowed = {0, 143} if name == 'client' else {0}
+            self.require(self.stop_states[name]['identityMatches'] and status == 'exited' and
+                         type(exit_code) is int and exit_code in allowed and state.get('OOMKilled') is False and
+                         not state.get('Running') and not state.get('Restarting') and state.get('Error', '') == '',
                          'Application shutdown was not clean; capture refused')
 
     def resume_apps(self):
@@ -535,31 +582,57 @@ class Backup:
             raise
         self.record('status.json', {'phase': 'capturing', 'startedAt': started})
         capture_error = None
+        cleanup_error = None
+        progress_error = None
+        recovery_error = None
         try:
             self.progress('backup_stopping_apps')
             self.stop_apps()
             capture_start = utc()
+            self.capture_stage = 'capturing'
             self.progress('backup_capturing')
             expected, artifacts = self.capture()
             capture_end = utc()
         except BaseException as exc:
             capture_error = exc
+            # Recovery may also fail; preserve the first cause before finally.
+            self.best_effort_record('capture-failure.json', failure_evidence(exc, self.capture_stage))
         finally:
             try:
                 self.cleanup_source()
+            except BaseException as exc:
+                cleanup_error = exc
+                self.best_effort_record('cleanup-failure.json', failure_evidence(exc, 'cleanup_source'))
             finally:
                 try:
                     self.progress('backup_resuming_old_apps')
+                except BaseException as exc:
+                    progress_error = exc
+                    self.best_effort_record('reporting-failure.json', failure_evidence(exc, 'reporting_resume'))
                 finally:
                     # Reporting failure must never prevent safe writer recovery.
                     try:
                         after = self.resume_apps()
-                    except BaseException:
-                        self.record('status.json', {'phase': 'source_changed_or_old_apps_resume_failed', 'at': utc()})
-                        raise
+                    except BaseException as exc:
+                        recovery_error = exc
+                        self.best_effort_record('recovery-failure.json', failure_evidence(exc, 'resume_old_apps'))
+                        self.best_effort_record('status.json',
+                                               {'phase': 'source_changed_or_old_apps_resume_failed', 'at': utc()})
+        if recovery_error is not None:
+            # The separate closed reports retain both errors even when the root
+            # wrapper reports only this final failure. Preserve Python's cause too.
+            if capture_error is not None:
+                raise recovery_error from capture_error
+            raise recovery_error
         if capture_error is not None:
-            self.record('status.json', {'phase': 'capture_failed_old_apps_resumed', 'at': utc()})
+            self.best_effort_record('status.json', {'phase': 'capture_failed_old_apps_resumed', 'at': utc()})
             raise capture_error
+        if cleanup_error is not None:
+            self.best_effort_record('status.json', {'phase': 'cleanup_failed_old_apps_resumed', 'at': utc()})
+            raise cleanup_error
+        if progress_error is not None:
+            self.best_effort_record('status.json', {'phase': 'reporting_failed_old_apps_resumed', 'at': utc()})
+            raise progress_error
         self.record('status.json', {'phase': 'drilling_old_apps_resumed', 'at': utc()})
         # Preserve failed drill resources as evidence; remove only after PASS.
         self.progress('backup_restoring_isolated_databases')
