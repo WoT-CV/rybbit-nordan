@@ -19,6 +19,7 @@ SCRIPT = Path(__file__).resolve().parents[1] / 'wotcv-native-update.py'
 SPEC = importlib.util.spec_from_file_location('wotcv_native_update_under_test', SCRIPT)
 phase = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(phase)
+DOCKER_CALL = phase.docker
 OLD_IMAGES = {name: 'sha256:' + str(index) * 64
               for index, name in enumerate(phase.SERVICES, 1)}
 NEW_IMAGES = {'backend': 'sha256:' + 'a' * 64, 'client': 'sha256:' + 'b' * 64}
@@ -661,6 +662,85 @@ class OfflineTests(unittest.TestCase):
                 phase.image_info('latest:mutable')
             docker.assert_not_called()
 
+    def private_build_permissions(self, *paths):
+        # Windows does not expose Unix private mode bits. Emulate just these
+        # directories after creation, preserving real I/O and absence checks.
+        actual_stat = Path.stat
+        def build_stat(path, *args, **kwargs):
+            value = actual_stat(path, *args, **kwargs)
+            if path in paths:
+                return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=phase.os.geteuid())
+            return value
+        self.stack.enter_context(patch.object(Path, 'stat', build_stat))
+
+    def test_build_config_is_fresh_empty_private_and_does_not_read_global_client_state(self):
+        bundle = self.root / 'private-release'
+        bundle.mkdir()
+        config = bundle / 'docker-cli'
+        self.private_build_permissions(bundle, config)
+        actual_mkdir = Path.mkdir
+        with patch.object(Path, 'mkdir', autospec=True, side_effect=actual_mkdir) as mkdir, \
+                patch.object(Path, 'read_bytes', side_effect=AssertionError('Client config reads forbidden')):
+            self.assertEqual(phase.create_build_config(bundle), config)
+        created = [call for call in mkdir.call_args_list if call.args[0] == config]
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0].kwargs, {'mode': 0o700})
+        self.assertEqual(list(config.iterdir()), [])
+        sentinel = config / 'existing-metadata'
+        sentinel.write_bytes(b'preserve')
+        with self.assertRaises(phase.Refused):
+            phase.create_build_config(bundle)
+        self.assertEqual(sentinel.read_bytes(), b'preserve')
+
+    def test_build_config_refuses_unowned_public_noncanonical_or_symlink_paths(self):
+        bundle = self.root / 'private-release'
+        bundle.mkdir()
+        config = bundle / 'docker-cli'
+        actual_stat = Path.stat
+        for mode, uid in ((0o755, 0), (0o700, 1001)):
+            def unsafe_stat(path, *args, **kwargs):
+                value = actual_stat(path, *args, **kwargs)
+                return SimpleNamespace(st_mode=stat.S_IFDIR | mode, st_uid=uid) if path == bundle else value
+            with self.subTest(mode=mode, uid=uid), patch.object(Path, 'stat', unsafe_stat), \
+                    self.assertRaises(phase.Refused):
+                phase.create_build_config(bundle)
+            self.assertFalse(config.exists())
+        self.private_build_permissions(bundle, config)
+        actual_symlink = Path.is_symlink
+        def symlink(path):
+            return path == config or actual_symlink(path)
+        with patch.object(Path, 'is_symlink', symlink), self.assertRaises(phase.Refused):
+            phase.create_build_config(bundle)
+        self.assertFalse(config.exists())
+        config.mkdir()
+        with self.assertRaises(phase.Refused):
+            phase.validate_build_config(bundle, self.root / 'outside-config')
+        with patch.object(Path, 'is_symlink', symlink), self.assertRaises(phase.Refused):
+            phase.validate_build_config(bundle, config)
+        actual_resolve = Path.resolve
+        def noncanonical(path, *args, **kwargs):
+            return self.root / 'different-release' if path == bundle else actual_resolve(path, *args, **kwargs)
+        with patch.object(Path, 'resolve', noncanonical), self.assertRaises(phase.Refused):
+            phase.validate_build_config(bundle, config)
+
+    def test_asset_build_refuses_unsafe_docker_config_before_inspecting_images(self):
+        config = self.root / 'docker-cli'
+        tag = 'wotcv-rybbit-native:' + REVISION + '-backend-1234abcd'
+        self.private_build_permissions(self.root)
+        with patch.object(phase, 'docker') as docker, self.assertRaises(phase.Refused):
+            phase.normalize_assets(NEW_IMAGES['backend'], tag, self.root / 'source', io.BytesIO(), config)
+        docker.assert_not_called()
+
+    def test_docker_build_config_keeps_pinned_engine_socket_and_fixed_environment(self):
+        config = self.root / 'docker-cli'
+        with patch.object(phase, 'run', return_value=b'') as run:
+            DOCKER_CALL('--config', str(config), 'build', '.')
+        self.assertEqual(run.call_args.args[0],
+                         ['/usr/bin/docker', '--host', 'unix:///var/run/docker.sock', '--config', str(config), 'build', '.'])
+        self.assertEqual(run.call_args.kwargs, {})
+        self.assertNotIn('DOCKER_CONFIG', phase.safe_env())
+        self.assertNotIn('DOCKER_HOST', phase.safe_env())
+
     def test_asset_normalization_derives_from_exact_image_offline_and_records_tool_provenance(self):
         original = NEW_IMAGES['backend']
         derived = 'sha256:' + 'd' * 64
@@ -669,13 +749,17 @@ class OfflineTests(unittest.TestCase):
         final = {'Id': derived, 'RootFS': {'Layers': ['sha256:base-layer', 'sha256:asset-layer']}}
         source = self.root / 'source'
         source.mkdir()
+        config = self.root / 'docker-cli'
+        config.mkdir()
+        self.private_build_permissions(self.root, config)
         with patch.object(phase, 'docker', side_effect=[json.dumps([base]).encode(), b'',
                           json.dumps([final]).encode(), json.dumps([base]).encode()]) as docker:
             log = io.BytesIO()
-            actual = phase.normalize_assets(original, base_tag, source, log)
+            actual = phase.normalize_assets(original, base_tag, source, log, config)
         self.assertEqual(actual, derived)
         before, build, inspect, after = docker.call_args_list
-        self.assertEqual(build.args, ('build', '--pull=false', '--network', 'none', '-f', '-', '-t', base_tag + '-assets', '.'))
+        self.assertEqual(build.args, ('--config', str(config), 'build', '--pull=false', '--network', 'none',
+                                     '-f', '-', '-t', base_tag + '-assets', '.'))
         self.assertEqual(build.kwargs['cwd'], source)
         self.assertIs(build.kwargs['log'], log)
         self.assertEqual(build.kwargs['timeout'], 180)
@@ -699,7 +783,7 @@ class OfflineTests(unittest.TestCase):
         for identity in ('backend:latest', 'sha256:abc', 'a' * 64, 'sha256:' + 'G' * 64):
             with self.subTest(identity=identity), patch.object(phase, 'docker') as docker:
                 with self.assertRaises(phase.Refused):
-                    phase.normalize_assets(identity, 'offline:normalized', self.root, io.BytesIO())
+                    phase.normalize_assets(identity, 'offline:normalized', self.root, io.BytesIO(), self.root / 'docker-cli')
                 docker.assert_not_called()
 
     def test_asset_normalization_refuses_unscoped_or_moving_base_tags(self):
@@ -708,7 +792,7 @@ class OfflineTests(unittest.TestCase):
                     'wotcv-rybbit-native:' + REVISION + '-backend-ABCDEF12'):
             with self.subTest(tag=tag), patch.object(phase, 'docker') as docker:
                 with self.assertRaises(phase.Refused):
-                    phase.normalize_assets(NEW_IMAGES['backend'], tag, self.root, io.BytesIO())
+                    phase.normalize_assets(NEW_IMAGES['backend'], tag, self.root, io.BytesIO(), self.root / 'docker-cli')
                 docker.assert_not_called()
 
     def test_asset_normalization_refuses_base_tag_identity_drift_and_unrelated_layer_lineage(self):
@@ -717,19 +801,24 @@ class OfflineTests(unittest.TestCase):
         base = {'Id': identity, 'RootFS': {'Layers': ['base-layer']}}
         final = {'Id': 'sha256:' + 'd' * 64, 'RootFS': {'Layers': ['base-layer', 'asset-layer']}}
         wrong = {'Id': NEW_IMAGES['client'], 'RootFS': {'Layers': ['other-layer']}}
+        config = self.root / 'docker-cli'
+        config.mkdir()
+        self.private_build_permissions(self.root, config)
         variants = ([json.dumps([wrong]).encode()],
                     [json.dumps([base]).encode(), b'', json.dumps([final]).encode(), json.dumps([wrong]).encode()],
                     [json.dumps([base]).encode(), b'', json.dumps([wrong]).encode(), json.dumps([base]).encode()])
         for responses in variants:
             with self.subTest(responses=len(responses)), patch.object(phase, 'docker', side_effect=responses), \
                     self.assertRaises(phase.Refused):
-                phase.normalize_assets(identity, tag, self.root, io.BytesIO())
+                phase.normalize_assets(identity, tag, self.root / 'source', io.BytesIO(), config)
 
     def test_build_images_normalizes_only_backend_and_pins_client_lite_flag(self):
         bundle = self.root / 'release.1234abcd'
         bundle.mkdir()
+        config = bundle / 'docker-cli'
+        self.private_build_permissions(bundle, config)
         def docker(*args, **kwargs):
-            if args[0] == 'build':
+            if args[:3] == ('--config', str(config), 'build'):
                 return b''
             self.assertEqual(args[:2], ('image', 'inspect'))
             return json.dumps([{'Id': NEW_IMAGES['backend' if '-backend-' in args[2] else 'client']}]).encode()
@@ -741,7 +830,8 @@ class OfflineTests(unittest.TestCase):
         normalize.assert_called_once()
         self.assertEqual(normalize.call_args.args[:3], (NEW_IMAGES['backend'],
                          'wotcv-rybbit-native:' + REVISION + '-backend-1234abcd', bundle / 'source'))
-        builds = [call for call in calls.call_args_list if call.args[0] == 'build']
+        self.assertEqual(normalize.call_args.args[4], config)
+        builds = [call for call in calls.call_args_list if call.args[:3] == ('--config', str(config), 'build')]
         self.assertEqual(len(builds), 2)
         self.assertIn('NEXT_PUBLIC_LITE_DASHBOARD=false', builds[1].args)
         for call in builds:

@@ -365,8 +365,34 @@ def locked(root=False):
         yield
 
 
+def private_build_directory(path):
+    require(not path.is_symlink() and path.is_dir() and path.resolve() == path,
+            'Build metadata requires a canonical private directory')
+    metadata = path.stat()
+    require(metadata.st_uid == os.geteuid() and metadata.st_mode & 0o077 == 0,
+            'Build metadata directory must be owned by the builder and private')
+
+
+def validate_build_config(bundle, config):
+    private_build_directory(bundle)
+    require(config == bundle / 'docker-cli', 'Unexpected bundle-local Docker CLI configuration path')
+    private_build_directory(config)
+
+
+def create_build_config(bundle):
+    private_build_directory(bundle)
+    config = bundle / 'docker-cli'
+    require(not config.exists() and not config.is_symlink(), 'Build metadata directory already exists; prepare a fresh bundle')
+    config.mkdir(mode=0o700)
+    validate_build_config(bundle, config)
+    # Docker/Buildx may write local metadata here. Never import global config,
+    # credentials or client metadata; the pinned engine/socket remains shared.
+    return config
+
+
 def build_images(bundle, sha):
     result = {}
+    docker_config = create_build_config(bundle)
     logpath = bundle / 'build.log'
     with os.fdopen(os.open(logpath, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as log:
         for name in ('backend', 'client'):
@@ -379,18 +405,20 @@ def build_images(bundle, sha):
                                    'NEXT_PUBLIC_LITE_DASHBOARD': 'false'}.items():
                     args += ['--build-arg', key + '=' + value]
             print('Building ' + name + '; private log: ' + str(logpath), flush=True)
-            docker(*args, '.', cwd=bundle / 'source', timeout=2400, log=log)
+            validate_build_config(bundle, docker_config)
+            docker('--config', str(docker_config), *args, '.', cwd=bundle / 'source', timeout=2400, log=log)
             identity = json.loads(docker('image', 'inspect', tag))[0]['Id']
             if name == 'backend':
-                identity = normalize_assets(identity, tag, bundle / 'source', log)
+                identity = normalize_assets(identity, tag, bundle / 'source', log, docker_config)
             result[name] = identity
     return result
 
 
-def normalize_assets(identity, base_tag, source, log):
+def normalize_assets(identity, base_tag, source, log, docker_config):
     require(IMAGE.fullmatch(identity), 'Unpinned backend build result')
     require(re.fullmatch(r'wotcv-rybbit-native:[0-9a-f]{40}-backend-[0-9a-f]{8}', base_tag),
             'Unexpected private build tag')
+    validate_build_config(source.parent, docker_config)
     base = json.loads(docker('image', 'inspect', base_tag))[0]
     require(base['Id'] == identity, 'Backend build tag changed')
     # Native build regenerates script.js but upstream's Dockerfile does not
@@ -408,7 +436,7 @@ def normalize_assets(identity, base_tag, source, log):
                   'LABEL wotcv.native.updater-sha256="' + digest(Path(__file__)) + '"\n' +
                   'RUN ' + json.dumps(['node', '-e', js]) + '\n')
     tag = base_tag + '-assets'
-    docker('build', '--pull=false', '--network', 'none', '-f', '-', '-t', tag, '.',
+    docker('--config', str(docker_config), 'build', '--pull=false', '--network', 'none', '-f', '-', '-t', tag, '.',
            cwd=source, timeout=180, log=log, data=dockerfile.encode())
     final = json.loads(docker('image', 'inspect', tag))[0]
     require(json.loads(docker('image', 'inspect', base_tag))[0]['Id'] == identity and
