@@ -141,8 +141,11 @@ The [native updater](scripts/wotcv-native-update.py) is tied to an existing
 installation and accepts frontend/static-asset updates by default. An explicitly
 hash-reviewed code contract can approve an exact backend API delta while
 dependencies, schema, startup and native configuration remain protected.
-See the [code-release runbook](ops/upgrades/2026-11-17-upstream.md) for its
-backup, migration-journal, operator and rollback prerequisites; this is not a
+The [code-release runbook](ops/upgrades/2026-11-17-upstream.md) describes the
+hash-reviewed [operator packet](scripts/wotcv-native-release.py), quiesced
+[backups and isolated restore drill](scripts/wotcv-native-backup.py), and
+guarded [application/configuration rollback](scripts/wotcv-native-rollback.py).
+It requires verified backups, migration journals and operator access; this is not a
 general database/dependency upgrade path. The [legacy updater bridge](scripts/wotcv-branch-build-deploy.sh) refuses
 deployment with exit code 78. These scripts are not a general fresh-install guide.
 Proxy examples for private noindex responses and public tracker caching are in
