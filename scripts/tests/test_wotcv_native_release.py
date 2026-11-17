@@ -180,6 +180,23 @@ class ReleaseTests(unittest.TestCase):
         self.backup.capture_and_drill.assert_not_called()
         self.native.reconcile.assert_not_called()
 
+    def test_failure_sites_include_hash_verified_recovery_helper_without_error_text(self):
+        pending = self.state / 'release-operations/pending.json'
+        pending.parent.mkdir()
+        pending.write_text(json.dumps({'operation': 'failed-drill', 'releaseSha': 'c' * 40}))
+        namespace = {'Refused': release.Refused}
+        exec(compile('def supersede(*args):\n    raise Refused("credential must-never-be-reported")\n',
+                     'wotcv-native-drill-recovery.py', 'exec'), namespace)
+        recovery = SimpleNamespace(supersede=namespace['supersede'])
+        with self.assertRaises(release.Refused):
+            release.execute(self.native, self.backup, self.root, self.manifest, self.progress,
+                            drill_recovery=recovery, failed_drill='failed-drill')
+        raw = (self.state / 'release-operations/fixture-operation/failure.json').read_text()
+        failure = json.loads(raw)
+        self.assertIn({'file': 'wotcv-native-drill-recovery.py', 'line': 2}, failure['sites'])
+        self.assertLessEqual(len(failure['sites']), 16)
+        self.assertNotIn('must-never-be-reported', raw)
+
     def test_failure_records_observed_backup_phase_instead_of_generic_preflight(self):
         def fail(*args):
             self.progress.last = 'backup_restoring_isolated_databases'

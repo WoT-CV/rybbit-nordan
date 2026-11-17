@@ -1,10 +1,12 @@
 """Retained-capture recovery tests; all clone operations are mocked read-only."""
 from copy import deepcopy
+from contextlib import redirect_stdout
 import importlib.util
+import io
 import json
 from pathlib import Path
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import test_wotcv_native_recovery as fixtures
 
@@ -150,6 +152,39 @@ class DrillRecoveryTests(unittest.TestCase):
         f.native.receipt_guard.assert_called_once_with(f.live)
         self.assertTrue(all(call.args[0] in {'inspect', 'volume', 'ps'} for call in f.native.docker.call_args_list))
         f.native.compose.assert_not_called()
+
+    def test_reviewed_contract_matches_real_native_record_writer_bytes(self):
+        reviewed = json.loads((fixtures.SCRIPTS.parent / 'ops/upgrades/drill-recovery-20261117.json').read_bytes())
+        marker = {'operation': reviewed['failedOperation'], 'releaseSha': reviewed['failedReleaseSha']}
+        path = self.f.root / 'real-recorded-pending.json'
+        with patch.object(updater.os, 'O_NOFOLLOW', getattr(updater.os, 'O_NOFOLLOW', 0), create=True):
+            updater.record(path, marker)
+        raw = path.read_bytes()
+        self.assertEqual(module.sha256(raw), reviewed['failedPendingSha256'])
+        self.assertNotEqual(module.sha256((json.dumps(marker) + '\n').encode()), reviewed['failedPendingSha256'])
+
+    def test_wrong_compact_contract_refuses_real_record_bytes_without_mutation(self):
+        marker = json.loads(self.f.pending_raw)
+        with patch.object(updater.os, 'O_NOFOLLOW', getattr(updater.os, 'O_NOFOLLOW', 0), create=True):
+            updater.record(self.f.pending, marker)
+        self.f.pending_raw = self.f.pending.read_bytes()
+        self.contract['failedPendingSha256'] = module.sha256((json.dumps(marker) + '\n').encode())
+        self.save_contract()
+        with self.assertRaisesRegex(updater.Refused, 'pending marker changed'):
+            self.run_recovery()
+        self.assert_unsuperseded()
+
+    def test_digest_proof_only_emits_byte_identity_and_match_status(self):
+        raw = b'private artifact and credentials must-never-be-reported'
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            actual = module.digest_proof('pending', raw, module.sha256(raw))
+        value = json.loads(stream.getvalue())
+        self.assertEqual(set(value), {'check', 'expectedSha256', 'actualSha256', 'bytes', 'matches'})
+        self.assertEqual(value['actualSha256'], actual)
+        self.assertTrue(value['matches'])
+        self.assertEqual(value['bytes'], len(raw))
+        self.assertNotIn('must-never-be-reported', stream.getvalue())
 
     def test_large_dump_is_streamed_without_receipt_file_size_limit(self):
         (self.f.backup / 'postgres.dump').write_bytes(b'PGDMP' + b'x' * (3 * 1024 * 1024))

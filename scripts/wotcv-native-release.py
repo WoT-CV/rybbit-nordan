@@ -32,6 +32,7 @@ FILES = {'updater': 'wotcv-native-update.py', 'backup': 'wotcv-native-backup.py'
          'drillRecovery': 'wotcv-native-drill-recovery.py',
          'drillRecoveryContract': 'drill-recovery-20261117.json',
          'codeContract': 'reviewed-code-20261117.json', 'restartContract': 'restart-20261116.json'}
+PACKET_CODE_FILES = {'wotcv-native-release.py'} | {name for name in FILES.values() if name.endswith('.py')}
 HEX = re.compile(r'[0-9a-f]{64}\Z')
 
 
@@ -276,12 +277,12 @@ def execute(native, backup, root, manifest, progress, recovery=None, failed_oper
             trace = error.__traceback__
             while trace:
                 filename = Path(trace.tb_frame.f_code.co_filename).name
-                if filename in {'wotcv-native-release.py', 'wotcv-native-update.py', 'wotcv-native-backup.py'}:
+                if filename in PACKET_CODE_FILES:
                     frames.append({'file': filename, 'line': trace.tb_lineno})
                 trace = trace.tb_next
             observed_stage = getattr(progress, 'last', stage) if stage == 'backup_preflight' else stage
             failure = {'phase': observed_stage if observed_stage in PHASES else stage,
-                       'errorType': type(error).__name__, 'sites': frames,
+                       'errorType': type(error).__name__, 'sites': frames[-16:],
                        'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                        'result': 'HOLD: inspect private transaction before retry'}
             native.record(transaction / 'failure.json', failure)

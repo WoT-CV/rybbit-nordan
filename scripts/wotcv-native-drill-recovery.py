@@ -30,6 +30,14 @@ def sha256(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
+def digest_proof(role, raw, expected):
+    """Only byte identities are public; neither file bytes nor errors are emitted."""
+    observed = sha256(raw)
+    print(json.dumps({'check': 'retained-' + role, 'expectedSha256': expected,
+                      'actualSha256': observed, 'bytes': len(raw), 'matches': observed == expected}), flush=True)
+    return observed
+
+
 def read_json(native, path):
     raw = native.receipt_file(path)
     return raw, native.reconciliation_json(raw)
@@ -251,10 +259,12 @@ def supersede(native, packet_root, manifest, failed_op, new_op, new_transaction)
                    'Selected failed drill operation inventory changed')
     pending = operations / 'pending.json'
     pending_raw, marker = read_json(native, pending)
-    native.require(sha256(pending_raw) == contract['failedPendingSha256'] and marker == {
+    native.require(digest_proof('pending', pending_raw, contract['failedPendingSha256']) ==
+                   contract['failedPendingSha256'] and marker == {
         'operation': failed_op, 'releaseSha': contract['failedReleaseSha']}, 'Failed drill pending marker changed')
     failure_raw, failure = read_json(native, original / 'failure.json')
-    native.require(sha256(failure_raw) == contract['failedFailureSha256'] and isinstance(failure, dict) and
+    native.require(digest_proof('failure', failure_raw, contract['failedFailureSha256']) ==
+                   contract['failedFailureSha256'] and isinstance(failure, dict) and
                    set(failure) == {'phase', 'errorType', 'sites', 'at', 'result'} and failure['phase'] == 'backup_preflight' and
                    failure['errorType'] == 'Refused' and isinstance(failure['sites'], list) and
                    {'file': 'wotcv-native-backup.py', 'line': 487} in failure['sites'] and
