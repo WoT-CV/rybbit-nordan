@@ -43,6 +43,6 @@ export function useStripeSubscription(organizationId?: string): UseQueryResult<S
     queryFn: fetchSubscription,
     staleTime: 5 * 60 * 1000,
     retry: false,
-    enabled: !!orgId,
+    enabled: IS_CLOUD && !!orgId,
   });
 }
