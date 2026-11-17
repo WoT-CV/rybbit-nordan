@@ -1,5 +1,7 @@
 import type { ReactNode } from "react";
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
+import { hydrateRoot } from "react-dom/client";
+import { renderToString } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({ isAdmin: true, role: "admin", signedIn: true, sourceCodeUrl: undefined as unknown }));
@@ -73,6 +75,30 @@ describe("configured fork source link", () => {
   });
 });
 describe("self-hosted admin navigation", () => {
+  it("hydrates the anonymous server rail when a session resolves before the boundary hydrates", async () => {
+    state.role = "user";
+    state.isAdmin = false;
+    state.signedIn = false;
+    const container = document.createElement("div");
+    container.innerHTML = renderToString(<AppSidebar />);
+    expect(container.querySelector('button[aria-label="Account"]')).not.toBeNull();
+    document.body.append(container);
+
+    state.signedIn = true;
+    const onRecoverableError = vi.fn();
+    let root: ReturnType<typeof hydrateRoot> | undefined;
+    try {
+      await act(async () => {
+        root = hydrateRoot(container, <AppSidebar />, { onRecoverableError });
+      });
+      expect(onRecoverableError).not.toHaveBeenCalled();
+      expect(container.querySelector('button[aria-label="Ada"]')?.textContent).toBe("A");
+    } finally {
+      await act(async () => root?.unmount());
+      container.remove();
+    }
+  });
+
   it("allows an existing system admin without a cloud/deployment flag", () => {
     render(<AppSidebar />);
     expect(screen.getByRole("link", { name: "Admin" }).getAttribute("href")).toBe("/admin");

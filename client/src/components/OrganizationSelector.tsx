@@ -4,11 +4,13 @@ import { useState, useEffect } from "react";
 import { authClient } from "../lib/auth";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 import { useUserOrganizations } from "../api/admin/hooks/useOrganizations";
+import { useHydrated } from "../hooks/useHydrated";
 
 export function OrganizationSelector() {
   const t = useExtracted();
   const { data: organizations, isLoading: isLoadingOrganizations } = useUserOrganizations();
   const { data: activeOrganization, isPending } = authClient.useActiveOrganization();
+  const hydrated = useHydrated();
 
   // Local state to handle the delay when switching organizations
   const [selectedOrgId, setSelectedOrgId] = useState<string | null>(null);
@@ -29,7 +31,7 @@ export function OrganizationSelector() {
     });
   };
 
-  if (!isLoadingOrganizations && organizations?.length === 0) {
+  if (hydrated && !isLoadingOrganizations && organizations?.length === 0) {
     return (
       <Select disabled>
         <SelectTrigger className="w-full">
@@ -40,7 +42,7 @@ export function OrganizationSelector() {
   }
 
   // Show placeholder when loading or no active organization
-  if (isPending || !activeOrganization) {
+  if (!hydrated || isPending || !activeOrganization) {
     return (
       <Select disabled>
         <SelectTrigger className="w-full">

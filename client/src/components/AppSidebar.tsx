@@ -9,6 +9,7 @@ import { Suspense, useRef, useState } from "react";
 import { useGetSite } from "../api/admin/hooks/useSites";
 import { useEmbedablePage } from "../app/[site]/utils";
 import { useAdminPermission } from "../app/admin/hooks/useAdminPermission";
+import { useHydrated } from "../hooks/useHydrated";
 import { useSignout } from "../hooks/useSignout";
 import { authClient } from "../lib/auth";
 import { getSourceCodeUrl, useConfigs } from "../lib/configs";
@@ -38,7 +39,9 @@ function AdminLink() {
 }
 
 function AppSidebarContent() {
-  const { data: session } = authClient.useSession();
+  const { data: browserSession } = authClient.useSession();
+  const hydrated = useHydrated();
+  const session = hydrated ? browserSession : null;
   const embed = useEmbedablePage();
   const { configs } = useConfigs();
   const sourceCodeUrl = getSourceCodeUrl(configs?.sourceCodeUrl);

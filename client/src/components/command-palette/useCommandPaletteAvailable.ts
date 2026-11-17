@@ -1,5 +1,6 @@
 import { usePathname } from "next/navigation";
 import { authClient } from "@/lib/auth";
+import { useHydrated } from "@/hooks/useHydrated";
 import { getSiteRouteContext } from "@/lib/siteRoute";
 
 /**
@@ -9,6 +10,7 @@ import { getSiteRouteContext } from "@/lib/siteRoute";
  */
 export function useCommandPaletteAvailable(): boolean {
   const { data: session } = authClient.useSession();
+  const hydrated = useHydrated();
   const pathname = usePathname();
-  return !!session?.user && !getSiteRouteContext(pathname).privateKey;
+  return hydrated && !!session?.user && !getSiteRouteContext(pathname).privateKey;
 }

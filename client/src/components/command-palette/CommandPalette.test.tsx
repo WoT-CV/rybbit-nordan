@@ -1,4 +1,6 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { hydrateRoot } from "react-dom/client";
+import { renderToString } from "react-dom/server";
 import { MotionGlobalConfig } from "framer-motion";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -126,6 +128,28 @@ const mockListLayout = () => {
 
 beforeAll(() => {
   MotionGlobalConfig.skipAnimations = true;
+});
+
+it("hydrates a streamed trigger after the browser session has already resolved", async () => {
+  mocks.signedIn = false;
+  const container = document.createElement("div");
+  container.innerHTML = renderToString(<CommandPaletteTrigger />);
+  expect(container.querySelector("button")).toBeNull();
+  document.body.append(container);
+
+  mocks.signedIn = true;
+  const onRecoverableError = vi.fn();
+  let root: ReturnType<typeof hydrateRoot> | undefined;
+  try {
+    await act(async () => {
+      root = hydrateRoot(container, <CommandPaletteTrigger />, { onRecoverableError });
+    });
+    expect(onRecoverableError).not.toHaveBeenCalled();
+    expect(container.querySelector("button")?.textContent).toContain("Search");
+  } finally {
+    await act(async () => root?.unmount());
+    container.remove();
+  }
 });
 
 beforeEach(() => {
