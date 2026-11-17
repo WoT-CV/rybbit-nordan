@@ -24,6 +24,16 @@ IDENTIFIER = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,126}\Z')
 ENGINES = {'MergeTree', 'ReplacingMergeTree', 'AggregatingMergeTree', 'SummingMergeTree',
            'MaterializedView', 'View'}
 TIMEOUT = 600
+DRILL_STEPS = {'validating_artifacts', 'postgres_create_target', 'postgres_wait_tcp',
+               'postgres_create_database', 'postgres_copy_archive', 'postgres_restore', 'postgres_verify',
+               'postgres_cleanup', 'clickhouse_create_target', 'clickhouse_wait_ready', 'clickhouse_restore',
+               'clickhouse_verify', 'clickhouse_cleanup', 'redis_create_target', 'redis_wait_ready',
+               'redis_verify', 'complete'}
+ARTIFACT_NAMES = {'postgres.dump', 'postgres-globals.sql', 'clickhouse.zip', 'redis.rdb', 'previous.env'}
+RESTORE_LIMITS = ['No application recovery test', 'PostgreSQL roles/ownership/ACL not replayed',
+                  'ClickHouse SQL access management not restored by database-only archive',
+                  'Local backup does not cover loss of this host',
+                  'Image rollback preserves later writes; data restore requires separate recovery decision']
 CH_DRILL_CONFIG = ('<clickhouse><backups><allowed_path>/backup</allowed_path></backups>'
     '<background_schedule_pool_size>16</background_schedule_pool_size>'
     '<background_buffer_flush_schedule_pool_size>4</background_buffer_flush_schedule_pool_size>'
@@ -99,6 +109,7 @@ class Backup:
         self.drill_history = []
         self.stop_states = {}
         self.capture_stage = 'stopping_apps'
+        self.drill_step = 'validating_artifacts'
 
     def require(self, condition, message):
         self.n.require(condition, message)
@@ -115,6 +126,12 @@ class Backup:
             self.record(name, value)
         except BaseException:
             pass
+
+    def step(self, name):
+        self.require(name in DRILL_STEPS, 'Unknown isolated drill step')
+        self.drill_step = name
+        self.record('drill-status.json', {'phase': 'passed' if name == 'complete' else 'running',
+                                         'step': name, 'at': utc()})
 
     def docker(self, *args, **kwargs):
         return self.n.docker(*args, **kwargs)
@@ -142,13 +159,45 @@ class Backup:
         self.require(temporary.stat().st_size > 0, 'Backup stream is empty')
         os.replace(temporary, path)
 
-    def pg(self, container, sql, database='analytics'):
+    def pg(self, container, sql, database='analytics', *, tcp=False):
         self.require(IDENTIFIER.fullmatch(database), 'Unsupported PostgreSQL database identifier')
         return self.shell(container,
                           'export PGPASSWORD="$POSTGRES_PASSWORD"; '
                           'exec psql -X -qAt --no-password --username "$POSTGRES_USER" '
+                          + ('--host 127.0.0.1 --port 5432 ' if tcp else '') +
                           '--dbname "$1" --set ON_ERROR_STOP=1', database,
                           data=sql.encode(), timeout=120).strip()
+
+    def logged_pg_command(self, container, script, tag, *, data=None):
+        """Text-only isolated commands retain stderr and actual terminal result."""
+        self.require(tag in {'postgres-create-database', 'postgres-restore'}, 'Unknown private command log')
+        self.require(container in self.targets, 'Private step commands require this drill isolated target')
+        command = [*self.n.DOCKER, 'exec', '-i', container, 'sh', '-ec', script, 'sh']
+        result = {'step': self.drill_step, 'startedAt': utc(), 'returnCode': None, 'timedOut': False}
+        error = None
+        with os.fdopen(os.open(self.root / (tag + '.stdout.log'),
+                               os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'wb') as output:
+            with os.fdopen(os.open(self.root / (tag + '.stderr.log'),
+                                   os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'wb') as stderr:
+                try:
+                    completed = subprocess.run(command, env=self.n.safe_env(), input=data,
+                                               stdout=output, stderr=stderr, timeout=TIMEOUT, check=False)
+                    result['returnCode'] = completed.returncode
+                except BaseException as exc:
+                    error = exc
+                    result['timedOut'] = isinstance(exc, subprocess.TimeoutExpired)
+                    result['errorType'] = type(exc).__name__
+                finally:
+                    output.flush()
+                    stderr.flush()
+                    os.fsync(output.fileno())
+                    os.fsync(stderr.fileno())
+        result['finishedAt'] = utc()
+        self.record(tag + '.result.json', result)
+        if error is not None and not isinstance(error, (OSError, subprocess.TimeoutExpired)):
+            raise error
+        self.require(error is None and result['returnCode'] == 0,
+                     'Isolated PostgreSQL command failed; inspect private step logs and result')
 
     def pg_json(self, container, sql):
         return json.loads(self.pg(container, sql))
@@ -192,19 +241,7 @@ class Backup:
         self.n.private_build_directory(self.root)
         self.require(not any(self.root.iterdir()), 'Backup transaction directory must be new and empty')
         self.require(not (self.n.STATE / 'pending.json').exists(), 'Pending native transaction blocks backup')
-        self.before = self.n.snapshot()
-        # Reconciliation belongs to the independently reviewed native updater.
-        # Capture requires its ordinary guard, including the current attestation.
-        self.n.receipt_guard(self.before)
-        env = self.n.current_env()
-        self.n.private(env)
-        model = self.n.config(env)
-        self.n.model_guard(model, self.before)
-        self.n.verify_model_live(model, self.before)
-        sealed = json.loads((self.n.ROOT / 'state.json').read_bytes())
-        self.require(sealed['project'] == self.n.PROJECT and sealed['source'] == self.n.BASELINE and
-                     sealed['sourceFiles'] == self.n.source_hashes(self.n.ROOT / 'source'),
-                     'Sealed native source changed')
+        env, model = self.validate_runtime()
         self.write(self.root / 'previous.env', env.read_bytes())
         # Expected image labels remain pinned; saved credentials are needed for
         # actual recovery but are never interpolated into argv or status output.
@@ -232,6 +269,23 @@ class Backup:
         self.record('source-configs.json', config_manifest)
         self.create_auth(model)
         return {}
+
+    def validate_runtime(self):
+        """Read-only validation shared with a drill of an existing capture."""
+        self.before = self.n.snapshot()
+        # Reconciliation belongs to the independently reviewed native updater.
+        # Capture requires its ordinary guard, including the current attestation.
+        self.n.receipt_guard(self.before)
+        env = self.n.current_env()
+        self.n.private(env)
+        model = self.n.config(env)
+        self.n.model_guard(model, self.before)
+        self.n.verify_model_live(model, self.before)
+        sealed = json.loads((self.n.ROOT / 'state.json').read_bytes())
+        self.require(sealed['project'] == self.n.PROJECT and sealed['source'] == self.n.BASELINE and
+                     sealed['sourceFiles'] == self.n.source_hashes(self.n.ROOT / 'source'),
+                     'Sealed native source changed')
+        return env, model
 
     def database_unchanged(self):
         for name in self.n.DATABASES:
@@ -473,23 +527,36 @@ class Backup:
         raise self.n.Refused('Isolated restore target did not become ready')
 
     def drill(self, expected, artifacts):
+        self.step('validating_artifacts')
         for name, artifact in artifacts.items():
             self.require(file_hash(self.root / name) == artifact['sha256'], 'Backup artifact changed before restore')
         admin = 'wotcv_restore_' + self.token
         env = self.root / 'drill-postgres.env'
         self.write(env, 'POSTGRES_USER=' + admin + '\nPOSTGRES_PASSWORD=' + secrets.token_hex(24) + '\nPOSTGRES_DB=postgres\n')
+        self.step('postgres_create_target')
         try:
             pg = self.create_target('postgres', '--env-file', str(env))
         finally:
             env.unlink()
         self.docker('start', pg)
-        self.wait(lambda: self.pg(pg, 'SELECT 1;', 'postgres') == b'1')
-        self.pg(pg, 'CREATE DATABASE analytics;', 'postgres')
+        self.step('postgres_wait_tcp')
+        # The image's initialization server is socket-only. Authenticated TCP
+        # proves the final server has started, before any CREATE or restore.
+        self.wait(lambda: self.pg(pg, 'SELECT 1;', 'postgres', tcp=True) == b'1')
+        self.step('postgres_create_database')
+        self.logged_pg_command(pg, 'export PGPASSWORD="$POSTGRES_PASSWORD"; '
+                               'exec psql -X -q --no-password --host 127.0.0.1 --port 5432 '
+                               '--username "$POSTGRES_USER" --dbname postgres --set ON_ERROR_STOP=1',
+                               'postgres-create-database', data=b'CREATE DATABASE analytics;\n')
+        self.step('postgres_copy_archive')
         self.docker('cp', str(self.root / 'postgres.dump'), pg + ':/tmp/restore.dump', timeout=TIMEOUT)
-        self.shell(pg, 'export PGPASSWORD="$POSTGRES_PASSWORD"; exec pg_restore --exit-on-error '
-                   '--no-owner --no-acl --no-password --username "$POSTGRES_USER" --dbname analytics /tmp/restore.dump',
-                   timeout=TIMEOUT)
+        self.step('postgres_restore')
+        self.logged_pg_command(pg, 'export PGPASSWORD="$POSTGRES_PASSWORD"; exec pg_restore --exit-on-error '
+                               '--no-owner --no-acl --no-password --host 127.0.0.1 --port 5432 '
+                               '--username "$POSTGRES_USER" --dbname analytics /tmp/restore.dump', 'postgres-restore')
+        self.step('postgres_verify')
         self.require(self.pg_checks(pg) == expected['postgres'], 'PostgreSQL restored schema/counts/journal mismatch')
+        self.step('postgres_cleanup')
         self.cleanup_targets()
         # File bind is deliberately read-only. Its private ancestor remains 0700;
         # readable staging copies allow the unprivileged ClickHouse process access.
@@ -502,6 +569,7 @@ class Backup:
         env = self.root / 'drill-clickhouse.env'
         password = secrets.token_hex(24)
         self.write(env, 'CLICKHOUSE_USER=default\nCLICKHOUSE_PASSWORD=' + password + '\nCLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1\n')
+        self.step('clickhouse_create_target')
         try:
             ch = self.create_target('clickhouse', '--env-file', str(env), '--mount',
                                     'type=bind,src=' + str(staged) + ',dst=/backup/analytics.zip,readonly',
@@ -515,19 +583,26 @@ class Backup:
         ET.SubElement(client, 'password').text = password
         self.shell(ch, 'umask 077; cat > /tmp/drill-client.xml', data=ET.tostring(client))
         auth = '/tmp/drill-client.xml'
+        self.step('clickhouse_wait_ready')
         self.wait(lambda: self.ch(ch, 'SELECT 1', auth) == b'1')
+        self.step('clickhouse_restore')
         raw = self.ch(ch, "RESTORE DATABASE analytics FROM File('/backup/analytics.zip') FORMAT JSONEachRow", auth)
         rows = [json.loads(line) for line in raw.splitlines() if line]
         self.require(len(rows) == 1 and rows[0].get('status') == 'RESTORED', 'ClickHouse restore did not finish')
+        self.step('clickhouse_verify')
         self.require(self.ch_checks(ch, auth) == expected['clickhouse'], 'ClickHouse restored schema/logical counts mismatch')
+        self.step('clickhouse_cleanup')
         self.cleanup_targets()
+        self.step('redis_create_target')
         redis = self.create_target('redis', command=('redis-server', '--appendonly', 'no', '--save', '',
                                                    '--dir', '/data', '--dbfilename', 'dump.rdb'))
         # The command is explicit for the RDB-only drill: production AOF is not
         # mounted, replayed, truncated or rewritten.
         self.docker('cp', str(self.root / 'redis.rdb'), redis + ':/data/dump.rdb', timeout=TIMEOUT)
         self.docker('start', redis)
+        self.step('redis_wait_ready')
         self.wait(lambda: self.redis(redis, 'PING', source=False) == b'PONG')
+        self.step('redis_verify')
         self.require(self.redis_modules(redis, source=False) == expected['redisModules'],
                      'Redis restored engine modules differ from source')
         persistence = self.redis(redis, 'INFO', 'persistence', source=False)
@@ -539,6 +614,7 @@ class Backup:
             self.require(after['keys'] <= before['keys'] and
                          after['keys'] - after['expires'] == before['keys'] - before['expires'],
                          'Redis restored persistent key count mismatch')
+        self.step('complete')
         return {'phase': 'passed', 'postgres': {'schemaCountsJournal': 'passed', 'ownershipAcl': 'not_tested'},
                 'clickhouse': {'schemaLogicalCounts': 'passed', 'accessManagement': 'not_tested'},
                 'redis': {'rdbLoadPersistentKeys': 'passed', 'moduleInventory': 'passed', 'ttlExpiryAccounted': True},
@@ -568,8 +644,123 @@ class Backup:
             item = json.loads(self.docker('inspect', container))[0]
             self.require(item['Config'].get('Labels', {}).get('wotcv.native.drill') == self.token and
                          item['HostConfig']['NetworkMode'] == 'none', 'Failed drill ownership mismatch')
-            if item['State']['Status'] == 'running':
+            if item['State']['Status'] in {'running', 'restarting'}:
                 self.docker('stop', '--time', '60', container, timeout=90)
+
+    def failed_drill(self, error, phase):
+        # Save the primary cause before cleanup. A cleanup/reporting failure may
+        # not hide the actual isolated step that failed.
+        self.best_effort_record('drill-failure.json', failure_evidence(error, self.drill_step))
+        self.best_effort_record('status.json', {'phase': phase, 'step': self.drill_step, 'at': utc(),
+                                              'targets': list(self.drill_history), 'volumes': list(self.volumes)})
+        try:
+            self.stop_failed_targets()
+        except BaseException as cleanup_error:
+            self.best_effort_record('drill-cleanup-failure.json',
+                                    failure_evidence(cleanup_error, 'stop_failed_targets'))
+
+    def copy_private(self, source, destination, expected_hash=None):
+        self.n.private(source)
+        # run_existing_capture already proved the destination root-owned/private.
+        self.require(source.resolve() == source and source.stat().st_uid == self.root.stat().st_uid,
+                     'Existing capture file is not canonical/root-owned')
+        frozen_hash = file_hash(source)
+        self.require(expected_hash is None or frozen_hash == expected_hash, 'Existing capture artifact hash changed')
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'wb') as output, source.open('rb') as original:
+            shutil.copyfileobj(original, output, length=1024 * 1024)
+            output.flush()
+            os.fsync(output.fileno())
+        self.require(file_hash(destination) == frozen_hash, 'Existing capture changed while copying')
+
+    def copy_capture(self, prior_capture):
+        self.n.receipt_directory(prior_capture)
+        source_operation = prior_capture.parent.name
+        self.require(prior_capture.name == 'backup' and
+                     prior_capture.parent.parent == self.n.STATE / 'release-operations' and
+                     re.fullmatch(r'[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}', source_operation),
+                     'Existing capture is outside the reviewed operation directory')
+        raw = self.n.receipt_file(prior_capture / 'artifacts.json')
+        artifacts = json.loads(raw)
+        self.require(isinstance(artifacts, dict) and set(artifacts) == ARTIFACT_NAMES,
+                     'Existing capture artifact scope changed')
+        total_bytes = 0
+        for name, artifact in artifacts.items():
+            self.require(isinstance(artifact, dict) and set(artifact) == {'path', 'bytes', 'sha256'} and
+                         artifact['path'] == name and type(artifact['bytes']) is int and artifact['bytes'] > 0 and
+                         isinstance(artifact['sha256'], str) and re.fullmatch(r'[0-9a-f]{64}', artifact['sha256']),
+                         'Invalid existing capture artifact identity')
+            self.require((prior_capture / name).stat().st_size == artifact['bytes'], 'Existing capture artifact size changed')
+            total_bytes += artifact['bytes']
+        self.require(shutil.disk_usage(self.root).free >= 3 * total_bytes + 512 * 1024 * 1024,
+                     'Insufficient space for copied capture and isolated restore')
+        for name, artifact in artifacts.items():
+            self.copy_private(prior_capture / name, self.root / name, artifact['sha256'])
+        for name in ('artifacts.json', 'captured-checks.json', 'compose-0.yml', 'compose-1.yml',
+                     'source-configs.json', 'stopped-apps.json'):
+            self.require((prior_capture / name).stat().st_size <= 2000000, 'Existing capture metadata is oversized')
+            self.copy_private(prior_capture / name, self.root / name)
+        source_configs = prior_capture / 'source-configs'
+        self.n.receipt_directory(source_configs)
+        manifest = json.loads((self.root / 'source-configs.json').read_bytes())
+        self.require(isinstance(manifest, list) and len(manifest) <= 32, 'Invalid captured configuration scope')
+        names = set()
+        for entry in manifest:
+            self.require(isinstance(entry, dict) and set(entry) == {'file', 'destination', 'sha256'} and
+                         isinstance(entry['file'], str) and re.fullmatch(r'config-[0-9]{1,2}\.xml', entry['file']) and
+                         entry['file'] not in names and isinstance(entry['destination'], str) and
+                         entry['destination'].startswith('/etc/clickhouse-server/') and
+                         isinstance(entry['sha256'], str) and re.fullmatch(r'[0-9a-f]{64}', entry['sha256']),
+                         'Invalid captured configuration identity')
+            names.add(entry['file'])
+        self.require({path.name for path in source_configs.iterdir()} == names, 'Captured configuration inventory changed')
+        destination = self.root / 'source-configs'
+        destination.mkdir(mode=0o700)
+        for entry in manifest:
+            self.copy_private(source_configs / entry['file'], destination / entry['file'], entry['sha256'])
+        expected = json.loads((self.root / 'captured-checks.json').read_bytes())
+        self.require(isinstance(expected, dict) and set(expected) == {'postgres', 'clickhouse', 'redis', 'redisModules'},
+                     'Existing captured data checks changed scope')
+        return expected, artifacts, source_operation
+
+    def run_existing_capture(self, prior_capture):
+        started = utc()
+        self.require(hasattr(os, 'geteuid') and os.geteuid() == 0, 'Root isolated drill orchestrator required')
+        self.n.private_build_directory(self.root)
+        self.require(not any(self.root.iterdir()), 'Resumed drill directory must be new and empty')
+        self.require(not (self.n.STATE / 'pending.json').exists() and
+                     not (self.n.STATE / 'pending.json').is_symlink(), 'Pending native activation blocks isolated drill')
+        environment, _ = self.validate_runtime()
+        for name in self.n.DATABASES:
+            self.require(self.n.image_info(self.before[name]['image'])['Id'] == self.before[name]['image'],
+                         'Source database image is unavailable')
+        self.n.readiness()
+        try:
+            expected, artifacts, source_operation = self.copy_capture(prior_capture)
+            self.require((self.root / 'previous.env').read_bytes() == environment.read_bytes(),
+                         'Captured and current source environment differ')
+            for index, relative in enumerate(('docker-compose.yml', 'ops/minimal/compose.fresh.yml')):
+                self.require((self.root / ('compose-' + str(index) + '.yml')).read_bytes() ==
+                             (self.n.ROOT / 'source' / relative).read_bytes(), 'Captured source Compose changed')
+            self.require(self.n.snapshot() == self.before, 'Source changed while copying existing capture')
+            self.progress('backup_restoring_isolated_databases')
+            drill = self.drill(expected, artifacts)
+            after = self.n.snapshot()
+            self.require(after == self.before, 'Source changed during isolated restore of existing capture')
+            self.cleanup_targets()
+            report = {'schemaVersion': 1, 'phase': 'verified', 'startedAt': started, 'finishedAt': utc(),
+                      'captureWindow': {'start': None, 'end': None}, 'sourceOperation': source_operation,
+                      'captureMode': 'existing-private-capture-no-source-stop',
+                      'before': self.before, 'after': after, 'artifacts': artifacts,
+                      'startedOnlyReceiptDrift': {}, 'drill': drill,
+                      'limits': list(RESTORE_LIMITS) + ['Original exact capture times are unknown']}
+            self.record('verified.json', report)
+            self.record('status.json', {'phase': 'verified', 'at': utc()})
+            self.progress('backup_verified')
+            return report
+        except BaseException as error:
+            self.failed_drill(error, 'existing_capture_drill_failed_source_not_controlled')
+            raise
 
     def run(self):
         started = utc()
@@ -638,10 +829,8 @@ class Backup:
         self.progress('backup_restoring_isolated_databases')
         try:
             drill = self.drill(expected, artifacts)
-        except BaseException:
-            self.record('status.json', {'phase': 'drill_failed_old_apps_resumed', 'at': utc(),
-                                        'targets': list(self.drill_history), 'volumes': list(self.volumes)})
-            self.stop_failed_targets()
+        except BaseException as error:
+            self.failed_drill(error, 'drill_failed_old_apps_resumed')
             raise
         self.database_unchanged()
         self.cleanup_targets()
@@ -649,10 +838,7 @@ class Backup:
                   'captureWindow': {'start': capture_start, 'end': capture_end},
                   'before': self.before, 'after': after, 'artifacts': artifacts,
                   'startedOnlyReceiptDrift': drift, 'drill': drill,
-                  'limits': ['No application recovery test', 'PostgreSQL roles/ownership/ACL not replayed',
-                             'ClickHouse SQL access management not restored by database-only archive',
-                             'Local backup does not cover loss of this host',
-                             'Image rollback preserves later writes; data restore requires separate recovery decision']}
+                  'limits': list(RESTORE_LIMITS)}
         self.record('verified.json', report)
         self.record('status.json', {'phase': 'verified', 'at': utc()})
         self.progress('backup_verified')
@@ -662,6 +848,15 @@ class Backup:
 def capture_and_drill(native, transaction: Path, progress=None):
     """Called only by the reviewed root orchestrator while both native locks hold."""
     return Backup(native, transaction, progress).run()
+
+
+def resume_drill(native, new_transaction: Path, prior_capture: Path, progress=None):
+    """Caller holds locks and separately verified/superseded the exact old HOLD.
+
+    Copy its private hash-bound artifacts and use new disposable targets only.
+    This function never calls source capture, auth creation, stop or start.
+    """
+    return Backup(native, new_transaction, progress).run_existing_capture(Path(prior_capture))
 
 
 if __name__ == '__main__':

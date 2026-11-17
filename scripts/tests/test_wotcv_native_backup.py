@@ -179,6 +179,154 @@ class BackupTests(unittest.TestCase):
         self.assertIn('resume_apps', events)
         self.assertEqual(json.loads((self.path / 'cleanup-failure.json').read_text())['errorType'], 'OSError')
 
+    def test_clone_pg_tcp_gate_is_authenticated_without_changing_source_transport(self):
+        self.job.shell = Mock(return_value=b'1\n')
+        self.assertEqual(self.job.pg('clone', 'SELECT 1;', 'postgres', tcp=True), b'1')
+        clone_script = self.job.shell.call_args.args[1]
+        self.assertIn('--host 127.0.0.1 --port 5432', clone_script)
+        self.assertIn('PGPASSWORD="$POSTGRES_PASSWORD"', clone_script)
+        self.assertIn('--no-password', clone_script)
+        self.job.pg('source', 'SELECT 1;', 'postgres')
+        self.assertNotIn('--host', self.job.shell.call_args.args[1])
+
+    def test_private_pg_command_keeps_stderr_and_return_code_without_printing_it(self):
+        self.job.targets = ['isolated-pg']
+        self.job.drill_step = 'postgres_restore'
+        def run(args, **kwargs):
+            self.assertNotIn('source', args)
+            self.assertIn('isolated-pg', args)
+            kwargs['stdout'].write(b'private stdout')
+            kwargs['stderr'].write(b'PRIVATE-RESTORE-ERROR')
+            return SimpleNamespace(returncode=3)
+        with patch.object(backup.subprocess, 'run', side_effect=run), \
+                patch('sys.stdout', new_callable=io.StringIO) as output:
+            with self.assertRaisesRegex(Refused, 'private step logs'):
+                self.job.logged_pg_command('isolated-pg', 'exec pg_restore fixture', 'postgres-restore')
+        self.assertEqual(output.getvalue(), '')
+        self.assertEqual((self.path / 'postgres-restore.stderr.log').read_bytes(), b'PRIVATE-RESTORE-ERROR')
+        self.assertEqual(json.loads((self.path / 'postgres-restore.result.json').read_text())['returnCode'], 3)
+
+    def test_private_pg_command_timeout_retains_null_terminal_result(self):
+        self.job.targets = ['isolated-pg']
+        with patch.object(backup.subprocess, 'run',
+                          side_effect=backup.subprocess.TimeoutExpired('private command', 600)):
+            with self.assertRaises(Refused):
+                self.job.logged_pg_command('isolated-pg', 'exec psql fixture', 'postgres-create-database')
+        result = json.loads((self.path / 'postgres-create-database.result.json').read_text())
+        self.assertIsNone(result['returnCode'])
+        self.assertTrue(result['timedOut'])
+
+    def test_primary_drill_step_is_saved_before_failing_cleanup(self):
+        self.mock_run_stages()
+        def drill(*args):
+            self.job.drill_step = 'postgres_create_database'
+            raise Refused('PRIMARY-PRIVATE-ERROR')
+        def cleanup():
+            report = json.loads((self.path / 'drill-failure.json').read_text())
+            self.assertEqual(report['phase'], 'postgres_create_database')
+            self.assertNotIn('PRIVATE', json.dumps(report))
+            raise OSError('SECONDARY-PRIVATE-ERROR')
+        self.job.drill.side_effect = drill
+        self.job.stop_failed_targets = Mock(side_effect=cleanup)
+        with self.assertRaisesRegex(Refused, 'PRIMARY-PRIVATE-ERROR'):
+            self.job.run()
+        self.assertEqual(json.loads((self.path / 'drill-cleanup-failure.json').read_text())['errorType'], 'OSError')
+
+    def existing_capture_fixture(self):
+        self.native.STATE = self.path / 'state'
+        prior = self.native.STATE / 'release-operations' / '20261117T153454Z-eddd7ac6' / 'backup'
+        prior.mkdir(parents=True)
+        artifacts = {}
+        for name in sorted(backup.ARTIFACT_NAMES):
+            path = prior / name
+            path.write_bytes(('private-fixture-' + name).encode())
+            artifacts[name] = {'path': name, 'bytes': path.stat().st_size, 'sha256': backup.file_hash(path)}
+        (prior / 'artifacts.json').write_text(json.dumps(artifacts))
+        expected = {'postgres': {'fixture': 1}, 'clickhouse': {'fixture': 2}, 'redis': {}, 'redisModules': []}
+        (prior / 'captured-checks.json').write_text(json.dumps(expected))
+        (prior / 'source-configs.json').write_text('[]')
+        (prior / 'source-configs').mkdir()
+        (prior / 'stopped-apps.json').write_text('{}')
+        self.native.ROOT = self.path / 'install'
+        (self.native.ROOT / 'source/ops/minimal').mkdir(parents=True)
+        for index, relative in enumerate(('docker-compose.yml', 'ops/minimal/compose.fresh.yml')):
+            raw = ('compose-' + str(index)).encode()
+            (prior / ('compose-' + str(index) + '.yml')).write_bytes(raw)
+            (self.native.ROOT / 'source' / relative).write_bytes(raw)
+        self.native.private = Mock()
+        self.native.receipt_directory = Mock()
+        self.native.private_build_directory = Mock()
+        self.native.receipt_file = lambda path: path.read_bytes()
+        self.native.snapshot = Mock(return_value=self.job.before)
+        self.native.image_info = Mock(side_effect=lambda identity: {'Id': identity})
+        self.native.readiness = Mock()
+        self.native.receipt_guard = Mock()
+        self.before = deepcopy(self.job.before)
+        def validate(instance):
+            instance.before = deepcopy(self.before)
+            return prior / 'previous.env', {}
+        self.stack.enter_context(patch.object(backup.Backup, 'validate_runtime', autospec=True, side_effect=validate))
+        self.stack.enter_context(patch.object(backup.os, 'geteuid', return_value=0, create=True))
+        for method in ('stop_apps', 'resume_apps', 'capture', 'create_auth', 'cleanup_source'):
+            self.stack.enter_context(patch.object(backup.Backup, method,
+                side_effect=AssertionError('Source control/auth/capture forbidden')))
+        drill = self.stack.enter_context(patch.object(backup.Backup, 'drill', autospec=True,
+                                                      return_value={'phase': 'passed'}))
+        self.stack.enter_context(patch.object(backup.Backup, 'cleanup_targets', autospec=True))
+        destination = self.path / 'new-private-drill'
+        destination.mkdir()
+        return prior, destination, artifacts, drill
+
+    def test_resume_drill_copies_verified_bytes_and_never_controls_source(self):
+        prior, destination, artifacts, drill = self.existing_capture_fixture()
+        original = {path.relative_to(prior).as_posix(): path.read_bytes() for path in prior.rglob('*') if path.is_file()}
+        result = backup.resume_drill(self.native, destination, prior)
+        self.assertEqual(result['phase'], 'verified')
+        self.assertEqual(result['sourceOperation'], prior.parent.name)
+        self.assertEqual(result['captureWindow'], {'start': None, 'end': None})
+        for name, artifact in artifacts.items():
+            self.assertEqual(backup.file_hash(destination / name), artifact['sha256'])
+        self.assertEqual(original, {path.relative_to(prior).as_posix(): path.read_bytes()
+                                   for path in prior.rglob('*') if path.is_file()})
+        self.assertFalse((destination / 'redis-auth.env').exists())
+        self.native.docker.assert_not_called()
+        drill.assert_called_once()
+
+    def test_resume_drill_rejects_changed_artifact_without_recapture(self):
+        prior, destination, _, drill = self.existing_capture_fixture()
+        (prior / 'postgres.dump').write_bytes(b'changed')
+        with self.assertRaisesRegex(Refused, 'artifact size changed'):
+            backup.resume_drill(self.native, destination, prior)
+        drill.assert_not_called()
+        self.assertTrue((destination / 'drill-failure.json').exists())
+        self.native.docker.assert_not_called()
+
+    def test_resume_drill_source_change_holds_and_preserves_original_capture(self):
+        prior, destination, _, _ = self.existing_capture_fixture()
+        changed = deepcopy(self.before)
+        changed['postgres']['started'] = 'changed'
+        self.native.snapshot.side_effect = [self.before, changed]
+        with self.assertRaisesRegex(Refused, 'Source changed during'):
+            backup.resume_drill(self.native, destination, prior)
+        self.assertTrue((prior / 'postgres.dump').exists())
+        self.assertTrue((destination / 'drill-failure.json').exists())
+        self.assertFalse((destination / 'verified.json').exists())
+        self.native.docker.assert_not_called()
+
+    def test_private_copy_is_exclusive_and_requests_mode_0600(self):
+        source = self.path / 'source-private'
+        source.write_bytes(b'private artifact')
+        self.native.private = Mock()
+        target = self.path / 'target-private'
+        real_open = backup.os.open
+        with patch.object(backup.os, 'open', wraps=real_open) as opened:
+            self.job.copy_private(source, target, backup.file_hash(source))
+        self.assertEqual(opened.call_args.args[-1], 0o600)
+        self.assertTrue(opened.call_args.args[1] & os.O_EXCL)
+        with self.assertRaises(FileExistsError):
+            self.job.copy_private(source, target)
+        self.assertEqual(target.read_bytes(), b'private artifact')
+
     def test_reporting_failure_cannot_suppress_old_app_resume(self):
         events = self.mock_run_stages()
         def progress(phase):
