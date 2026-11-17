@@ -8,6 +8,7 @@ PostgreSQL ownership/ACL recreation and authenticated application recovery are
 explicitly outside this DB-only drill. Globals/env/config are retained privately.
 """
 import hashlib
+import copy
 import json
 import os
 from pathlib import Path
@@ -74,6 +75,67 @@ def file_hash(path):
         for chunk in iter(lambda: handle.read(1024 * 1024), b''):
             value.update(chunk)
     return value.hexdigest()
+
+
+def normalize_postgres_checks(checks):
+    """Copy raw checks, replacing physical column positions with visible ranks.
+
+    DROP COLUMN leaves attnum gaps; logical pg_dump/pg_restore does not recreate
+    those holes. Keep column list order and every other inventory/count value.
+    """
+    if not (isinstance(checks, dict) and set(checks) == {'inventory', 'counts'} and
+            isinstance(checks['inventory'], dict) and
+            set(checks['inventory']) == {'columns', 'constraints', 'indexes', 'journal'} and
+            all(isinstance(rows, list) for rows in checks['inventory'].values()) and
+            isinstance(checks['counts'], dict) and
+            all(isinstance(name, str) and type(value) is int and value >= 0 for name, value in checks['counts'].items())):
+        raise ValueError('Invalid PostgreSQL check structure')
+    fields = {'table_schema', 'table_name', 'column_name', 'ordinal_position',
+              'data_type', 'udt_name', 'is_nullable', 'column_default'}
+    identities = set()
+    ordinals = {}
+    for column in checks['inventory']['columns']:
+        if not (isinstance(column, dict) and set(column) == fields and
+                all(isinstance(column[key], str) and IDENTIFIER.fullmatch(column[key])
+                    for key in ('table_schema', 'table_name', 'column_name')) and
+                type(column['ordinal_position']) is int and column['ordinal_position'] > 0 and
+                isinstance(column['data_type'], str) and isinstance(column['udt_name'], str) and
+                column['is_nullable'] in {'YES', 'NO'} and
+                (column['column_default'] is None or isinstance(column['column_default'], str))):
+            raise ValueError('Invalid PostgreSQL column metadata')
+        identity = (column['table_schema'], column['table_name'], column['column_name'])
+        table = identity[:2]
+        position = column['ordinal_position']
+        if identity in identities or position in ordinals.setdefault(table, set()):
+            raise ValueError('Duplicate PostgreSQL column identity or ordinal')
+        identities.add(identity)
+        ordinals[table].add(position)
+    ranks = {table: {position: index + 1 for index, position in enumerate(sorted(positions))}
+             for table, positions in ordinals.items()}
+    normalized = copy.deepcopy(checks)
+    for column in normalized['inventory']['columns']:
+        column['ordinal_position'] = ranks[(column['table_schema'], column['table_name'])][column['ordinal_position']]
+    return normalized
+
+
+def postgres_checks_digest(checks):
+    normalized = normalize_postgres_checks(checks)
+    return hashlib.sha256(json.dumps(normalized, sort_keys=True, separators=(',', ':'),
+                                    allow_nan=False).encode()).hexdigest()
+
+
+def postgres_comparison(expected, actual):
+    # Canonical JSON also retains JSON scalar types (e.g. integer vs boolean).
+    expected_logical = postgres_checks_digest(expected)
+    actual_logical = postgres_checks_digest(actual)
+    def raw_digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
+                                        allow_nan=False).encode()).hexdigest()
+    expected_raw, actual_raw = raw_digest(expected), raw_digest(actual)
+    return {'version': 1, 'columnOrdinals': 'dense-visible-order-per-table',
+            'rawEqual': expected_raw == actual_raw, 'logicalEqual': expected_logical == actual_logical,
+            'expectedRawSha256': expected_raw, 'actualRawSha256': actual_raw,
+            'expectedLogicalSha256': expected_logical, 'actualLogicalSha256': actual_logical}
 
 
 def failure_evidence(error, phase):
@@ -364,6 +426,15 @@ class Backup:
             counts[schema + '.' + name] = int(self.pg(container, 'SELECT count(*) FROM "' + schema + '"."' + name + '";'))
         return {'inventory': inventory, 'counts': counts}
 
+    def verify_postgres(self, expected, actual):
+        # Keep evidence exactly as read; only the comparison uses visible ranks.
+        self.record('postgres-expected-checks.json', expected)
+        self.record('postgres-actual-checks.json', actual)
+        comparison = postgres_comparison(expected, actual)
+        self.record('postgres-comparison.json', comparison)
+        self.require(comparison['logicalEqual'], 'PostgreSQL restored schema/counts/journal mismatch')
+        return comparison
+
     def ch_checks(self, container, config=None):
         tables = self.ch_rows(container, "SELECT name,engine,create_table_query FROM system.tables "
                               "WHERE database='analytics' ORDER BY name", config)
@@ -555,7 +626,7 @@ class Backup:
                                '--no-owner --no-acl --no-password --host 127.0.0.1 --port 5432 '
                                '--username "$POSTGRES_USER" --dbname analytics /tmp/restore.dump', 'postgres-restore')
         self.step('postgres_verify')
-        self.require(self.pg_checks(pg) == expected['postgres'], 'PostgreSQL restored schema/counts/journal mismatch')
+        self.verify_postgres(expected['postgres'], self.pg_checks(pg))
         self.step('postgres_cleanup')
         self.cleanup_targets()
         # File bind is deliberately read-only. Its private ancestor remains 0700;

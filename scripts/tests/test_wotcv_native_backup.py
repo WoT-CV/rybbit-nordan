@@ -492,5 +492,120 @@ class BackupTests(unittest.TestCase):
             self.job.redis_modules('fixture')
 
 
+class PostgresLogicalComparisonTests(unittest.TestCase):
+    def setUp(self):
+        def column(table, name, ordinal, datatype='text', udt='text', nullable='YES', default=None):
+            return {'table_schema': 'public', 'table_name': table, 'column_name': name,
+                    'ordinal_position': ordinal, 'data_type': datatype, 'udt_name': udt,
+                    'is_nullable': nullable, 'column_default': default}
+        self.expected = {'inventory': {
+            'columns': [column('invitation', 'id', 1, 'integer', 'int4', 'NO'),
+                        column('invitation', 'teamId', 10), column('invitation', 'site_role', 14),
+                        column('user', 'id', 5, nullable='NO')],
+            'constraints': [{'schema': 'public', 'name': 'invitation', 'conname': 'invitation_pkey',
+                             'definition': 'PRIMARY KEY (id)'}],
+            'indexes': [{'schemaname': 'public', 'tablename': 'invitation', 'indexname': 'invitation_pkey',
+                         'indexdef': 'CREATE UNIQUE INDEX invitation_pkey ON public.invitation USING btree (id)'}],
+            'journal': [{'id': 1, 'hash': 'a' * 64, 'created_at': 1700000000000}]},
+            'counts': {'public.invitation': 7, 'public.user': 2}}
+        self.actual = deepcopy(self.expected)
+        for row, ordinal in zip(self.actual['inventory']['columns'], (1, 2, 3, 1)):
+            row['ordinal_position'] = ordinal
+
+    def test_physical_gaps_are_accepted_per_table_without_mutating_raw_evidence(self):
+        expected_raw = json.dumps(self.expected)
+        actual_raw = json.dumps(self.actual)
+        comparison = backup.postgres_comparison(self.expected, self.actual)
+        self.assertFalse(comparison['rawEqual'])
+        self.assertTrue(comparison['logicalEqual'])
+        self.assertEqual(comparison['expectedLogicalSha256'], comparison['actualLogicalSha256'])
+        self.assertEqual([row['ordinal_position'] for row in
+                          backup.normalize_postgres_checks(self.expected)['inventory']['columns']], [1, 2, 3, 1])
+        self.assertEqual(json.dumps(self.expected), expected_raw)
+        self.assertEqual(json.dumps(self.actual), actual_raw)
+
+    def test_changed_visible_column_order_is_rejected(self):
+        self.actual['inventory']['columns'][1]['ordinal_position'] = 3
+        self.actual['inventory']['columns'][2]['ordinal_position'] = 2
+        self.actual['inventory']['columns'][1:3] = reversed(self.actual['inventory']['columns'][1:3])
+        self.assertFalse(backup.postgres_comparison(self.expected, self.actual)['logicalEqual'])
+
+    def test_type_default_nullability_and_udt_changes_are_rejected(self):
+        for field, value in [('data_type', 'bigint'), ('udt_name', 'int8'),
+                             ('column_default', 'PRIVATE-DIFFERENT-DEFAULT'), ('is_nullable', 'YES')]:
+            actual = deepcopy(self.actual)
+            actual['inventory']['columns'][0][field] = value
+            with self.subTest(field=field):
+                self.assertFalse(backup.postgres_comparison(self.expected, actual)['logicalEqual'])
+
+    def test_constraints_indexes_journal_and_counts_remain_exact(self):
+        changes = [('constraints', 'definition', 'PRIMARY KEY (teamId)'),
+                   ('indexes', 'indexdef', 'CREATE INDEX different_definition'),
+                   ('journal', 'hash', 'b' * 64), ('journal', 'id', 2), ('journal', 'created_at', 1700000000001)]
+        for section, field, value in changes:
+            actual = deepcopy(self.actual)
+            actual['inventory'][section][0][field] = value
+            with self.subTest(section=section, field=field):
+                self.assertFalse(backup.postgres_comparison(self.expected, actual)['logicalEqual'])
+        self.actual['counts']['public.invitation'] += 1
+        self.assertFalse(backup.postgres_comparison(self.expected, self.actual)['logicalEqual'])
+
+    def test_missing_extra_or_renamed_columns_are_rejected(self):
+        for change in ('missing', 'extra', 'renamed'):
+            actual = deepcopy(self.actual)
+            if change == 'missing':
+                actual['inventory']['columns'].pop()
+            elif change == 'extra':
+                row = dict(actual['inventory']['columns'][0], column_name='added', ordinal_position=20)
+                actual['inventory']['columns'].append(row)
+            else:
+                actual['inventory']['columns'][0]['column_name'] = 'renamed'
+            with self.subTest(change=change):
+                self.assertFalse(backup.postgres_comparison(self.expected, actual)['logicalEqual'])
+
+    def test_malformed_or_duplicate_ordinals_fail_closed_even_if_both_sides_match(self):
+        for ordinal in (0, -1, None, '1', 1.0, True, False):
+            bad = deepcopy(self.actual)
+            bad['inventory']['columns'][0]['ordinal_position'] = ordinal
+            with self.subTest(ordinal=ordinal), self.assertRaisesRegex(ValueError, 'column metadata'):
+                backup.postgres_comparison(bad, bad)
+        bad = deepcopy(self.actual)
+        bad['inventory']['columns'][1]['ordinal_position'] = 1
+        with self.assertRaisesRegex(ValueError, 'Duplicate'):
+            backup.postgres_comparison(bad, bad)
+
+    def test_duplicate_column_identity_and_unknown_metadata_fail_closed(self):
+        bad = deepcopy(self.actual)
+        duplicate = dict(bad['inventory']['columns'][0], ordinal_position=99)
+        bad['inventory']['columns'].append(duplicate)
+        with self.assertRaisesRegex(ValueError, 'Duplicate'):
+            backup.postgres_comparison(bad, bad)
+        bad = deepcopy(self.actual)
+        bad['inventory']['columns'][0]['unreviewed'] = 'value'
+        with self.assertRaisesRegex(ValueError, 'column metadata'):
+            backup.postgres_comparison(bad, bad)
+
+    def test_verifier_keeps_expected_actual_and_comparison_private_without_rewriting_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            captured = root / 'captured-checks.json'
+            original = json.dumps({'postgres': self.expected, 'otherEvidence': 'unchanged'}).encode()
+            captured.write_bytes(original)
+            native = SimpleNamespace(require=require,
+                record=lambda path, value: path.write_text(json.dumps(value)))
+            job = backup.Backup(native, root)
+            result = job.verify_postgres(self.expected, self.actual)
+            self.assertTrue(result['logicalEqual'])
+            self.assertEqual(captured.read_bytes(), original)
+            self.assertEqual(json.loads((root / 'postgres-expected-checks.json').read_text()), self.expected)
+            self.assertEqual(json.loads((root / 'postgres-actual-checks.json').read_text()), self.actual)
+            self.assertEqual(json.loads((root / 'postgres-comparison.json').read_text()), result)
+            actual = deepcopy(self.actual)
+            actual['counts']['public.invitation'] = 999
+            with self.assertRaisesRegex(Refused, 'schema/counts/journal mismatch'):
+                job.verify_postgres(self.expected, actual)
+            self.assertEqual(json.loads((root / 'postgres-actual-checks.json').read_text()), actual)
+
+
 if __name__ == '__main__':
     unittest.main()
