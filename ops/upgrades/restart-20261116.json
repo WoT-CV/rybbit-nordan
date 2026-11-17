@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "baseRevision": "c7b638b5af2249d420de7a46b946477e0eb3b67f",
+  "baseImages": {
+    "backend": "sha256:a4c6b314cd0ba537a2721ff67c407f2e10f4fbba86dc7dbea8dd337734f8c03f",
+    "client": "sha256:755c4dde808bf137401e413120607eb08d8dd7b5a0e711ef4a33a2b52ae9f71c"
+  },
+  "envSha256": "70ede3e741db082931838010c50b107ef133f95c4f0e2b24cfcc64e13da2ee65",
+  "originalStarted": {
+    "postgres": "2026-11-02T06:57:08.998134498Z",
+    "clickhouse": "2026-11-02T06:57:09.115604146Z",
+    "redis": "2026-11-02T06:57:08.877481325Z"
+  },
+  "acceptedStarted": {
+    "postgres": "2026-11-16T15:46:17.662021017Z",
+    "clickhouse": "2026-11-16T15:46:17.947655609Z",
+    "redis": "2026-11-16T15:46:18.000647277Z"
+  },
+  "dockerLifecycle": {
+    "since": "2026-11-16 15:43:00 UTC",
+    "until": "2026-11-16 15:49:00 UTC",
+    "events": [
+      { "event": "stopping", "timestampMicros": "1794843966329326" },
+      { "event": "stopped", "timestampMicros": "1794843976612664" },
+      { "event": "starting", "timestampMicros": "1794843976635495" },
+      { "event": "started", "timestampMicros": "1794843978716068" }
+    ]
+  },
+  "postgresMigrations": {
+    "count": 25,
+    "sha256": "f47e80d77b59b0516a4309487047cb5a260b029eb0dd1a422f309525705d8033"
+  }
+}

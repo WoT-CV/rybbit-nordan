@@ -3,3 +3,4 @@ server/docker-entrypoint.sh text eol=lf
 scripts/wotcv-branch-build-deploy.sh text eol=lf
 scripts/wotcv-native-*.py text eol=lf
 ops/upgrades/reviewed-code-*.json text eol=lf
+ops/upgrades/restart-*.json text eol=lf

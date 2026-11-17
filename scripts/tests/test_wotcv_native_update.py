@@ -12,7 +12,7 @@ import tarfile
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'wotcv-native-update.py'
@@ -1176,6 +1176,308 @@ class OfflineTests(unittest.TestCase):
             (self.root / 'active.json').write_text(json.dumps(receipt))
             with self.assertRaises(phase.Refused):
                 phase.receipt_guard(live)
+
+
+class ReconciliationTests(unittest.TestCase):
+    def setUp(self):
+        OfflineTests.setUp(self)
+        if not hasattr(phase.os, 'O_NOFOLLOW'):
+            self.stack.enter_context(patch.object(phase.os, 'O_NOFOLLOW', 0, create=True))
+
+    def fixture(self):
+        state = self.root / 'state'
+        release = state / 'rybbit-native-update-20261102T010203Z.1234abcd'
+        release.mkdir(parents=True)
+        environment = release / 'deployment.env'
+        environment.write_bytes(ENV)
+        old = live_state()
+        live = deepcopy(old)
+        for name in phase.DATABASES:
+            live[name]['started'] = '2026-11-16T15:46:18.000000000Z'
+        receipt = {'phase': 'active', 'release': release.name, 'sha': REVISION, 'runtime': old,
+                   'images': {name: OLD_IMAGES[name] for name in ('backend', 'client')},
+                   'envSha256': phase.digest(environment)}
+        raw = json.dumps(receipt).encode()
+        (state / 'active.json').write_bytes(raw)
+        (release / 'success.json').write_bytes(raw)
+        pairs = [{'createdAt': '123', 'sha256': 'a' * 64}]
+        contract = {'version': 1, 'baseRevision': REVISION, 'baseImages': receipt['images'],
+                    'envSha256': receipt['envSha256'],
+                    'originalStarted': {n: old[n]['started'] for n in phase.DATABASES},
+                    'acceptedStarted': {n: live[n]['started'] for n in phase.DATABASES},
+                    'dockerLifecycle': {'since': '2026-11-16 15:43:00 UTC',
+                                        'until': '2026-11-16 15:49:00 UTC',
+                                        'events': [{'event': event, 'timestampMicros': str(1794843966329326 + i)}
+                                                   for i, event in enumerate(('stopping', 'stopped', 'starting', 'started'))]},
+                    'postgresMigrations': {'count': 1, 'sha256': phase.canonical_hash(pairs)}}
+        contract_path = self.root / 'contract.json'
+        contract_path.write_text(json.dumps(contract))
+        self.stack.enter_context(patch.object(phase, 'STATE', state))
+        # Windows does not expose POSIX permissions. Test those checks separately.
+        self.stack.enter_context(patch.object(phase, 'receipt_directory'))
+        self.stack.enter_context(patch.object(phase, 'receipt_file', side_effect=lambda p: p.read_bytes()))
+        self.stack.enter_context(patch.object(phase, 'fsync_directory'))
+        snapshot = self.stack.enter_context(patch.object(phase, 'snapshot', return_value=live))
+        for name in ('code_runtime_guard', 'model_guard', 'verify_model_live', 'readiness'):
+            self.stack.enter_context(patch.object(phase, name))
+        self.stack.enter_context(patch.object(phase, 'config', return_value=effective_model()))
+        self.stack.enter_context(patch.object(phase, 'docker_lifecycle', return_value=contract['dockerLifecycle']['events']))
+        migrations = self.stack.enter_context(patch.object(phase, 'migration_pairs', return_value=pairs))
+        return SimpleNamespace(state=state, release=release, receipt=receipt, raw=raw, old=old, live=live,
+                               path=contract_path, contract=contract, snapshot=snapshot, migrations=migrations)
+
+    def reconcile(self, fixture):
+        return phase.reconcile(fixture.path, phase.digest(fixture.path), phase.RECONCILE_ACK)
+
+    def test_reconciliation_preserves_history_and_accepts_only_exact_attested_runtime(self):
+        f = self.fixture()
+        report = self.reconcile(f)
+        self.assertEqual(report['result'], 'VERIFIED')
+        self.assertEqual((f.state / 'active.json').read_bytes(), f.raw)
+        self.assertEqual((f.release / 'success.json').read_bytes(), f.raw)
+        self.assertEqual((f.release / 'deployment.env').read_bytes(), ENV)
+        self.assertFalse((f.state / 'pending.json').exists())
+        phase.receipt_guard(f.live)
+        phase.receipt_guard(f.old)
+        for field, value in [('id', 'different'), ('image', NEW_IMAGES['backend']), ('mounts', []),
+                             ('volume', {}), ('started', '2026-11-17T00:00:00Z'), ('restarts', 1),
+                             ('unexpected', 'extra')]:
+            changed = deepcopy(f.live)
+            changed['postgres'][field] = value
+            with self.subTest(field=field), self.assertRaises((phase.Refused, OSError)):
+                phase.receipt_guard(changed)
+        for name in ('backend', 'client'):
+            changed = deepcopy(f.live)
+            changed[name]['image'] = NEW_IMAGES[name]
+            with self.subTest(name=name), self.assertRaises(phase.Refused):
+                phase.receipt_guard(changed)
+        self.assertEqual(self.reconcile(f)['attestationSha256'], report['attestationSha256'])
+
+    def test_reconciliation_refuses_stable_drift_missing_fields_and_nonzero_restarts(self):
+        f = self.fixture()
+        for field, value in [('id', 'changed'), ('image', NEW_IMAGES['backend']), ('mounts', []),
+                             ('volume', {}), ('restarts', 1), ('unknown', 1), ('started', 'unreviewed')]:
+            changed = deepcopy(f.live)
+            changed['redis'][field] = value
+            f.snapshot.return_value = changed
+            with self.subTest(field=field), self.assertRaises(phase.Refused):
+                self.reconcile(f)
+        changed = deepcopy(f.live)
+        del changed['redis']['mounts']
+        f.snapshot.return_value = changed
+        with self.assertRaises(phase.Refused):
+            self.reconcile(f)
+        self.assertFalse((f.state / 'reconciliations').exists())
+
+    def test_reconciliation_rejects_wrong_ack_root_and_contract_digest_before_runtime(self):
+        f = self.fixture()
+        for ack, digest in [('wrong', phase.digest(f.path)), (phase.RECONCILE_ACK, '0' * 64),
+                            (phase.RECONCILE_ACK, None)]:
+            with self.subTest(ack=ack, digest=digest), self.assertRaises(phase.Refused):
+                phase.reconcile(f.path, digest, ack)
+        with patch.object(phase.os, 'geteuid', return_value=1000), self.assertRaises(phase.Refused):
+            self.reconcile(f)
+        f.snapshot.assert_not_called()
+
+    def test_reconciliation_rejects_pending_history_environment_and_provenance_changes(self):
+        f = self.fixture()
+        for path, data in [(f.state / 'pending.json', b'{}'), (f.release / 'success.json', b'{}'),
+                           (f.release / 'deployment.env', b'changed')]:
+            original = path.read_bytes() if path.exists() else None
+            path.write_bytes(data)
+            with self.subTest(path=path.name), self.assertRaises(phase.Refused):
+                self.reconcile(f)
+            if original is None:
+                path.unlink()
+            else:
+                path.write_bytes(original)
+        f.contract['baseRevision'] = 'd' * 40
+        f.path.write_text(json.dumps(f.contract))
+        with self.assertRaises(phase.Refused):
+            self.reconcile(f)
+
+    def test_reconciliation_never_publishes_on_failed_independent_checks_or_race(self):
+        f = self.fixture()
+        for check in ('code_runtime_guard', 'config', 'model_guard', 'verify_model_live', 'readiness',
+                      'docker_lifecycle', 'migration_pairs'):
+            with patch.object(phase, check, side_effect=phase.Refused('safe failure')):
+                with self.subTest(check=check), self.assertRaises(phase.Refused):
+                    self.reconcile(f)
+        f.migrations.return_value = []
+        with self.assertRaises(phase.Refused):
+            self.reconcile(f)
+        f.migrations.return_value = [{'createdAt': '123', 'sha256': 'b' * 64}]
+        with self.assertRaises(phase.Refused):
+            self.reconcile(f)
+        f.migrations.return_value = [{'createdAt': '123', 'sha256': 'a' * 64}]
+        changed = deepcopy(f.live)
+        changed['postgres']['started'] = '2026-11-17T00:00:00Z'
+        f.snapshot.side_effect = [f.live, changed]
+        with self.assertRaises(phase.Refused):
+            self.reconcile(f)
+        self.assertFalse((f.state / 'reconciliations').exists())
+
+    def test_attestation_invalidates_after_tool_receipt_or_content_changes(self):
+        f = self.fixture()
+        self.reconcile(f)
+        attestation = phase.reconciliation_path(phase.digest(f.state / 'active.json'), f.live)
+        original = attestation.read_bytes()
+        for field, value in [('version', True), ('operation', 'unreviewed'), ('toolSha256', '0' * 64),
+                             ('activeReceiptSha256', '0' * 64), ('successReceiptSha256', '0' * 64),
+                             ('databaseRuntime', {}), ('contractSha256', '0' * 64),
+                             ('contractRaw', '{}'), ('contract', {})]:
+            changed = json.loads(original)
+            changed[field] = value
+            attestation.write_text(json.dumps(changed))
+            with self.subTest(field=field), self.assertRaises(phase.Refused):
+                phase.receipt_guard(f.live)
+        for field in json.loads(original):
+            changed = json.loads(original)
+            del changed[field]
+            attestation.write_text(json.dumps(changed))
+            with self.subTest(missing=field), self.assertRaises(phase.Refused):
+                phase.receipt_guard(f.live)
+        for field, value in [('postgresMigrations', {}), ('dockerLifecycle', []),
+                             ('observedRuntimeSha256', '0' * 64), ('contractCanonicalSha256', '0' * 64),
+                             ('createdAt', '2026-11-17T00:00:00Z')]:
+            changed = json.loads(original)
+            changed[field] = value
+            attestation.write_text(json.dumps(changed))
+            with self.subTest(extra=field), self.assertRaises(phase.Refused):
+                phase.receipt_guard(f.live)
+        attestation.write_bytes(original)
+        (f.state / 'active.json').write_bytes(f.raw + b'\n')
+        with self.assertRaises(phase.Refused):
+            phase.receipt_guard(f.live)
+
+    def test_attestation_replay_rejects_duplicate_malformed_or_invalid_utf8_raw_contract(self):
+        f = self.fixture()
+        self.reconcile(f)
+        path = phase.reconciliation_path(phase.digest(f.state / 'active.json'), f.live)
+        original = path.read_bytes()
+        for raw in ('{"version":1,"version":1}', '{}', '\ud800'):
+            attestation = json.loads(original)
+            attestation['contractRaw'] = raw
+            if raw != '\ud800':
+                attestation['contractSha256'] = phase.hashlib.sha256(raw.encode()).hexdigest()
+            path.write_text(json.dumps(attestation))
+            with self.subTest(raw=ascii(raw)), self.assertRaises(phase.Refused):
+                phase.receipt_guard(f.live)
+        duplicate = original.decode().replace('"version": 1,', '"version":1,"version":1,', 1)
+        path.write_text(duplicate)
+        with self.assertRaises(phase.Refused):
+            phase.receipt_guard(f.live)
+
+    def test_bad_raw_contract_never_reaches_runtime_or_creates_attestation(self):
+        f = self.fixture()
+        for raw in (b'{"version":1,"version":1}', b'\xff', b'{}'):
+            f.path.write_bytes(raw)
+            with self.subTest(raw=raw), self.assertRaises(phase.Refused):
+                self.reconcile(f)
+        f.snapshot.assert_not_called()
+        self.assertFalse((f.state / 'reconciliations').exists())
+
+    def test_immutable_publication_refuses_overwrite_and_interruption_leaves_no_partial_record(self):
+        path = self.root / 'attestation.json'
+        with patch.object(phase, 'fsync_directory') as sync:
+            phase.immutable_record(path, {'complete': 1})
+            sync.assert_called_once_with(path.parent)
+            original = path.read_bytes()
+            with self.assertRaises(FileExistsError):
+                phase.immutable_record(path, {'complete': 2})
+            self.assertEqual(path.read_bytes(), original)
+            other = self.root / 'other.json'
+            with patch.object(phase.os, 'link', side_effect=OSError('interrupted')):
+                with self.assertRaises(OSError):
+                    phase.immutable_record(other, {'complete': 3})
+            self.assertFalse(other.exists())
+            self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['attestation.json'])
+
+    def test_journal_collector_outputs_fixed_classifications_and_refuses_event_drift(self):
+        contract = json.loads((SCRIPT.parents[1] / 'ops/upgrades/restart-20261116.json').read_text())
+        lifecycle = contract['dockerLifecycle']
+        messages = ('Stopping docker.service - Docker Application Container Engine...',
+                    'Stopped docker.service - Docker Application Container Engine.',
+                    'Starting docker.service - Docker Application Container Engine...',
+                    'Started docker.service - Docker Application Container Engine.')
+        records = [{'MESSAGE': message, '__REALTIME_TIMESTAMP': event['timestampMicros']}
+                   for message, event in zip(messages, lifecycle['events'])]
+        records.append({'MESSAGE': 'secret ignored daemon diagnostic', '__REALTIME_TIMESTAMP': '1794843979999999'})
+        phase.run.return_value = '\n'.join(json.dumps(x) for x in records).encode()
+        phase.run.side_effect = None
+        self.assertEqual(phase.docker_lifecycle(lifecycle), lifecycle['events'])
+        self.assertNotIn('secret', json.dumps(phase.docker_lifecycle(lifecycle)))
+        records[0]['__REALTIME_TIMESTAMP'] = '1794843966329327'
+        phase.run.return_value = '\n'.join(json.dumps(x) for x in records).encode()
+        with self.assertRaises(phase.Refused):
+            phase.docker_lifecycle(lifecycle)
+
+    def test_reconciliation_cli_requires_root_then_uses_both_locks_and_explicit_contract_hash(self):
+        args = ['update.py', 'reconcile', '--reconciliation-contract', str(self.root / 'contract.json'),
+                '--reconciliation-contract-sha256', 'a' * 64, '--ack', phase.RECONCILE_ACK]
+        with patch('sys.argv', args), patch.object(phase.os, 'geteuid', return_value=1000), \
+                patch.object(phase, 'locked') as locked, patch.object(phase, 'reconcile') as operation:
+            with self.assertRaises(phase.Refused):
+                phase.main()
+            locked.assert_not_called()
+            operation.assert_not_called()
+        with patch('sys.argv', args), patch.object(phase, 'locked', return_value=nullcontext()) as locked, \
+                patch.object(phase, 'reconcile', return_value={'result': 'VERIFIED'}) as operation:
+            phase.main()
+            locked.assert_called_once_with(root=True)
+            operation.assert_called_once_with(self.root / 'contract.json', 'a' * 64, phase.RECONCILE_ACK)
+
+    def test_restart_contract_rejects_duplicate_fields_and_unreviewed_schema(self):
+        path = self.root / 'contract.json'
+        path.write_text('{"version":1,"version":1}')
+        with self.assertRaises(phase.Refused):
+            phase.read_reconciliation_contract(path, phase.digest(path))
+        original = json.loads((SCRIPT.parents[1] / 'ops/upgrades/restart-20261116.json').read_text())
+        phase.validate_reconciliation_contract(original)
+        for field, value in [('version', True), ('unknown', 'unreviewed'), ('baseImages', {}),
+                             ('originalStarted', {}), ('envSha256', 'unreviewed'),
+                             ('postgresMigrations', {'count': True, 'sha256': 'a' * 64}),
+                             ('dockerLifecycle', {'since': 'unbounded'})]:
+            contract = deepcopy(original)
+            contract[field] = value
+            path.write_text(json.dumps(contract))
+            with self.subTest(field=field), self.assertRaises(phase.Refused):
+                phase.read_reconciliation_contract(path, phase.digest(path))
+
+    def test_migration_collector_only_reads_journal_and_hashes_runtime_sql(self):
+        live = live_state()
+        pairs = [{'createdAt': '123', 'sha256': 'a' * 64}]
+        phase.docker.side_effect = [b'123|' + b'a' * 64 + b'\n', json.dumps(pairs).encode()]
+        self.assertEqual(phase.migration_pairs(live), pairs)
+        calls = phase.docker.call_args_list
+        self.assertEqual(calls[0].args[:4], ('exec', live['postgres']['id'], 'sh', '-ec'))
+        self.assertIn('SELECT created_at, hash FROM drizzle.__drizzle_migrations', calls[0].args[4])
+        self.assertEqual(calls[1].args[:4], ('exec', live['backend']['id'], 'node', '-e'))
+        self.assertIn("readFileSync('/app/drizzle/'", calls[1].args[4])
+        self.assertNotIn('secret', calls[0].args[4])
+        phase.docker.side_effect = [b'123|' + b'a' * 64 + b'\n', b'[]']
+        with self.assertRaises(phase.Refused):
+            phase.migration_pairs(live)
+
+    def test_private_directory_and_file_checks_fail_closed(self):
+        directory = Mock()
+        directory.resolve.return_value = directory
+        directory.is_dir.return_value = True
+        directory.is_symlink.return_value = False
+        directory.stat.return_value = SimpleNamespace(st_uid=0, st_mode=0o40700)
+        phase.receipt_directory(directory)
+        for mode, uid, symlink in [(0o40755, 0, False), (0o40700, 1000, False), (0o40700, 0, True)]:
+            directory.stat.return_value = SimpleNamespace(st_uid=uid, st_mode=mode)
+            directory.is_symlink.return_value = symlink
+            with self.subTest(mode=mode, uid=uid, symlink=symlink), self.assertRaises(phase.Refused):
+                phase.receipt_directory(directory)
+        file = Mock()
+        file.resolve.return_value = file
+        file.is_file.return_value = True
+        file.is_symlink.return_value = False
+        file.stat.return_value = SimpleNamespace(st_uid=1000, st_mode=0o100600, st_size=1)
+        with self.assertRaises(phase.Refused):
+            phase.receipt_file(file)
 
 
 if __name__ == '__main__':
