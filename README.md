@@ -138,15 +138,8 @@ applied after the base Compose file; do not combine them. They require Compose
 2.24.4 or newer for `!override`. The native backend's entrypoint applies database
 migrations on startup, so use an isolated, explicitly prepared environment.
 The [native updater](scripts/wotcv-native-update.py) is tied to an existing
-installation and accepts frontend/static-asset updates by default. An explicitly
-hash-reviewed code contract can approve an exact backend API delta while
-dependencies, schema, startup and native configuration remain protected.
-The [code-release runbook](ops/upgrades/2026-11-17-upstream.md) describes the
-hash-reviewed [operator packet](scripts/wotcv-native-release.py), quiesced
-[backups and isolated restore drill](scripts/wotcv-native-backup.py), and
-guarded [application/configuration rollback](scripts/wotcv-native-rollback.py).
-It requires verified backups, migration journals and operator access; this is not a
-general database/dependency upgrade path. The [legacy updater bridge](scripts/wotcv-branch-build-deploy.sh) refuses
+installation and accepts only frontend/static-asset updates under its source
+guards. The [legacy updater bridge](scripts/wotcv-branch-build-deploy.sh) refuses
 deployment with exit code 78. These scripts are not a general fresh-install guide.
 Proxy examples for private noindex responses and public tracker caching are in
 [ops/nginx/](ops/nginx/).

@@ -6,20 +6,18 @@ import importlib.util
 import io
 import json
 from pathlib import Path
-import shutil
 import stat
 import tarfile
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'wotcv-native-update.py'
 SPEC = importlib.util.spec_from_file_location('wotcv_native_update_under_test', SCRIPT)
 phase = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(phase)
-DOCKER_CALL = phase.docker
 OLD_IMAGES = {name: 'sha256:' + str(index) * 64
               for index, name in enumerate(phase.SERVICES, 1)}
 NEW_IMAGES = {'backend': 'sha256:' + 'a' * 64, 'client': 'sha256:' + 'b' * 64}
@@ -152,14 +150,6 @@ class OfflineTests(unittest.TestCase):
         (candidate / 'server/public/script.js.gz').write_bytes(b'new compressed asset')
         phase.source_guard(candidate)
 
-    def test_git_archives_use_canonical_lf_configuration_without_changing_checkout(self):
-        with patch.object(phase, 'run', return_value=b'archive') as run:
-            self.assertEqual(phase.git('archive', '--format=tar', phase.BASELINE), b'archive')
-        command = run.call_args.args[0]
-        self.assertIn('core.autocrlf=false', command)
-        self.assertIn('core.eol=lf', command)
-        self.assertEqual(command[-3:], ['archive', '--format=tar', phase.BASELINE])
-
     def test_source_guard_rejects_changed_or_added_backend_contracts(self):
         _, candidate = self.source_fixture()
         for name in ('server/src/index.ts', 'server/src/db/schema.ts', 'server/new-migration.sql',
@@ -215,234 +205,6 @@ class OfflineTests(unittest.TestCase):
             (original / 'server/src/db/schema.ts').write_text('tampered native baseline')
             with self.assertRaises(phase.Refused):
                 phase.source_guard(candidate)
-
-    def code_fixture(self):
-        original, candidate = self.source_fixture()
-        data = io.BytesIO()
-        with tarfile.open(fileobj=data, mode='w'):
-            pass
-        self.stack.enter_context(patch.object(phase, 'git', return_value=data.getvalue()))
-        name = 'server/src/api/reviewed.ts'
-        for base, data in ((original, b'original API\n'), (candidate, b'reviewed API\n')):
-            path = base / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
-        (original.parent / 'state.json').write_text(json.dumps({
-            'source': phase.BASELINE, 'project': phase.PROJECT,
-            'sourceFiles': phase.source_hashes(original)}))
-        contract = {'version': 1, 'baseline': phase.BASELINE, 'baseRevision': REVISION,
-                    'baseImages': {name: OLD_IMAGES[name] for name in ('backend', 'client')},
-                    'changes': {name: {'before': phase.digest(original / name),
-                                       'after': phase.digest(candidate / name)}}}
-        return original, candidate, contract
-
-    def write_contract(self, contract, path=None):
-        path = path or self.root / 'reviewed-code.json'
-        path.write_bytes((json.dumps(contract, indent=2, sort_keys=True) + '\n').encode())
-        return path, phase.digest(path)
-
-    def test_code_contract_accepts_exact_reviewed_delta_but_default_refuses_it(self):
-        _, candidate, contract = self.code_fixture()
-        with self.assertRaises(phase.Refused):
-            phase.source_guard(candidate)
-        phase.source_guard(candidate, contract)
-        path, expected = self.write_contract(contract)
-        raw, loaded = phase.read_code_contract(path, expected)
-        self.assertEqual(raw, path.read_bytes())
-        self.assertEqual(loaded, contract)
-
-    def test_code_contract_accepts_exact_added_api_file(self):
-        original, candidate, contract = self.code_fixture()
-        name = 'server/src/api/new.ts'
-        (candidate / name).write_bytes(b'new API\n')
-        contract['changes'][name] = {'before': None, 'after': phase.digest(candidate / name)}
-        self.assertFalse((original / name).exists())
-        phase.source_guard(candidate, contract)
-
-    def test_code_contract_refuses_malicious_or_out_of_scope_paths(self):
-        _, _, contract = self.code_fixture()
-        for name in ('../server/src/api/escape.ts', '/server/src/api/escape.ts',
-                     'server/src/api/../db/schema.ts', 'server/src/api/./test.ts',
-                     'server\\src\\api\\test.ts', 'server/src/api//test.ts',
-                     'server/src/api/test.ts\n', 'server/src/index.ts', 'server/src/db/schema.ts',
-                     'server/docker-entrypoint.sh', 'server/Dockerfile', 'server/package.json',
-                     'shared/index.ts', 'pnpm-lock.yaml', 'docker-compose.yml',
-                     'ops/minimal/compose.fresh.yml', 'server/src/api/arbitrary.sh'):
-            with self.subTest(name=name):
-                bad = deepcopy(contract)
-                bad['changes'] = {name: next(iter(contract['changes'].values()))}
-                with self.assertRaises(phase.Refused):
-                    phase.validate_code_contract(bad)
-
-    def test_code_contract_refuses_invalid_fields_hashes_deletions_and_duplicate_json(self):
-        _, _, contract = self.code_fixture()
-        name = next(iter(contract['changes']))
-        variants = []
-        for key, value in (('version', True), ('baseline', REVISION), ('baseRevision', 'bad'),
-                           ('baseImages', {'backend': 'latest'}), ('changes', {}), ('extra', 'ignored')):
-            bad = deepcopy(contract)
-            bad[key] = value
-            variants.append(bad)
-        for before, after in (('bad', 'a' * 64), (None, None), ('a' * 64, 'a' * 64),
-                              ('a' * 64, 'SHA256:' + 'b' * 64), (7, 'b' * 64)):
-            bad = deepcopy(contract)
-            bad['changes'][name] = {'before': before, 'after': after}
-            variants.append(bad)
-        for bad in variants:
-            with self.subTest(bad=bad), self.assertRaises(phase.Refused):
-                phase.validate_code_contract(bad)
-        path, _ = self.write_contract(contract)
-        path.write_bytes(b'{"version":1,"version":1}')
-        with self.assertRaises(phase.Refused):
-            phase.read_code_contract(path, phase.digest(path))
-
-    def test_code_contract_refuses_stale_before_after_extra_missing_or_deleted_delta(self):
-        _, candidate, contract = self.code_fixture()
-        name = next(iter(contract['changes']))
-        for side in ('before', 'after'):
-            bad = deepcopy(contract)
-            bad['changes'][name][side] = '0' * 64
-            with self.subTest(side=side), self.assertRaises(phase.Refused):
-                phase.source_guard(candidate, bad)
-        for extra in ('server/src/api/unreviewed.ts', 'server/src/db/schema.ts',
-                      'pnpm-lock.yaml', 'ops/minimal/compose.fresh.yml'):
-            path = candidate / extra
-            previous = path.read_bytes() if path.exists() else None
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b'unreviewed change')
-            with self.subTest(extra=extra), self.assertRaises(phase.Refused):
-                phase.source_guard(candidate, contract)
-            if previous is None:
-                path.unlink()
-            else:
-                path.write_bytes(previous)
-        original_bytes = (candidate / name).read_bytes()
-        (candidate / name).write_bytes(b'original API\n')
-        with self.assertRaises(phase.Refused):
-            phase.source_guard(candidate, contract)
-        (candidate / name).write_bytes(original_bytes)
-        (candidate / name).unlink()
-        with self.assertRaises(phase.Refused):
-            phase.source_guard(candidate, contract)
-
-    def test_code_contract_requires_explicit_hash_and_rejects_changed_file(self):
-        _, _, contract = self.code_fixture()
-        path, expected = self.write_contract(contract)
-        for invalid in (None, 'bad', '0' * 64):
-            with self.subTest(invalid=invalid), self.assertRaises(phase.Refused):
-                phase.read_code_contract(path, invalid)
-        path.write_bytes(path.read_bytes() + b' ')
-        with self.assertRaises(phase.Refused):
-            phase.read_code_contract(path, expected)
-
-    def test_code_runtime_guard_requires_reviewed_images_and_revision_labels(self):
-        _, _, contract = self.code_fixture()
-        labels = {'Config': {'Labels': {'org.opencontainers.image.revision': REVISION}}}
-        with patch.object(phase, 'image_info', return_value=labels):
-            phase.code_runtime_guard(contract, live_state())
-            drifted = live_state()
-            drifted['backend']['image'] = NEW_IMAGES['backend']
-            with self.assertRaises(phase.Refused):
-                phase.code_runtime_guard(contract, drifted)
-        with patch.object(phase, 'image_info', return_value={'Config': {'Labels': {}}}), \
-                self.assertRaises(phase.Refused):
-            phase.code_runtime_guard(contract, live_state())
-
-    def prepared_code_fixture(self):
-        original, candidate, contract = self.code_fixture()
-        bundle = self.root / 'rybbit-native-update-20261117T010203Z.1234abcd'
-        bundle.mkdir()
-        candidate.rename(bundle / 'source')
-        path, expected = self.write_contract(contract, bundle / 'code-contract.json')
-        nginx = self.root / 'nginx.conf'
-        nginx.write_bytes(b'offline nginx')
-        plan = {'version': 1, 'sha': REVISION, 'project': phase.PROJECT,
-                'root': str(phase.ROOT), 'before': live_state(), 'images': NEW_IMAGES,
-                'files': phase.source_hashes(bundle / 'source'), 'toolSha256': phase.digest(SCRIPT),
-                'nginxSha256': phase.digest(nginx), 'phase': 'prepared', 'codeContractSha256': expected}
-        (bundle / 'plan.json').write_text(json.dumps(plan))
-        self.stack.enter_context(patch.object(phase, 'NGINX', nginx))
-        self.stack.enter_context(patch.object(phase, 'private'))
-        self.stack.enter_context(patch.object(phase, 'verify_images'))
-        actual_path = Path
-        self.stack.enter_context(patch.object(phase, 'Path', side_effect=lambda value:
-                                             self.root if str(value) == '/home/wotcv' else actual_path(value)))
-        original_stat = Path.stat
-        def bundle_stat(path, *args, **kwargs):
-            value = original_stat(path, *args, **kwargs)
-            return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700) if path == bundle else value
-        self.stack.enter_context(patch.object(Path, 'stat', bundle_stat))
-        return SimpleNamespace(bundle=bundle, contract=contract, path=path, expected=expected, plan=plan)
-
-    def test_prepared_code_plan_requires_same_explicit_hash_at_check_and_apply(self):
-        f = self.prepared_code_fixture()
-        self.assertEqual(phase.load_plan(f.bundle, f.expected), f.plan)
-        for invalid in (None, '0' * 64):
-            with self.subTest(invalid=invalid), self.assertRaises(phase.Refused):
-                phase.load_plan(f.bundle, invalid)
-        f.path.write_bytes(f.path.read_bytes() + b' ')
-        with self.assertRaises(phase.Refused):
-            phase.load_plan(f.bundle, f.expected)
-        with patch.object(phase, 'snapshot') as snapshot, patch.object(phase, 'compose') as compose:
-            with self.assertRaises(phase.Refused):
-                phase.apply(f.bundle, phase.ACK, f.expected)
-            snapshot.assert_not_called()
-            compose.assert_not_called()
-
-    def test_code_prepare_requires_paired_contract_options_and_pinned_commit_before_git(self):
-        _, _, contract = self.code_fixture()
-        path, expected = self.write_contract(contract)
-        for args in ((REVISION, path, None), (REVISION, None, expected), (None, path, expected)):
-            with self.subTest(args=args), patch.object(phase, 'git') as git, self.assertRaises(phase.Refused):
-                phase.prepare(*args)
-            git.assert_not_called()
-
-    def test_code_prepare_copies_exact_contract_into_plan_without_starting_apps(self):
-        _, candidate, contract = self.code_fixture()
-        path, expected = self.write_contract(contract)
-        empty_archive = phase.git()
-        def git(*args):
-            if args == ('remote', 'get-url', 'origin'):
-                return phase.REMOTE.encode()
-            if args[0] == 'fetch':
-                return b''
-            if args[0] == 'rev-parse':
-                return REVISION.encode()
-            self.assertEqual(args[0], 'archive')
-            return empty_archive
-        nginx = self.root / 'nginx.conf'
-        nginx.write_bytes(b'offline nginx')
-        actual_path = Path
-        with patch.object(phase, 'Path', side_effect=lambda value:
-                          self.root if str(value) == '/home/wotcv' else actual_path(value)), \
-                patch.object(phase, 'git', side_effect=git), \
-                patch.object(phase, 'unpack', side_effect=lambda data, target:
-                             shutil.copytree(candidate, target, dirs_exist_ok=True)), \
-                patch.object(phase, 'write', side_effect=lambda target, raw:
-                             target.write_bytes(raw.encode() if isinstance(raw, str) else raw)), \
-                patch.object(phase, 'snapshot', return_value=live_state()), \
-                patch.object(phase, 'image_info', return_value={
-                    'Config': {'Labels': {'org.opencontainers.image.revision': REVISION}}}), \
-                patch.object(phase, 'build_images', return_value=NEW_IMAGES), \
-                patch.object(phase, 'verify_images'), patch.object(phase, 'NGINX', nginx), \
-                patch.object(phase, 'compose') as compose:
-            bundle = phase.prepare(REVISION, path, expected)
-        plan = json.loads((bundle / 'plan.json').read_text())
-        self.assertEqual(plan['codeContractSha256'], expected)
-        self.assertEqual(plan['sha'], REVISION)
-        self.assertEqual(plan['toolSha256'], phase.digest(SCRIPT))
-        self.assertEqual((bundle / 'code-contract.json').read_bytes(), path.read_bytes())
-        compose.assert_not_called()
-
-    def test_apply_cli_passes_explicit_reviewed_hash_without_installing_tool(self):
-        expected = 'a' * 64
-        args = ['update.py', 'apply', '--bundle', str(self.root / 'bundle'), '--ack', phase.ACK,
-                '--code-contract-sha256', expected]
-        with patch('sys.argv', args), patch.object(phase, 'locked', return_value=nullcontext()), \
-                patch.object(phase, 'apply') as apply, patch.object(phase, 'install') as install:
-            phase.main()
-        apply.assert_called_once_with(self.root / 'bundle', phase.ACK, expected)
-        install.assert_not_called()
 
     def archive(self, name, kind=tarfile.REGTYPE):
         data = io.BytesIO()
@@ -662,85 +424,6 @@ class OfflineTests(unittest.TestCase):
                 phase.image_info('latest:mutable')
             docker.assert_not_called()
 
-    def private_build_permissions(self, *paths):
-        # Windows does not expose Unix private mode bits. Emulate just these
-        # directories after creation, preserving real I/O and absence checks.
-        actual_stat = Path.stat
-        def build_stat(path, *args, **kwargs):
-            value = actual_stat(path, *args, **kwargs)
-            if path in paths:
-                return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=phase.os.geteuid())
-            return value
-        self.stack.enter_context(patch.object(Path, 'stat', build_stat))
-
-    def test_build_config_is_fresh_empty_private_and_does_not_read_global_client_state(self):
-        bundle = self.root / 'private-release'
-        bundle.mkdir()
-        config = bundle / 'docker-cli'
-        self.private_build_permissions(bundle, config)
-        actual_mkdir = Path.mkdir
-        with patch.object(Path, 'mkdir', autospec=True, side_effect=actual_mkdir) as mkdir, \
-                patch.object(Path, 'read_bytes', side_effect=AssertionError('Client config reads forbidden')):
-            self.assertEqual(phase.create_build_config(bundle), config)
-        created = [call for call in mkdir.call_args_list if call.args[0] == config]
-        self.assertEqual(len(created), 1)
-        self.assertEqual(created[0].kwargs, {'mode': 0o700})
-        self.assertEqual(list(config.iterdir()), [])
-        sentinel = config / 'existing-metadata'
-        sentinel.write_bytes(b'preserve')
-        with self.assertRaises(phase.Refused):
-            phase.create_build_config(bundle)
-        self.assertEqual(sentinel.read_bytes(), b'preserve')
-
-    def test_build_config_refuses_unowned_public_noncanonical_or_symlink_paths(self):
-        bundle = self.root / 'private-release'
-        bundle.mkdir()
-        config = bundle / 'docker-cli'
-        actual_stat = Path.stat
-        for mode, uid in ((0o755, 0), (0o700, 1001)):
-            def unsafe_stat(path, *args, **kwargs):
-                value = actual_stat(path, *args, **kwargs)
-                return SimpleNamespace(st_mode=stat.S_IFDIR | mode, st_uid=uid) if path == bundle else value
-            with self.subTest(mode=mode, uid=uid), patch.object(Path, 'stat', unsafe_stat), \
-                    self.assertRaises(phase.Refused):
-                phase.create_build_config(bundle)
-            self.assertFalse(config.exists())
-        self.private_build_permissions(bundle, config)
-        actual_symlink = Path.is_symlink
-        def symlink(path):
-            return path == config or actual_symlink(path)
-        with patch.object(Path, 'is_symlink', symlink), self.assertRaises(phase.Refused):
-            phase.create_build_config(bundle)
-        self.assertFalse(config.exists())
-        config.mkdir()
-        with self.assertRaises(phase.Refused):
-            phase.validate_build_config(bundle, self.root / 'outside-config')
-        with patch.object(Path, 'is_symlink', symlink), self.assertRaises(phase.Refused):
-            phase.validate_build_config(bundle, config)
-        actual_resolve = Path.resolve
-        def noncanonical(path, *args, **kwargs):
-            return self.root / 'different-release' if path == bundle else actual_resolve(path, *args, **kwargs)
-        with patch.object(Path, 'resolve', noncanonical), self.assertRaises(phase.Refused):
-            phase.validate_build_config(bundle, config)
-
-    def test_asset_build_refuses_unsafe_docker_config_before_inspecting_images(self):
-        config = self.root / 'docker-cli'
-        tag = 'wotcv-rybbit-native:' + REVISION + '-backend-1234abcd'
-        self.private_build_permissions(self.root)
-        with patch.object(phase, 'docker') as docker, self.assertRaises(phase.Refused):
-            phase.normalize_assets(NEW_IMAGES['backend'], tag, self.root / 'source', io.BytesIO(), config)
-        docker.assert_not_called()
-
-    def test_docker_build_config_keeps_pinned_engine_socket_and_fixed_environment(self):
-        config = self.root / 'docker-cli'
-        with patch.object(phase, 'run', return_value=b'') as run:
-            DOCKER_CALL('--config', str(config), 'build', '.')
-        self.assertEqual(run.call_args.args[0],
-                         ['/usr/bin/docker', '--host', 'unix:///var/run/docker.sock', '--config', str(config), 'build', '.'])
-        self.assertEqual(run.call_args.kwargs, {})
-        self.assertNotIn('DOCKER_CONFIG', phase.safe_env())
-        self.assertNotIn('DOCKER_HOST', phase.safe_env())
-
     def test_asset_normalization_derives_from_exact_image_offline_and_records_tool_provenance(self):
         original = NEW_IMAGES['backend']
         derived = 'sha256:' + 'd' * 64
@@ -749,17 +432,13 @@ class OfflineTests(unittest.TestCase):
         final = {'Id': derived, 'RootFS': {'Layers': ['sha256:base-layer', 'sha256:asset-layer']}}
         source = self.root / 'source'
         source.mkdir()
-        config = self.root / 'docker-cli'
-        config.mkdir()
-        self.private_build_permissions(self.root, config)
         with patch.object(phase, 'docker', side_effect=[json.dumps([base]).encode(), b'',
                           json.dumps([final]).encode(), json.dumps([base]).encode()]) as docker:
             log = io.BytesIO()
-            actual = phase.normalize_assets(original, base_tag, source, log, config)
+            actual = phase.normalize_assets(original, base_tag, source, log)
         self.assertEqual(actual, derived)
         before, build, inspect, after = docker.call_args_list
-        self.assertEqual(build.args, ('--config', str(config), 'build', '--pull=false', '--network', 'none',
-                                     '-f', '-', '-t', base_tag + '-assets', '.'))
+        self.assertEqual(build.args, ('build', '--pull=false', '--network', 'none', '-f', '-', '-t', base_tag + '-assets', '.'))
         self.assertEqual(build.kwargs['cwd'], source)
         self.assertIs(build.kwargs['log'], log)
         self.assertEqual(build.kwargs['timeout'], 180)
@@ -783,7 +462,7 @@ class OfflineTests(unittest.TestCase):
         for identity in ('backend:latest', 'sha256:abc', 'a' * 64, 'sha256:' + 'G' * 64):
             with self.subTest(identity=identity), patch.object(phase, 'docker') as docker:
                 with self.assertRaises(phase.Refused):
-                    phase.normalize_assets(identity, 'offline:normalized', self.root, io.BytesIO(), self.root / 'docker-cli')
+                    phase.normalize_assets(identity, 'offline:normalized', self.root, io.BytesIO())
                 docker.assert_not_called()
 
     def test_asset_normalization_refuses_unscoped_or_moving_base_tags(self):
@@ -792,7 +471,7 @@ class OfflineTests(unittest.TestCase):
                     'wotcv-rybbit-native:' + REVISION + '-backend-ABCDEF12'):
             with self.subTest(tag=tag), patch.object(phase, 'docker') as docker:
                 with self.assertRaises(phase.Refused):
-                    phase.normalize_assets(NEW_IMAGES['backend'], tag, self.root, io.BytesIO(), self.root / 'docker-cli')
+                    phase.normalize_assets(NEW_IMAGES['backend'], tag, self.root, io.BytesIO())
                 docker.assert_not_called()
 
     def test_asset_normalization_refuses_base_tag_identity_drift_and_unrelated_layer_lineage(self):
@@ -801,24 +480,19 @@ class OfflineTests(unittest.TestCase):
         base = {'Id': identity, 'RootFS': {'Layers': ['base-layer']}}
         final = {'Id': 'sha256:' + 'd' * 64, 'RootFS': {'Layers': ['base-layer', 'asset-layer']}}
         wrong = {'Id': NEW_IMAGES['client'], 'RootFS': {'Layers': ['other-layer']}}
-        config = self.root / 'docker-cli'
-        config.mkdir()
-        self.private_build_permissions(self.root, config)
         variants = ([json.dumps([wrong]).encode()],
                     [json.dumps([base]).encode(), b'', json.dumps([final]).encode(), json.dumps([wrong]).encode()],
                     [json.dumps([base]).encode(), b'', json.dumps([wrong]).encode(), json.dumps([base]).encode()])
         for responses in variants:
             with self.subTest(responses=len(responses)), patch.object(phase, 'docker', side_effect=responses), \
                     self.assertRaises(phase.Refused):
-                phase.normalize_assets(identity, tag, self.root / 'source', io.BytesIO(), config)
+                phase.normalize_assets(identity, tag, self.root, io.BytesIO())
 
     def test_build_images_normalizes_only_backend_and_pins_client_lite_flag(self):
         bundle = self.root / 'release.1234abcd'
         bundle.mkdir()
-        config = bundle / 'docker-cli'
-        self.private_build_permissions(bundle, config)
         def docker(*args, **kwargs):
-            if args[:3] == ('--config', str(config), 'build'):
+            if args[0] == 'build':
                 return b''
             self.assertEqual(args[:2], ('image', 'inspect'))
             return json.dumps([{'Id': NEW_IMAGES['backend' if '-backend-' in args[2] else 'client']}]).encode()
@@ -830,8 +504,7 @@ class OfflineTests(unittest.TestCase):
         normalize.assert_called_once()
         self.assertEqual(normalize.call_args.args[:3], (NEW_IMAGES['backend'],
                          'wotcv-rybbit-native:' + REVISION + '-backend-1234abcd', bundle / 'source'))
-        self.assertEqual(normalize.call_args.args[4], config)
-        builds = [call for call in calls.call_args_list if call.args[:3] == ('--config', str(config), 'build')]
+        builds = [call for call in calls.call_args_list if call.args[0] == 'build']
         self.assertEqual(len(builds), 2)
         self.assertIn('NEXT_PUBLIC_LITE_DASHBOARD=false', builds[1].args)
         for call in builds:
@@ -905,33 +578,6 @@ class OfflineTests(unittest.TestCase):
         self.assertEqual(snapshot.call_count, 60)
         self.assertEqual(sleep.call_count, 60)
 
-    def test_wait_ready_retries_connection_reset_during_http_startup(self):
-        live = live_state()
-        with patch.object(phase, 'snapshot', return_value=live), \
-                patch.object(phase, 'readiness', side_effect=[ConnectionResetError(), None]) as ready, \
-                patch.object(phase.time, 'sleep') as sleep:
-            self.assertEqual(phase.wait_ready({name: live[name]['image'] for name in NEW_IMAGES}), live)
-        self.assertEqual(ready.call_count, 2)
-        sleep.assert_called_once_with(2)
-
-    def test_wait_ready_bounds_resets_and_does_not_swallow_other_os_errors(self):
-        live = live_state()
-        images = {name: live[name]['image'] for name in NEW_IMAGES}
-        with patch.object(phase, 'snapshot', return_value=live), \
-                patch.object(phase, 'readiness', side_effect=ConnectionResetError()) as ready, \
-                patch.object(phase.time, 'sleep') as sleep:
-            with self.assertRaisesRegex(phase.Refused, 'timed out'):
-                phase.wait_ready(images)
-        self.assertEqual(ready.call_count, 60)
-        self.assertEqual(sleep.call_count, 60)
-        with patch.object(phase, 'snapshot', return_value=live), \
-                patch.object(phase, 'readiness', side_effect=PermissionError()) as ready, \
-                patch.object(phase.time, 'sleep') as sleep:
-            with self.assertRaises(PermissionError):
-                phase.wait_ready(images)
-        ready.assert_called_once_with()
-        sleep.assert_not_called()
-
     def application_fixture(self):
         state = self.root / 'state'
         bundle = self.root / 'candidate'
@@ -1000,53 +646,6 @@ class OfflineTests(unittest.TestCase):
         self.assertEqual(active['envSha256'], phase.digest(transaction / 'deployment.env'))
         self.assertFalse((f.state / 'pending.json').exists())
         self.assertTrue((transaction / 'completed-pending.json').is_file())
-
-    def code_application_fixture(self):
-        _, _, contract = self.code_fixture()
-        f = self.application_fixture()
-        f.bundle.mkdir(exist_ok=True)
-        f.contract_path, f.contract_hash = self.write_contract(contract, f.bundle / 'code-contract.json')
-        f.plan['codeContractSha256'] = f.contract_hash
-        self.stack.enter_context(patch.object(phase, 'image_info', return_value={
-            'Config': {'Labels': {'org.opencontainers.image.revision': REVISION}}}))
-        return f
-
-    def test_code_apply_preserves_runtime_guards_and_contract_identity_in_private_receipts(self):
-        f = self.code_application_fixture()
-        phase.apply(f.bundle, phase.ACK, f.contract_hash)
-        phase.load_plan.assert_called_once_with(f.bundle, f.contract_hash)
-        phase.receipt_guard.assert_called_once_with(f.before)
-        self.assert_app_only(f.compose.call_args)
-        transaction = f.state / f.bundle.name
-        self.assertEqual(phase.digest(transaction / 'code-contract.json'), f.contract_hash)
-        for path in (transaction / 'attempt.json', transaction / 'success.json', f.state / 'active.json'):
-            self.assertEqual(json.loads(path.read_text())['codeContractSha256'], f.contract_hash)
-        self.assertEqual((transaction / 'previous.env').read_bytes(), ENV)
-
-    def test_code_apply_refuses_unreviewed_runtime_base_before_transaction(self):
-        f = self.code_application_fixture()
-        manifest = json.loads(f.contract_path.read_text())
-        manifest['baseImages']['backend'] = NEW_IMAGES['backend']
-        _, expected = self.write_contract(manifest, f.contract_path)
-        f.plan['codeContractSha256'] = expected
-        with self.assertRaises(phase.Refused):
-            phase.apply(f.bundle, phase.ACK, expected)
-        f.compose.assert_not_called()
-        self.assertFalse(f.state.exists())
-
-    def test_reviewed_code_activation_failure_rolls_back_only_images_and_keeps_contract_pending(self):
-        f = self.code_application_fixture()
-        f.wait.side_effect = [phase.Refused('offline code activation failure'), f.before]
-        with self.assertRaises(phase.Refused):
-            phase.apply(f.bundle, phase.ACK, f.contract_hash)
-        self.assertEqual(f.compose.call_count, 2)
-        for call in f.compose.call_args_list:
-            self.assert_app_only(call)
-        pending = json.loads((f.state / 'pending.json').read_text())
-        self.assertEqual(pending['codeContractSha256'], f.contract_hash)
-        failure = json.loads((f.state / f.bundle.name / 'failure.json').read_text())
-        self.assertEqual(failure['phase'], 'application-images-restored')
-        self.assertFalse((f.state / 'active.json').exists())
 
     def install_fixture(self):
         f = self.application_fixture()
@@ -1203,328 +802,6 @@ class OfflineTests(unittest.TestCase):
             (self.root / 'active.json').write_text(json.dumps(receipt))
             with self.assertRaises(phase.Refused):
                 phase.receipt_guard(live)
-
-
-class ReconciliationTests(unittest.TestCase):
-    def setUp(self):
-        OfflineTests.setUp(self)
-        if not hasattr(phase.os, 'O_NOFOLLOW'):
-            self.stack.enter_context(patch.object(phase.os, 'O_NOFOLLOW', 0, create=True))
-
-    def fixture(self):
-        state = self.root / 'state'
-        release = state / 'rybbit-native-update-20261102T010203Z.1234abcd'
-        release.mkdir(parents=True)
-        environment = release / 'deployment.env'
-        environment.write_bytes(ENV)
-        old = live_state()
-        live = deepcopy(old)
-        for name in phase.DATABASES:
-            live[name]['started'] = '2026-11-16T15:46:18.000000000Z'
-        receipt = {'phase': 'active', 'release': release.name, 'sha': REVISION, 'runtime': old,
-                   'images': {name: OLD_IMAGES[name] for name in ('backend', 'client')},
-                   'envSha256': phase.digest(environment)}
-        raw = json.dumps(receipt).encode()
-        (state / 'active.json').write_bytes(raw)
-        (release / 'success.json').write_bytes(raw)
-        pairs = [{'createdAt': '123', 'sha256': 'a' * 64}]
-        contract = {'version': 1, 'baseRevision': REVISION, 'baseImages': receipt['images'],
-                    'envSha256': receipt['envSha256'],
-                    'originalStarted': {n: old[n]['started'] for n in phase.DATABASES},
-                    'acceptedStarted': {n: live[n]['started'] for n in phase.DATABASES},
-                    'dockerLifecycle': {'since': '2026-11-16 15:43:00 UTC',
-                                        'until': '2026-11-16 15:49:00 UTC',
-                                        'events': [{'event': event, 'timestampMicros': str(1794843966329326 + i)}
-                                                   for i, event in enumerate(('stopping', 'stopped', 'starting', 'started'))]},
-                    'postgresMigrations': {'count': 1, 'sha256': phase.canonical_hash(pairs)}}
-        contract_path = self.root / 'contract.json'
-        contract_path.write_text(json.dumps(contract))
-        self.stack.enter_context(patch.object(phase, 'STATE', state))
-        # Windows does not expose POSIX permissions. Test those checks separately.
-        self.stack.enter_context(patch.object(phase, 'receipt_directory'))
-        self.stack.enter_context(patch.object(phase, 'receipt_file', side_effect=lambda p: p.read_bytes()))
-        self.stack.enter_context(patch.object(phase, 'fsync_directory'))
-        snapshot = self.stack.enter_context(patch.object(phase, 'snapshot', return_value=live))
-        for name in ('code_runtime_guard', 'model_guard', 'verify_model_live', 'readiness'):
-            self.stack.enter_context(patch.object(phase, name))
-        self.stack.enter_context(patch.object(phase, 'config', return_value=effective_model()))
-        self.stack.enter_context(patch.object(phase, 'docker_lifecycle', return_value=contract['dockerLifecycle']['events']))
-        migrations = self.stack.enter_context(patch.object(phase, 'migration_pairs', return_value=pairs))
-        return SimpleNamespace(state=state, release=release, receipt=receipt, raw=raw, old=old, live=live,
-                               path=contract_path, contract=contract, snapshot=snapshot, migrations=migrations)
-
-    def reconcile(self, fixture):
-        return phase.reconcile(fixture.path, phase.digest(fixture.path), phase.RECONCILE_ACK)
-
-    def test_reconciliation_preserves_history_and_accepts_only_exact_attested_runtime(self):
-        f = self.fixture()
-        report = self.reconcile(f)
-        self.assertEqual(report['result'], 'VERIFIED')
-        self.assertEqual((f.state / 'active.json').read_bytes(), f.raw)
-        self.assertEqual((f.release / 'success.json').read_bytes(), f.raw)
-        self.assertEqual((f.release / 'deployment.env').read_bytes(), ENV)
-        self.assertFalse((f.state / 'pending.json').exists())
-        phase.receipt_guard(f.live)
-        phase.receipt_guard(f.old)
-        for field, value in [('id', 'different'), ('image', NEW_IMAGES['backend']), ('mounts', []),
-                             ('volume', {}), ('started', '2026-11-17T00:00:00Z'), ('restarts', 1),
-                             ('unexpected', 'extra')]:
-            changed = deepcopy(f.live)
-            changed['postgres'][field] = value
-            with self.subTest(field=field), self.assertRaises((phase.Refused, OSError)):
-                phase.receipt_guard(changed)
-        for name in ('backend', 'client'):
-            changed = deepcopy(f.live)
-            changed[name]['image'] = NEW_IMAGES[name]
-            with self.subTest(name=name), self.assertRaises(phase.Refused):
-                phase.receipt_guard(changed)
-        self.assertEqual(self.reconcile(f)['attestationSha256'], report['attestationSha256'])
-
-    def test_new_reviewed_tool_requires_fresh_attestation_and_preserves_old_bytes(self):
-        f = self.fixture()
-        self.reconcile(f)
-        active_hash = phase.digest(f.state / 'active.json')
-        old_path = phase.reconciliation_path(active_hash, f.live)
-        old_bytes = old_path.read_bytes()
-        real_digest = phase.digest
-        def changed_tool(path):
-            return 'b' * 64 if path == Path(phase.__file__) else real_digest(path)
-        with patch.object(phase, 'digest', side_effect=changed_tool):
-            new_path = phase.reconciliation_path(active_hash, f.live)
-            self.assertNotEqual(new_path, old_path)
-            with self.assertRaises((phase.Refused, OSError)):
-                phase.receipt_guard(f.live)
-            self.reconcile(f)
-            phase.receipt_guard(f.live)
-            self.assertEqual(json.loads(new_path.read_bytes())['toolSha256'], 'b' * 64)
-        self.assertEqual(old_path.read_bytes(), old_bytes)
-        self.assertEqual(len(list(old_path.parent.glob('*.json'))), 2)
-
-    def test_reconciliation_refuses_stable_drift_missing_fields_and_nonzero_restarts(self):
-        f = self.fixture()
-        for field, value in [('id', 'changed'), ('image', NEW_IMAGES['backend']), ('mounts', []),
-                             ('volume', {}), ('restarts', 1), ('unknown', 1), ('started', 'unreviewed')]:
-            changed = deepcopy(f.live)
-            changed['redis'][field] = value
-            f.snapshot.return_value = changed
-            with self.subTest(field=field), self.assertRaises(phase.Refused):
-                self.reconcile(f)
-        changed = deepcopy(f.live)
-        del changed['redis']['mounts']
-        f.snapshot.return_value = changed
-        with self.assertRaises(phase.Refused):
-            self.reconcile(f)
-        self.assertFalse((f.state / 'reconciliations').exists())
-
-    def test_reconciliation_rejects_wrong_ack_root_and_contract_digest_before_runtime(self):
-        f = self.fixture()
-        for ack, digest in [('wrong', phase.digest(f.path)), (phase.RECONCILE_ACK, '0' * 64),
-                            (phase.RECONCILE_ACK, None)]:
-            with self.subTest(ack=ack, digest=digest), self.assertRaises(phase.Refused):
-                phase.reconcile(f.path, digest, ack)
-        with patch.object(phase.os, 'geteuid', return_value=1000), self.assertRaises(phase.Refused):
-            self.reconcile(f)
-        f.snapshot.assert_not_called()
-
-    def test_reconciliation_rejects_pending_history_environment_and_provenance_changes(self):
-        f = self.fixture()
-        for path, data in [(f.state / 'pending.json', b'{}'), (f.release / 'success.json', b'{}'),
-                           (f.release / 'deployment.env', b'changed')]:
-            original = path.read_bytes() if path.exists() else None
-            path.write_bytes(data)
-            with self.subTest(path=path.name), self.assertRaises(phase.Refused):
-                self.reconcile(f)
-            if original is None:
-                path.unlink()
-            else:
-                path.write_bytes(original)
-        f.contract['baseRevision'] = 'd' * 40
-        f.path.write_text(json.dumps(f.contract))
-        with self.assertRaises(phase.Refused):
-            self.reconcile(f)
-
-    def test_reconciliation_never_publishes_on_failed_independent_checks_or_race(self):
-        f = self.fixture()
-        for check in ('code_runtime_guard', 'config', 'model_guard', 'verify_model_live', 'readiness',
-                      'docker_lifecycle', 'migration_pairs'):
-            with patch.object(phase, check, side_effect=phase.Refused('safe failure')):
-                with self.subTest(check=check), self.assertRaises(phase.Refused):
-                    self.reconcile(f)
-        f.migrations.return_value = []
-        with self.assertRaises(phase.Refused):
-            self.reconcile(f)
-        f.migrations.return_value = [{'createdAt': '123', 'sha256': 'b' * 64}]
-        with self.assertRaises(phase.Refused):
-            self.reconcile(f)
-        f.migrations.return_value = [{'createdAt': '123', 'sha256': 'a' * 64}]
-        changed = deepcopy(f.live)
-        changed['postgres']['started'] = '2026-11-17T00:00:00Z'
-        f.snapshot.side_effect = [f.live, changed]
-        with self.assertRaises(phase.Refused):
-            self.reconcile(f)
-        self.assertFalse((f.state / 'reconciliations').exists())
-
-    def test_attestation_invalidates_after_tool_receipt_or_content_changes(self):
-        f = self.fixture()
-        self.reconcile(f)
-        attestation = phase.reconciliation_path(phase.digest(f.state / 'active.json'), f.live)
-        original = attestation.read_bytes()
-        for field, value in [('version', True), ('operation', 'unreviewed'), ('toolSha256', '0' * 64),
-                             ('activeReceiptSha256', '0' * 64), ('successReceiptSha256', '0' * 64),
-                             ('databaseRuntime', {}), ('contractSha256', '0' * 64),
-                             ('contractRaw', '{}'), ('contract', {})]:
-            changed = json.loads(original)
-            changed[field] = value
-            attestation.write_text(json.dumps(changed))
-            with self.subTest(field=field), self.assertRaises(phase.Refused):
-                phase.receipt_guard(f.live)
-        for field in json.loads(original):
-            changed = json.loads(original)
-            del changed[field]
-            attestation.write_text(json.dumps(changed))
-            with self.subTest(missing=field), self.assertRaises(phase.Refused):
-                phase.receipt_guard(f.live)
-        for field, value in [('postgresMigrations', {}), ('dockerLifecycle', []),
-                             ('observedRuntimeSha256', '0' * 64), ('contractCanonicalSha256', '0' * 64),
-                             ('createdAt', '2026-11-17T00:00:00Z')]:
-            changed = json.loads(original)
-            changed[field] = value
-            attestation.write_text(json.dumps(changed))
-            with self.subTest(extra=field), self.assertRaises(phase.Refused):
-                phase.receipt_guard(f.live)
-        attestation.write_bytes(original)
-        (f.state / 'active.json').write_bytes(f.raw + b'\n')
-        with self.assertRaises(phase.Refused):
-            phase.receipt_guard(f.live)
-
-    def test_attestation_replay_rejects_duplicate_malformed_or_invalid_utf8_raw_contract(self):
-        f = self.fixture()
-        self.reconcile(f)
-        path = phase.reconciliation_path(phase.digest(f.state / 'active.json'), f.live)
-        original = path.read_bytes()
-        for raw in ('{"version":1,"version":1}', '{}', '\ud800'):
-            attestation = json.loads(original)
-            attestation['contractRaw'] = raw
-            if raw != '\ud800':
-                attestation['contractSha256'] = phase.hashlib.sha256(raw.encode()).hexdigest()
-            path.write_text(json.dumps(attestation))
-            with self.subTest(raw=ascii(raw)), self.assertRaises(phase.Refused):
-                phase.receipt_guard(f.live)
-        duplicate = original.decode().replace('"version": 1,', '"version":1,"version":1,', 1)
-        path.write_text(duplicate)
-        with self.assertRaises(phase.Refused):
-            phase.receipt_guard(f.live)
-
-    def test_bad_raw_contract_never_reaches_runtime_or_creates_attestation(self):
-        f = self.fixture()
-        for raw in (b'{"version":1,"version":1}', b'\xff', b'{}'):
-            f.path.write_bytes(raw)
-            with self.subTest(raw=raw), self.assertRaises(phase.Refused):
-                self.reconcile(f)
-        f.snapshot.assert_not_called()
-        self.assertFalse((f.state / 'reconciliations').exists())
-
-    def test_immutable_publication_refuses_overwrite_and_interruption_leaves_no_partial_record(self):
-        path = self.root / 'attestation.json'
-        with patch.object(phase, 'fsync_directory') as sync:
-            phase.immutable_record(path, {'complete': 1})
-            sync.assert_called_once_with(path.parent)
-            original = path.read_bytes()
-            with self.assertRaises(FileExistsError):
-                phase.immutable_record(path, {'complete': 2})
-            self.assertEqual(path.read_bytes(), original)
-            other = self.root / 'other.json'
-            with patch.object(phase.os, 'link', side_effect=OSError('interrupted')):
-                with self.assertRaises(OSError):
-                    phase.immutable_record(other, {'complete': 3})
-            self.assertFalse(other.exists())
-            self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['attestation.json'])
-
-    def test_journal_collector_outputs_fixed_classifications_and_refuses_event_drift(self):
-        contract = json.loads((SCRIPT.parents[1] / 'ops/upgrades/restart-20261116.json').read_text())
-        lifecycle = contract['dockerLifecycle']
-        messages = ('Stopping docker.service - Docker Application Container Engine...',
-                    'Stopped docker.service - Docker Application Container Engine.',
-                    'Starting docker.service - Docker Application Container Engine...',
-                    'Started docker.service - Docker Application Container Engine.')
-        records = [{'MESSAGE': message, '__REALTIME_TIMESTAMP': event['timestampMicros']}
-                   for message, event in zip(messages, lifecycle['events'])]
-        records.append({'MESSAGE': 'secret ignored daemon diagnostic', '__REALTIME_TIMESTAMP': '1794843979999999'})
-        phase.run.return_value = '\n'.join(json.dumps(x) for x in records).encode()
-        phase.run.side_effect = None
-        self.assertEqual(phase.docker_lifecycle(lifecycle), lifecycle['events'])
-        self.assertNotIn('secret', json.dumps(phase.docker_lifecycle(lifecycle)))
-        records[0]['__REALTIME_TIMESTAMP'] = '1794843966329327'
-        phase.run.return_value = '\n'.join(json.dumps(x) for x in records).encode()
-        with self.assertRaises(phase.Refused):
-            phase.docker_lifecycle(lifecycle)
-
-    def test_reconciliation_cli_requires_root_then_uses_both_locks_and_explicit_contract_hash(self):
-        args = ['update.py', 'reconcile', '--reconciliation-contract', str(self.root / 'contract.json'),
-                '--reconciliation-contract-sha256', 'a' * 64, '--ack', phase.RECONCILE_ACK]
-        with patch('sys.argv', args), patch.object(phase.os, 'geteuid', return_value=1000), \
-                patch.object(phase, 'locked') as locked, patch.object(phase, 'reconcile') as operation:
-            with self.assertRaises(phase.Refused):
-                phase.main()
-            locked.assert_not_called()
-            operation.assert_not_called()
-        with patch('sys.argv', args), patch.object(phase, 'locked', return_value=nullcontext()) as locked, \
-                patch.object(phase, 'reconcile', return_value={'result': 'VERIFIED'}) as operation:
-            phase.main()
-            locked.assert_called_once_with(root=True)
-            operation.assert_called_once_with(self.root / 'contract.json', 'a' * 64, phase.RECONCILE_ACK)
-
-    def test_restart_contract_rejects_duplicate_fields_and_unreviewed_schema(self):
-        path = self.root / 'contract.json'
-        path.write_text('{"version":1,"version":1}')
-        with self.assertRaises(phase.Refused):
-            phase.read_reconciliation_contract(path, phase.digest(path))
-        original = json.loads((SCRIPT.parents[1] / 'ops/upgrades/restart-20261116.json').read_text())
-        phase.validate_reconciliation_contract(original)
-        for field, value in [('version', True), ('unknown', 'unreviewed'), ('baseImages', {}),
-                             ('originalStarted', {}), ('envSha256', 'unreviewed'),
-                             ('postgresMigrations', {'count': True, 'sha256': 'a' * 64}),
-                             ('dockerLifecycle', {'since': 'unbounded'})]:
-            contract = deepcopy(original)
-            contract[field] = value
-            path.write_text(json.dumps(contract))
-            with self.subTest(field=field), self.assertRaises(phase.Refused):
-                phase.read_reconciliation_contract(path, phase.digest(path))
-
-    def test_migration_collector_only_reads_journal_and_hashes_runtime_sql(self):
-        live = live_state()
-        pairs = [{'createdAt': '123', 'sha256': 'a' * 64}]
-        phase.docker.side_effect = [b'123|' + b'a' * 64 + b'\n', json.dumps(pairs).encode()]
-        self.assertEqual(phase.migration_pairs(live), pairs)
-        calls = phase.docker.call_args_list
-        self.assertEqual(calls[0].args[:4], ('exec', live['postgres']['id'], 'sh', '-ec'))
-        self.assertIn('SELECT created_at, hash FROM drizzle.__drizzle_migrations', calls[0].args[4])
-        self.assertEqual(calls[1].args[:4], ('exec', live['backend']['id'], 'node', '-e'))
-        self.assertIn("readFileSync('/app/drizzle/'", calls[1].args[4])
-        self.assertNotIn('secret', calls[0].args[4])
-        phase.docker.side_effect = [b'123|' + b'a' * 64 + b'\n', b'[]']
-        with self.assertRaises(phase.Refused):
-            phase.migration_pairs(live)
-
-    def test_private_directory_and_file_checks_fail_closed(self):
-        directory = Mock()
-        directory.resolve.return_value = directory
-        directory.is_dir.return_value = True
-        directory.is_symlink.return_value = False
-        directory.stat.return_value = SimpleNamespace(st_uid=0, st_mode=0o40700)
-        phase.receipt_directory(directory)
-        for mode, uid, symlink in [(0o40755, 0, False), (0o40700, 1000, False), (0o40700, 0, True)]:
-            directory.stat.return_value = SimpleNamespace(st_uid=uid, st_mode=mode)
-            directory.is_symlink.return_value = symlink
-            with self.subTest(mode=mode, uid=uid, symlink=symlink), self.assertRaises(phase.Refused):
-                phase.receipt_directory(directory)
-        file = Mock()
-        file.resolve.return_value = file
-        file.is_file.return_value = True
-        file.is_symlink.return_value = False
-        file.stat.return_value = SimpleNamespace(st_uid=1000, st_mode=0o100600, st_size=1)
-        with self.assertRaises(phase.Refused):
-            phase.receipt_file(file)
 
 
 if __name__ == '__main__':

@@ -6,7 +6,6 @@ import { useParams } from "next/navigation";
 import { useRef, useState } from "react";
 import { CopyButton } from "@/components/interior/copy-button";
 import { toast } from "@/components/ui/sonner";
-import { useHydrated } from "@/hooks/useHydrated";
 import {
   useGeneratePrivateLinkKey,
   useGetPrivateLinkConfig,
@@ -40,10 +39,9 @@ import { exportCsv, exportPdf } from "./Export";
 export function ShareExportButton() {
   const t = useExtracted();
   const session = authClient.useSession();
-  const hydrated = useHydrated();
   const params = useParams();
   const siteId = Number(params.site);
-  const canShare = hydrated && !!session.data;
+  const canShare = !!session.data;
 
   const [isExportingCsv, setIsExportingCsv] = useState(false);
   const [isExportingPdf, setIsExportingPdf] = useState(false);

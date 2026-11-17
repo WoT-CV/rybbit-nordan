@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""Native updater. Never opens legacy data or mutates the sealed bootstrap.
+"""Native app-only updater. Never opens legacy data or mutates the sealed bootstrap.
 
 prepare builds an exact published commit without starting applications. install
-and update require an operator's sudo. By default only frontend/static-asset
-changes are accepted. An explicitly hash-reviewed code contract can approve an
-exact API-code delta; dependencies, database and startup contracts stay frozen.
-Backup and applied-journal preflight remain operator duties. Image rollback is
-NOT a DB restore. No database deletion, Docker prune, nginx edit or checkout exists.
-reconcile records only an explicitly reviewed daemon-restart timestamp exception;
-historical deployment receipts and the running services remain untouched.
+and update require an operator's sudo. This first updater intentionally accepts
+only frontend/static-asset changes: server code, dependencies and DB contracts
+must remain byte-identical to the native bootstrap. Image rollback is NOT a DB
+restore. No database deletion, Docker prune, nginx edit or git checkout exists.
 """
 import argparse
 import contextlib
@@ -40,15 +37,8 @@ DOCKER = ['/usr/bin/docker', '--host', 'unix:///var/run/docker.sock']
 SERVICES = ('backend', 'client', 'postgres', 'clickhouse', 'redis')
 DATABASES = {'postgres': '/var/lib/postgresql/data', 'clickhouse': '/var/lib/clickhouse', 'redis': '/data'}
 SHA = re.compile(r'[0-9a-f]{40}\Z')
-SHA256 = re.compile(r'[0-9a-f]{64}\Z')
 IMAGE = re.compile(r'sha256:[0-9a-f]{64}\Z')
 ACK = 'update-native-apps-preserve-data'
-RECONCILE_ACK = 'reconcile-native-docker-restart'
-CODE_PATH = re.compile(r'server/src/api/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_.-]+\.(?:ts|snap)\Z')
-CODE_FILES = {'server/src/lib/subscriptionUtils.ts', 'server/src/lib/subscriptionUtils.test.ts',
-              'server/src/services/sites/siteConfigurationLifecycle.ts',
-              'server/src/services/sites/siteConfigurationLifecycle.test.ts',
-              'server/src/mcp/mcp.test.ts'}
 
 
 class Refused(RuntimeError):
@@ -82,8 +72,7 @@ def docker(*args, **kwargs):
 
 
 def git(*args):
-    # Archive hashes must be independent of a workstation's CRLF preference.
-    command = ['/usr/bin/git', '-c', 'core.autocrlf=false', '-c', 'core.eol=lf', '-C', str(REPO), *args]
+    command = ['/usr/bin/git', '-C', str(REPO), *args]
     if os.geteuid() == 0:
         command = ['/usr/sbin/runuser', '-u', 'wotcv', '--', *command]
     return run(command, timeout=180)
@@ -133,59 +122,7 @@ def guarded(name):
                 'client/package.json', 'client/Dockerfile', 'docker-compose.yml', '.dockerignore')
 
 
-def validate_code_contract(contract):
-    require(isinstance(contract, dict) and set(contract) ==
-            {'version', 'baseline', 'baseRevision', 'baseImages', 'changes'}, 'Invalid reviewed code contract fields')
-    require(type(contract['version']) is int and contract['version'] == 1 and contract['baseline'] == BASELINE and
-            isinstance(contract['baseRevision'], str) and SHA.fullmatch(contract['baseRevision']),
-            'Invalid reviewed code baseline/revision')
-    images = contract['baseImages']
-    require(isinstance(images, dict) and set(images) == {'backend', 'client'} and
-            all(isinstance(value, str) and IMAGE.fullmatch(value) for value in images.values()),
-            'Reviewed code contract requires immutable base application images')
-    changes = contract['changes']
-    require(isinstance(changes, dict) and 0 < len(changes) <= 250, 'Invalid reviewed code delta')
-    for name, entry in changes.items():
-        require(isinstance(name, str) and PurePosixPath(name).as_posix() == name and
-                '..' not in PurePosixPath(name).parts and '\\' not in name and
-                (CODE_PATH.fullmatch(name) or name in CODE_FILES), 'Code contract path is outside reviewed API scope')
-        require(isinstance(entry, dict) and set(entry) == {'before', 'after'} and
-                (entry['before'] is None or isinstance(entry['before'], str) and SHA256.fullmatch(entry['before'])) and
-                isinstance(entry['after'], str) and SHA256.fullmatch(entry['after']) and
-                entry['before'] != entry['after'], 'Invalid reviewed before/after code hashes')
-
-
-def read_code_contract(path, expected_hash):
-    require(isinstance(expected_hash, str) and SHA256.fullmatch(expected_hash),
-            'Explicit reviewed --code-contract-sha256 required')
-    require(path.is_file() and not path.is_symlink() and path.stat().st_size <= 131072,
-            'Expected a bounded regular code contract file')
-    raw = path.read_bytes()
-    require(hashlib.sha256(raw).hexdigest() == expected_hash, 'Reviewed code contract hash changed')
-
-    def unique_fields(pairs):
-        result = {}
-        for key, value in pairs:
-            require(key not in result, 'Duplicate reviewed code contract field')
-            result[key] = value
-        return result
-
-    contract = json.loads(raw, object_pairs_hook=unique_fields)
-    validate_code_contract(contract)
-    return raw, contract
-
-
-def code_runtime_guard(contract, live):
-    require(all(live[name]['image'] == identity for name, identity in contract['baseImages'].items()),
-            'Runtime no longer matches reviewed base application images')
-    for identity in contract['baseImages'].values():
-        require(image_info(identity)['Config'].get('Labels', {}).get('org.opencontainers.image.revision') ==
-                contract['baseRevision'], 'Reviewed base image revision mismatch')
-
-
-def source_guard(candidate, code_contract=None):
-    if code_contract is not None:
-        validate_code_contract(code_contract)
+def source_guard(candidate):
     original = source_hashes(ROOT / 'source')
     if os.geteuid() == 0:
         state = json.loads((ROOT / 'state.json').read_text())
@@ -201,23 +138,7 @@ def source_guard(candidate, code_contract=None):
         require({k: v for k, v in original.items() if guarded(k)} == approved,
                 'Original native executable contract differs from published baseline')
     approved = {k: v for k, v in original.items() if guarded(k)}
-    candidate_files = source_hashes(candidate)
-    actual = {k: v for k, v in candidate_files.items() if guarded(k)}
-    if code_contract is not None:
-        # Historical overlay additions postdate BASELINE. Freeze them against
-        # the reviewed live revision, not the earlier bootstrap Git archive.
-        with tarfile.open(fileobj=io.BytesIO(git('archive', '--format=tar', code_contract['baseRevision'],
-                                               'ops/minimal'))) as archive:
-            config_files = {m.name: hashlib.sha256(archive.extractfile(m).read()).hexdigest()
-                            for m in archive.getmembers() if m.isfile()}
-        require({k: v for k, v in candidate_files.items() if k.startswith('ops/minimal/')} == config_files,
-                'Reviewed code release changed native overlay configuration')
-        changed = {name for name in approved.keys() | actual.keys() if approved.get(name) != actual.get(name)}
-        require(changed == set(code_contract['changes']), 'Guarded delta differs from exact reviewed code paths')
-        for name, entry in code_contract['changes'].items():
-            require(approved.get(name) == entry['before'] and actual.get(name) == entry['after'],
-                    'Reviewed code before/after hash mismatch')
-            approved[name] = entry['after']
+    actual = {k: v for k, v in source_hashes(candidate).items() if guarded(k)}
     require(actual == approved,
             'Backend/dependency/database/Compose contract changed; separate reviewed migration required')
 
@@ -368,34 +289,8 @@ def locked(root=False):
         yield
 
 
-def private_build_directory(path):
-    require(not path.is_symlink() and path.is_dir() and path.resolve() == path,
-            'Build metadata requires a canonical private directory')
-    metadata = path.stat()
-    require(metadata.st_uid == os.geteuid() and metadata.st_mode & 0o077 == 0,
-            'Build metadata directory must be owned by the builder and private')
-
-
-def validate_build_config(bundle, config):
-    private_build_directory(bundle)
-    require(config == bundle / 'docker-cli', 'Unexpected bundle-local Docker CLI configuration path')
-    private_build_directory(config)
-
-
-def create_build_config(bundle):
-    private_build_directory(bundle)
-    config = bundle / 'docker-cli'
-    require(not config.exists() and not config.is_symlink(), 'Build metadata directory already exists; prepare a fresh bundle')
-    config.mkdir(mode=0o700)
-    validate_build_config(bundle, config)
-    # Docker/Buildx may write local metadata here. Never import global config,
-    # credentials or client metadata; the pinned engine/socket remains shared.
-    return config
-
-
 def build_images(bundle, sha):
     result = {}
-    docker_config = create_build_config(bundle)
     logpath = bundle / 'build.log'
     with os.fdopen(os.open(logpath, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as log:
         for name in ('backend', 'client'):
@@ -408,20 +303,18 @@ def build_images(bundle, sha):
                                    'NEXT_PUBLIC_LITE_DASHBOARD': 'false'}.items():
                     args += ['--build-arg', key + '=' + value]
             print('Building ' + name + '; private log: ' + str(logpath), flush=True)
-            validate_build_config(bundle, docker_config)
-            docker('--config', str(docker_config), *args, '.', cwd=bundle / 'source', timeout=2400, log=log)
+            docker(*args, '.', cwd=bundle / 'source', timeout=2400, log=log)
             identity = json.loads(docker('image', 'inspect', tag))[0]['Id']
             if name == 'backend':
-                identity = normalize_assets(identity, tag, bundle / 'source', log, docker_config)
+                identity = normalize_assets(identity, tag, bundle / 'source', log)
             result[name] = identity
     return result
 
 
-def normalize_assets(identity, base_tag, source, log, docker_config):
+def normalize_assets(identity, base_tag, source, log):
     require(IMAGE.fullmatch(identity), 'Unpinned backend build result')
     require(re.fullmatch(r'wotcv-rybbit-native:[0-9a-f]{40}-backend-[0-9a-f]{8}', base_tag),
             'Unexpected private build tag')
-    validate_build_config(source.parent, docker_config)
     base = json.loads(docker('image', 'inspect', base_tag))[0]
     require(base['Id'] == identity, 'Backend build tag changed')
     # Native build regenerates script.js but upstream's Dockerfile does not
@@ -439,7 +332,7 @@ def normalize_assets(identity, base_tag, source, log, docker_config):
                   'LABEL wotcv.native.updater-sha256="' + digest(Path(__file__)) + '"\n' +
                   'RUN ' + json.dumps(['node', '-e', js]) + '\n')
     tag = base_tag + '-assets'
-    docker('--config', str(docker_config), 'build', '--pull=false', '--network', 'none', '-f', '-', '-t', tag, '.',
+    docker('build', '--pull=false', '--network', 'none', '-f', '-', '-t', tag, '.',
            cwd=source, timeout=180, log=log, data=dockerfile.encode())
     final = json.loads(docker('image', 'inspect', tag))[0]
     require(json.loads(docker('image', 'inspect', base_tag))[0]['Id'] == identity and
@@ -472,10 +365,7 @@ def verify_images(images, sha):
     docker('run', '--rm', '--network', 'none', '--entrypoint', 'node', images['client'], '-e', client_js, PUBLIC)
 
 
-def prepare(expected=None, code_contract=None, code_contract_sha256=None):
-    require((code_contract is None) == (code_contract_sha256 is None), 'Code contract path and reviewed hash required together')
-    raw_contract, contract = (None, None) if code_contract is None else read_code_contract(code_contract, code_contract_sha256)
-    require(contract is None or expected is not None, 'Reviewed code release requires explicit --expected-sha')
+def prepare(expected=None):
     require(git('remote', 'get-url', 'origin').decode().strip().removesuffix('.git') == REMOTE,
             'Unexpected Git origin')
     require(expected is None or SHA.fullmatch(expected), 'Expected SHA must be 40 lowercase hex characters')
@@ -483,30 +373,24 @@ def prepare(expected=None, code_contract=None, code_contract_sha256=None):
     sha = git('rev-parse', 'FETCH_HEAD^{commit}').decode().strip()
     require(SHA.fullmatch(sha) and (not expected or sha == expected), 'Published branch SHA differs from expected')
     before = snapshot()
-    if contract is not None:
-        code_runtime_guard(contract, before)
     bundle = Path('/home/wotcv') / ('rybbit-native-update-' + time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '.' + secrets.token_hex(4))
     bundle.mkdir(mode=0o700)
     source = bundle / 'source'
     source.mkdir(mode=0o700)
     unpack(git('archive', '--format=tar', sha), source)
-    source_guard(source, contract)
-    if contract is not None:
-        write(bundle / 'code-contract.json', raw_contract)
+    source_guard(source)
     images = build_images(bundle, sha)
     verify_images(images, sha)
     require(snapshot() == before, 'Runtime changed while building; candidate not approved')
     plan = {'version': 1, 'sha': sha, 'project': PROJECT, 'root': str(ROOT), 'before': before,
             'images': images, 'files': source_hashes(source), 'toolSha256': digest(Path(__file__)),
             'nginxSha256': digest(NGINX), 'phase': 'prepared'}
-    if contract is not None:
-        plan['codeContractSha256'] = code_contract_sha256
     record(bundle / 'plan.json', plan)
     print('PREPARED: ' + str(bundle) + '; SHA ' + sha + '. No application start, restart or migration.')
     return bundle
 
 
-def load_plan(bundle, code_contract_sha256=None):
+def load_plan(bundle):
     require(bundle.parent == Path('/home/wotcv') and
             re.fullmatch(r'rybbit-native-update-[0-9]{8}T[0-9]{6}Z\.[0-9a-f]{8}', bundle.name) and
             bundle.resolve() == bundle and not bundle.is_symlink() and bundle.stat().st_mode & 0o077 == 0,
@@ -517,15 +401,7 @@ def load_plan(bundle, code_contract_sha256=None):
             plan.get('root') == str(ROOT) and SHA.fullmatch(plan.get('sha', '')) and
             plan.get('toolSha256') == digest(Path(__file__)), 'Prepared plan/tool identity mismatch')
     require(plan['files'] == source_hashes(bundle / 'source'), 'Prepared source changed')
-    contract = None
-    if 'codeContractSha256' in plan:
-        require(code_contract_sha256 is not None and plan['codeContractSha256'] == code_contract_sha256,
-                'Prepared code release requires the explicitly reviewed contract hash')
-        _, contract = read_code_contract(bundle / 'code-contract.json', code_contract_sha256)
-    else:
-        require(code_contract_sha256 is None and not (bundle / 'code-contract.json').exists(),
-                'Unexpected code contract for frontend-only release')
-    source_guard(bundle / 'source', contract)
+    source_guard(bundle / 'source')
     verify_images(plan['images'], plan['sha'])
     require(plan.get('nginxSha256') == digest(NGINX), 'Nginx changed since prepare')
     return plan
@@ -549,270 +425,13 @@ def current_env():
     return path
 
 
-def canonical_hash(value):
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-
-
-def receipt_directory(path):
-    require(path.is_dir() and not path.is_symlink() and path.resolve() == path and
-            path.stat().st_uid == 0 and path.stat().st_mode & 0o077 == 0,
-            'Reconciliation requires a canonical root-private directory')
-
-
-def receipt_file(path):
-    private(path)
-    require(path.resolve() == path and path.stat().st_uid == 0 and path.stat().st_size <= 2000000,
-            'Reconciliation requires a bounded root-owned private file')
-    return path.read_bytes()
-
-
-def reconciliation_context():
-    receipt_directory(STATE)
-    require(not (STATE / 'pending.json').exists(), 'Pending native transaction requires inspection')
-    raw = receipt_file(STATE / 'active.json')
-    state = json.loads(raw)
-    require(isinstance(state, dict) and state.get('phase') == 'active' and
-            isinstance(state.get('release'), str) and
-            re.fullmatch(r'rybbit-native-update-[0-9]{8}T[0-9]{6}Z\.[0-9a-f]{8}', state['release']) and
-            isinstance(state.get('sha'), str) and SHA.fullmatch(state['sha']) and
-            isinstance(state.get('envSha256'), str) and SHA256.fullmatch(state['envSha256']),
-            'Unexpected active receipt provenance')
-    release = STATE / state['release']
-    receipt_directory(release)
-    success = receipt_file(release / 'success.json')
-    require(raw == success, 'Historical success and active receipt bytes differ')
-    environment = release / 'deployment.env'
-    env_raw = receipt_file(environment)
-    require(hashlib.sha256(env_raw).hexdigest() == state['envSha256'], 'Active environment changed')
-    return state, hashlib.sha256(raw).hexdigest(), hashlib.sha256(success).hexdigest(), environment
-
-
-def validate_reconciliation_contract(contract):
-    require(isinstance(contract, dict) and set(contract) == {
-        'version', 'baseRevision', 'baseImages', 'envSha256', 'originalStarted',
-        'acceptedStarted', 'dockerLifecycle', 'postgresMigrations'}, 'Invalid restart contract fields')
-    require(type(contract['version']) is int and contract['version'] == 1 and
-            isinstance(contract['baseRevision'], str) and SHA.fullmatch(contract['baseRevision']) and
-            isinstance(contract['envSha256'], str) and SHA256.fullmatch(contract['envSha256']),
-            'Invalid restart contract provenance')
-    require(isinstance(contract['baseImages'], dict) and set(contract['baseImages']) == {'backend', 'client'} and
-            all(isinstance(x, str) and IMAGE.fullmatch(x) for x in contract['baseImages'].values()),
-            'Invalid restart contract application images')
-    for field in ('originalStarted', 'acceptedStarted'):
-        require(isinstance(contract[field], dict) and set(contract[field]) == set(DATABASES) and
-                all(isinstance(x, str) and re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z', x)
-                    for x in contract[field].values()), 'Invalid restart contract timestamps')
-    lifecycle = contract['dockerLifecycle']
-    require(isinstance(lifecycle, dict) and set(lifecycle) == {'since', 'until', 'events'} and
-            all(isinstance(lifecycle[x], str) and
-                re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} UTC', lifecycle[x])
-                for x in ('since', 'until')), 'Invalid Docker lifecycle interval')
-    events = lifecycle['events']
-    require(isinstance(events, list) and len(events) == 4 and
-            all(isinstance(e, dict) and set(e) == {'event', 'timestampMicros'} and
-                e['event'] == expected and isinstance(e['timestampMicros'], str) and
-                re.fullmatch(r'[0-9]{16}', e['timestampMicros'])
-                for e, expected in zip(events, ('stopping', 'stopped', 'starting', 'started'))) and
-            [e['timestampMicros'] for e in events] == sorted(e['timestampMicros'] for e in events),
-            'Invalid reviewed Docker lifecycle events')
-    migrations = contract['postgresMigrations']
-    require(isinstance(migrations, dict) and set(migrations) == {'count', 'sha256'} and
-            type(migrations['count']) is int and 0 < migrations['count'] <= 10000 and
-            isinstance(migrations['sha256'], str) and SHA256.fullmatch(migrations['sha256']),
-            'Invalid reviewed migration journal')
-
-
-def reconciliation_json(raw):
-    def unique(pairs):
-        result = {}
-        for key, value in pairs:
-            require(key not in result, 'Duplicate reconciliation JSON field')
-            result[key] = value
-        return result
-    try:
-        return json.loads(raw.decode('utf-8'), object_pairs_hook=unique)
-    except UnicodeError:
-        raise Refused('Reconciliation JSON must be valid UTF-8') from None
-
-
-def parse_reconciliation_contract(raw, expected_hash):
-    require(isinstance(expected_hash, str) and SHA256.fullmatch(expected_hash),
-            'Explicit reviewed --reconciliation-contract-sha256 required')
-    require(len(raw) <= 131072 and hashlib.sha256(raw).hexdigest() == expected_hash,
-            'Reviewed restart contract size or hash changed')
-    contract = reconciliation_json(raw)
-    validate_reconciliation_contract(contract)
-    return contract
-
-
-def read_reconciliation_contract(path, expected_hash):
-    require(path.is_file() and not path.is_symlink() and path.stat().st_size <= 131072,
-            'Expected a bounded regular restart contract')
-    raw = path.read_bytes()
-    return raw, parse_reconciliation_contract(raw, expected_hash)
-
-
-def restart_only_guard(state, live, contract):
-    require(state.get('sha') == contract['baseRevision'] and state.get('envSha256') == contract['envSha256'] and
-            all(state['images'][name] == live[name]['image'] == identity
-                for name, identity in contract['baseImages'].items()), 'Restart receipt provenance changed')
-    for name in DATABASES:
-        old, new = state['runtime'][name], live[name]
-        require(isinstance(old, dict) and isinstance(new, dict) and
-                old.get('started') == contract['originalStarted'][name] and
-                new.get('started') == contract['acceptedStarted'][name] and old['started'] != new['started'] and
-                type(old.get('restarts')) is int and type(new.get('restarts')) is int and
-                old['restarts'] == new['restarts'] == 0 and
-                {k: v for k, v in old.items() if k != 'started'} ==
-                {k: v for k, v in new.items() if k != 'started'},
-                'Database changed beyond the reviewed daemon restart timestamp')
-
-
-def database_runtime(live):
-    return {name: live[name] for name in DATABASES}
-
-
-def reconciliation_path(active_hash, live):
-    # A reviewed tool change needs its own freshly verified immutable evidence.
-    # Earlier attestations remain history and cannot authorize different bytes.
-    return STATE / 'reconciliations' / (active_hash + '.' + canonical_hash(database_runtime(live)) +
-                                      '.' + digest(Path(__file__)) + '.json')
-
-
-def reconciled_receipt_guard(state, live):
-    current, active_hash, success_hash, _ = reconciliation_context()
-    require(current == state, 'Active receipt changed during inspection')
-    path = reconciliation_path(active_hash, live)
-    receipt_directory(path.parent)
-    attestation = reconciliation_json(receipt_file(path))
-    require(isinstance(attestation, dict) and set(attestation) == {
-        'version', 'operation', 'activeReceiptSha256', 'successReceiptSha256', 'toolSha256',
-        'contractSha256', 'contractRaw', 'contract', 'databaseRuntime'} and
-            type(attestation['version']) is int and attestation['version'] == 1 and
-            attestation.get('operation') == 'reconcile-docker-restart' and
-            attestation.get('activeReceiptSha256') == active_hash and
-            attestation.get('successReceiptSha256') == success_hash and
-            attestation.get('toolSha256') == digest(Path(__file__)) and
-            attestation.get('databaseRuntime') == database_runtime(live), 'Restart attestation no longer matches')
-    require(isinstance(attestation['contractRaw'], str) and len(attestation['contractRaw']) <= 131072,
-            'Restart attestation contract bytes are invalid')
-    try:
-        raw_contract = attestation['contractRaw'].encode('utf-8')
-    except UnicodeError:
-        raise Refused('Restart attestation contract must be valid UTF-8') from None
-    contract = parse_reconciliation_contract(raw_contract, attestation['contractSha256'])
-    validate_reconciliation_contract(attestation['contract'])
-    require(contract == attestation['contract'], 'Restart attestation parsed contract changed')
-    restart_only_guard(state, live, contract)
-
-
-def docker_lifecycle(lifecycle):
-    output = run(['/usr/bin/journalctl', '--unit=docker.service', '--since=' + lifecycle['since'],
-                  '--until=' + lifecycle['until'], '--output=json', '--no-pager', '--utc'], timeout=30)
-    events = []
-    prefixes = {'Stopping docker.service': 'stopping', 'Stopped docker.service': 'stopped',
-                'Starting docker.service': 'starting', 'Started docker.service': 'started'}
-    for line in output.splitlines():
-        item = json.loads(line)
-        message = item.get('MESSAGE')
-        require(isinstance(message, str), 'Unexpected Docker journal record')
-        for prefix, event in prefixes.items():
-            if message.startswith(prefix):
-                stamp = item.get('__REALTIME_TIMESTAMP')
-                require(isinstance(stamp, str) and re.fullmatch(r'[0-9]{16}', stamp),
-                        'Unexpected Docker lifecycle timestamp')
-                events.append({'event': event, 'timestampMicros': stamp})
-                break
-    require(events == lifecycle['events'], 'Docker daemon lifecycle differs from reviewed evidence')
-    return events
-
-
-def migration_pairs(live):
-    command = ('export PGPASSWORD="$POSTGRES_PASSWORD"; '
-               'exec psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -c '
-               '"SELECT created_at, hash FROM drizzle.__drizzle_migrations ORDER BY created_at, id"')
-    output = docker('exec', live['postgres']['id'], 'sh', '-ec', command, timeout=30).decode()
-    applied = []
-    for line in output.splitlines():
-        created, value = line.split('|')
-        require(created.isdecimal() and SHA256.fullmatch(value), 'Unexpected migration journal entry')
-        applied.append({'createdAt': created, 'sha256': value})
-    js = ("const f=require('fs'),h=require('crypto');"
-          "const j=JSON.parse(f.readFileSync('/app/drizzle/meta/_journal.json'));"
-          "console.log(JSON.stringify(j.entries.map(e=>({createdAt:String(e.when),"
-          "sha256:h.createHash('sha256').update(f.readFileSync('/app/drizzle/'+e.tag+'.sql')).digest('hex')}))))")
-    expected = json.loads(docker('exec', live['backend']['id'], 'node', '-e', js, timeout=30))
-    require(applied == expected, 'Applied migration journal differs from runtime files')
-    return applied
-
-
-def fsync_directory(path):
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def immutable_record(path, value):
-    temporary = path.with_name('.' + path.name + '-' + secrets.token_hex(6))
-    try:
-        write(temporary, json.dumps(value, indent=2) + '\n')
-        # Hard-link publication is atomic and cannot replace an existing receipt.
-        os.link(temporary, path, follow_symlinks=False)
-        fsync_directory(path.parent)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def reconcile(contract_path, contract_sha256, ack):
-    # Caller holds locked(root=True), also when invoked by an outer orchestrator.
-    require(os.geteuid() == 0 and ack == RECONCILE_ACK, 'Operator sudo and restart reconciliation acknowledgment required')
-    raw_contract, contract = read_reconciliation_contract(contract_path, contract_sha256)
-    state, active_hash, success_hash, environment = reconciliation_context()
-    live = snapshot()
-    restart_only_guard(state, live, contract)
-    code_runtime_guard(contract, live)
-    model = config(environment)
-    model_guard(model, live)
-    verify_model_live(model, live)
-    readiness()
-    docker_lifecycle(contract['dockerLifecycle'])
-    pairs = migration_pairs(live)
-    require(len(pairs) == contract['postgresMigrations']['count'] and
-            canonical_hash(pairs) == contract['postgresMigrations']['sha256'],
-            'Migration journal differs from the reviewed restart contract')
-    tool_hash = digest(Path(__file__))
-    require(reconciliation_context() == (state, active_hash, success_hash, environment) and snapshot() == live,
-            'Receipt, environment or runtime changed during reconciliation')
-    directory = STATE / 'reconciliations'
-    directory.mkdir(mode=0o700, exist_ok=True)
-    receipt_directory(directory)
-    path = reconciliation_path(active_hash, live)
-    if path.exists():
-        require(json.loads(receipt_file(path)).get('contractSha256') == contract_sha256,
-                'Existing restart attestation used a different reviewed contract')
-        reconciled_receipt_guard(state, live)
-    else:
-        attestation = {'version': 1, 'operation': 'reconcile-docker-restart',
-                       'activeReceiptSha256': active_hash, 'successReceiptSha256': success_hash,
-                       'toolSha256': tool_hash, 'contractSha256': contract_sha256,
-                       'contractRaw': raw_contract.decode('utf-8'), 'contract': contract,
-                       'databaseRuntime': database_runtime(live)}
-        immutable_record(path, attestation)
-    reconciled_receipt_guard(state, snapshot())
-    return {'operation': 'reconcile-docker-restart', 'result': 'VERIFIED',
-            'activeReceiptSha256': active_hash, 'databaseRuntimeSha256': canonical_hash(database_runtime(live)),
-            'attestationSha256': digest(path), 'toolSha256': tool_hash, 'contractSha256': contract_sha256}
-
-
 def receipt_guard(live):
     active = STATE / 'active.json'
     if active.exists():
         state = json.loads(active.read_text())
         require(state.get('phase') == 'active', 'Active native receipt is incomplete')
-        if not all(state['runtime'][name] == live[name] for name in DATABASES):
-            reconciled_receipt_guard(state, live)
+        require(all(state['runtime'][name] == live[name] for name in DATABASES),
+                'Database identities drifted from last successful update')
         require(all(state['images'][name] == live[name]['image'] for name in ('backend', 'client')),
                 'Application image drifted from last successful update')
     else:
@@ -848,22 +467,18 @@ def wait_ready(images):
                     'Application restarted during activation')
             readiness()
             return live
-        except (Refused, urllib.error.URLError, ConnectionResetError, TimeoutError, ValueError):
+        except (Refused, urllib.error.URLError, TimeoutError, ValueError):
             time.sleep(2)
     raise Refused('Application readiness timed out')
 
 
-def apply(bundle, ack, code_contract_sha256=None):
+def apply(bundle, ack):
     require(os.geteuid() == 0 and ack == ACK, 'Operator sudo and explicit native-update acknowledgment required')
-    plan = load_plan(bundle, code_contract_sha256)
+    plan = load_plan(bundle)
     require(not (STATE / 'pending.json').exists(), 'Pending native transaction requires inspection; no automatic retry')
     before = snapshot()
     require(before == plan['before'], 'Runtime changed since prepare; prepare a new candidate')
     receipt_guard(before)
-    raw_contract = None
-    if 'codeContractSha256' in plan:
-        raw_contract, contract = read_code_contract(bundle / 'code-contract.json', code_contract_sha256)
-        code_runtime_guard(contract, before)
     old_env = current_env()
     private(old_env)
     old_model = config(old_env)
@@ -888,9 +503,6 @@ def apply(bundle, ack, code_contract_sha256=None):
     require(new_model == expected, 'Candidate changed runtime settings beyond application images/provenance')
     attempt = {'phase': 'activating', 'release': transaction.name, 'sha': plan['sha'],
                'before': before, 'previousEnv': str(old_env), 'images': plan['images']}
-    if 'codeContractSha256' in plan:
-        attempt['codeContractSha256'] = plan['codeContractSha256']
-        write(transaction / 'code-contract.json', raw_contract)
     record(STATE / 'pending.json', attempt)
     record(transaction / 'attempt.json', attempt)
     print('Activating only native backend/client; existing database containers and volumes are retained.', flush=True)
@@ -904,9 +516,7 @@ def apply(bundle, ack, code_contract_sha256=None):
         verify_model_live(new_model, after)
         require(digest(NGINX) == plan['nginxSha256'], 'Nginx changed during activation')
     except (Refused, OSError, ValueError, urllib.error.URLError):
-        # Only image rollback: protected DB/init/dependency contracts are equal.
-        # Reviewed API-code releases still require the operator's journal/backup
-        # preflight; this tool neither proves the live schema nor restores data.
+        # Only application-image rollback: protected server/DDL bytes are equal.
         # No data restore is claimed. A persistent pending marker blocks retries.
         record(transaction / 'failure.json', {'phase': 'rollback-starting'})
         try:
@@ -922,8 +532,6 @@ def apply(bundle, ack, code_contract_sha256=None):
         raise Refused('Activation failed; inspect private transaction/rollback logs and pending marker before retry') from None
     receipt = {'phase': 'active', 'release': transaction.name, 'sha': plan['sha'], 'runtime': after,
                'envSha256': digest(candidate_env), 'previousEnv': str(old_env), 'images': plan['images']}
-    if 'codeContractSha256' in plan:
-        receipt['codeContractSha256'] = plan['codeContractSha256']
     record(transaction / 'success.json', receipt)
     record(STATE / 'active.json', receipt)
     # Keep completed attempt as history; only its active pending name is moved.
@@ -974,47 +582,29 @@ def install(bundle, ack):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('prepare', 'check', 'apply', 'install', 'update', 'reconcile'))
+    parser.add_argument('command', choices=('prepare', 'check', 'install', 'update'))
     parser.add_argument('--expected-sha')
     parser.add_argument('--bundle', type=Path)
     parser.add_argument('--ack')
-    parser.add_argument('--code-contract', type=Path)
-    parser.add_argument('--code-contract-sha256')
-    parser.add_argument('--reconciliation-contract', type=Path)
-    parser.add_argument('--reconciliation-contract-sha256')
     args = parser.parse_args()
-    require(args.code_contract is None or args.command in ('prepare', 'update'),
-            '--code-contract path is used only when preparing a new bundle')
-    require(args.command != 'install' or args.code_contract_sha256 is None,
-            'Reviewed code releases require separately reviewed tooling installation')
-    require(args.command == 'reconcile' or
-            args.reconciliation_contract is None and args.reconciliation_contract_sha256 is None,
-            'Restart reconciliation options are used only by reconcile')
     if args.command == 'check':
         require(args.bundle is not None, '--bundle required')
-        load_plan(args.bundle, args.code_contract_sha256)
+        load_plan(args.bundle)
         require(snapshot() == json.loads((args.bundle / 'plan.json').read_text())['before'], 'Runtime changed')
         print('CHECK PASS: exact source, built images, native runtime unchanged. No startup/migration.')
         return
-    root = args.command in ('apply', 'install', 'update', 'reconcile')
+    root = args.command in ('install', 'update')
     require(not root or os.geteuid() == 0, 'Installation/update requires operator sudo')
     with locked(root=root):
-        if args.command == 'reconcile':
-            require(args.reconciliation_contract is not None, '--reconciliation-contract required')
-            print(json.dumps(reconcile(args.reconciliation_contract,
-                                       args.reconciliation_contract_sha256, args.ack), indent=2))
-        elif args.command == 'prepare':
-            prepare(args.expected_sha, args.code_contract, args.code_contract_sha256)
-        elif args.command == 'apply':
-            require(args.bundle is not None, '--bundle required')
-            apply(args.bundle, args.ack, args.code_contract_sha256)
+        if args.command == 'prepare':
+            prepare(args.expected_sha)
         elif args.command == 'install':
             require(args.bundle is not None, '--bundle required')
             install(args.bundle, args.ack)
         else:
             require(not (STATE / 'pending.json').exists(), 'Pending native transaction requires inspection')
-            bundle = prepare(args.expected_sha, args.code_contract, args.code_contract_sha256)
-            apply(bundle, ACK, args.code_contract_sha256)
+            bundle = prepare(args.expected_sha)
+            apply(bundle, ACK)
 
 
 if __name__ == '__main__':
