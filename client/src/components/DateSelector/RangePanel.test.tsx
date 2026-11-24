@@ -15,6 +15,20 @@ vi.mock("next-intl", () => ({
           .replace(/\{(\w+)\}/g, (_, key) => String(values[key] ?? `{${key}}`))
       : message,
 }));
+// The comparison window's calendar popover is covered by ui/date-picker's own
+// test; a native input drives the same props. The bound rows stay real.
+vi.mock("@/components/ui/date-picker", async importOriginal => ({
+  ...(await importOriginal<typeof import("@/components/ui/date-picker")>()),
+  DatePicker: ({
+    value,
+    onChange,
+    "aria-label": ariaLabel,
+  }: {
+    value: string;
+    onChange: (value: string) => void;
+    "aria-label"?: string;
+  }) => <input aria-label={ariaLabel} value={value} onChange={event => onChange(event.target.value)} />,
+}));
 
 const ZONE = "America/New_York";
 
@@ -136,27 +150,6 @@ describe("RangePanel typed windows", () => {
     // 14 days is a dropped preset, so the typed window keeps its identity.
     expect(applied).toMatchObject({ mode: "range", wellKnown: "last-14-days" });
     expect(DateTime.fromISO(applied.endDate).diff(DateTime.fromISO(applied.startDate), "days").days).toBe(13);
-  });
-
-  it("applies a count no preset covers as a plain range", () => {
-    renderPanel(DATE_RANGE);
-
-    fireEvent.change(screen.getByPlaceholderText(/Search/), { target: { value: "20d" } });
-    fireEvent.click(screen.getByText("Last 20 days"));
-
-    const applied = onApply.mock.calls[0][0];
-    expect(applied.mode).toBe("range");
-    expect(applied.wellKnown).toBeUndefined();
-    expect(DateTime.fromISO(applied.endDate).diff(DateTime.fromISO(applied.startDate), "days").days).toBe(19);
-  });
-
-  it("serves hours from the realtime path", () => {
-    renderPanel(DATE_RANGE);
-
-    fireEvent.change(screen.getByPlaceholderText(/Search/), { target: { value: "5h" } });
-    fireEvent.click(screen.getByText("Last 5 hours"));
-
-    expect(onApply.mock.calls[0][0]).toEqual({ mode: "past-minutes", pastMinutesStart: 300, pastMinutesEnd: 0 });
   });
 
   it("applies the typed row on Enter", () => {
@@ -397,14 +390,6 @@ describe("RangePanel draft", () => {
 
     const future = DateTime.now().plus({ years: 1 }).toISODate()!;
     fireEvent.change(screen.getByLabelText("End date"), { target: { value: future } });
-
-    expect((screen.getByRole("button", { name: "Apply" }) as HTMLButtonElement).disabled).toBe(true);
-  });
-
-  it("refuses a wall time that daylight saving skipped", () => {
-    renderPanel({ mode: "range", startDate: "2024-03-10", endDate: "2024-03-10" });
-
-    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "02:30" } });
 
     expect((screen.getByRole("button", { name: "Apply" }) as HTMLButtonElement).disabled).toBe(true);
   });

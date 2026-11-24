@@ -41,6 +41,11 @@ export interface StripeSubscriptionInfo {
   cancelAtPeriodEnd: boolean;
   createdAt: Date;
   trialEnd?: Date;
+  /**
+   * Set while Stripe is retrying a failed renewal and the plan is kept on meanwhile (see
+   * PAST_DUE_GRACE_DAYS). `status` reads "active" then: the plan works as usual.
+   */
+  pastDue?: PastDuePayment;
 }
 
 /**
@@ -63,6 +68,25 @@ export interface TrialGrace {
   retryingPayment: boolean;
 }
 
+/**
+ * A plan that has been paid for before stays on while Stripe retries a failed renewal, for up
+ * to this long after the unpaid invoice was issued. Stripe gives up and cancels well within
+ * that (its retries run for about two weeks); the cap is for a subscription Stripe is set to
+ * leave past due instead.
+ */
+export const PAST_DUE_GRACE_DAYS = 21;
+
+/**
+ * A card subscription whose latest charge failed and that Stripe is still retrying. The app
+ * asks the organization's owners to update the card. A plan that has been paid for before
+ * stays on meanwhile; a trial whose first charge failed is on the free tier, in its grace period.
+ */
+export interface PastDuePayment {
+  subscriptionId: string;
+  /** The plan being charged for, when its price is one of ours. */
+  planName: string | null;
+}
+
 export interface FreeSubscriptionInfo {
   source: "free";
   eventLimit: number;
@@ -71,6 +95,8 @@ export interface FreeSubscriptionInfo {
   status: "free";
   /** Set while the organization is in the grace period after an unpaid trial. */
   trialGrace?: TrialGrace;
+  /** Set while Stripe is retrying a failed charge on the organization's subscription. */
+  pastDue?: PastDuePayment;
 }
 
 export interface OverrideSubscriptionInfo {
@@ -258,6 +284,7 @@ export function invalidateStripeSubscriptionCache(stripeCustomerId: string | nul
     stripeSubscriptionCache.delete(stripeCustomerId);
     subscriptionHistoryCache.delete(stripeCustomerId);
     subscriptionPaidCache.delete(stripeCustomerId);
+    unpaidSinceCache.delete(stripeCustomerId);
   }
   // Also drop the account-wide snapshot so admin/cron reads pick up the change promptly.
   allStripeSubscriptionsCache = null;
@@ -346,7 +373,8 @@ export async function getAllStripeSubscriptionsByCustomer(): Promise<Map<string,
 
 /**
  * Resolves a customer's StripeSubscriptionInfo from a bulk snapshot, applying the same
- * active/trialing-only semantics as getStripeSubscription (canceled/past_due → no sub → free).
+ * active/trialing-only semantics as getStripeSubscription. Canceled and past-due subscriptions
+ * are none; getBestSubscriptionFromStripeSub keeps a paid plan on while it is past due.
  */
 export function stripeSubscriptionInfoFromSnapshot(
   snapshot: Map<string, Stripe.Subscription>,
@@ -526,6 +554,19 @@ async function fetchStripeSubscription(stripeCustomerId: string): Promise<Stripe
 const LAPSED_STATUSES = new Set<Stripe.Subscription.Status>(["canceled", "past_due", "unpaid"]);
 
 /**
+ * The failed charge Stripe is retrying on a subscription, if any. Invoiced subscriptions
+ * (send_invoice) go past due when an invoice is late; there is no card to update for those.
+ */
+export function pastDuePayment(subscription: Stripe.Subscription | null | undefined): PastDuePayment | null {
+  if (!subscription || subscription.status !== "past_due" || subscription.collection_method === "send_invoice") {
+    return null;
+  }
+  const priceId = subscription.items?.data[0]?.price.id;
+  const plan = getStripePrices().find((p: StripePlan) => p.priceId === priceId);
+  return { subscriptionId: subscription.id, planName: plan?.name ?? null };
+}
+
+/**
  * The grace period a lapsed subscription would earn from its trial: the trial ended (or was
  * canceled) less than TRIAL_GRACE_DAYS ago. Pure; resolveTrialGrace also checks that the
  * subscription never took a payment, which is what makes the trial "unpaid".
@@ -595,6 +636,66 @@ async function subscriptionWasPaid(subscription: Stripe.Subscription): Promise<b
     expiresAt: Date.now() + (value ? PAID_CACHE_TTL_MS : UNPAID_CACHE_TTL_MS),
   });
   return value;
+}
+
+const unpaidSinceCache = new Map<string, { subscriptionId: string; value: number | null; expiresAt: number }>();
+
+/**
+ * When the oldest invoice Stripe is still collecting on the subscription was issued, in unix
+ * seconds. The billing period can't answer this: it keeps advancing while nothing is paid.
+ */
+async function unpaidSince(subscription: Stripe.Subscription): Promise<number | null> {
+  if (!stripe) {
+    return null;
+  }
+  const customerId = typeof subscription.customer === "string" ? subscription.customer : subscription.customer.id;
+  const cached = unpaidSinceCache.get(customerId);
+  if (cached && cached.subscriptionId === subscription.id && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+
+  const invoices = await stripe.invoices.list({ subscription: subscription.id, status: "open", limit: 100 });
+  const value = invoices.data.length > 0 ? Math.min(...invoices.data.map(invoice => invoice.created)) : null;
+  unpaidSinceCache.set(customerId, {
+    subscriptionId: subscription.id,
+    value,
+    expiresAt: Date.now() + UNPAID_CACHE_TTL_MS,
+  });
+  return value;
+}
+
+/**
+ * The plan a past-due subscription keeps while Stripe retries the card: only one that has taken
+ * a payment before (a trial whose first charge failed gets the trial grace period instead), and
+ * only for PAST_DUE_GRACE_DAYS.
+ */
+async function resolvePastDuePlan(
+  subscription: Stripe.Subscription | null | undefined,
+  { throwOnError = false }: LookupOptions = {}
+): Promise<StripeSubscriptionInfo | null> {
+  const pastDue = IS_CLOUD ? pastDuePayment(subscription) : null;
+  // A price that isn't one of ours has no limits to keep on.
+  if (!subscription || !pastDue?.planName) {
+    return null;
+  }
+  const plan = buildStripeSubscriptionInfo(subscription);
+  if (!plan) {
+    return null;
+  }
+  try {
+    if (!(await subscriptionWasPaid(subscription))) {
+      return null;
+    }
+    const since = (await unpaidSince(subscription)) ?? subscription.items.data[0].current_period_start;
+    if (Date.now() / 1000 - since > PAST_DUE_GRACE_DAYS * 86_400) {
+      return null;
+    }
+  } catch (error) {
+    logger.error({ err: error, subscriptionId: subscription.id }, "Error checking a past-due subscription's invoices");
+    if (throwOnError) throw error;
+    return null;
+  }
+  return { ...plan, status: "active", pastDue };
 }
 
 /** The grace period the customer's lapsed trial gives them right now, if any. */
@@ -753,18 +854,27 @@ export async function getBestSubscription(
     return stripeState.value;
   }
 
+  const pastDuePlan = await resolvePastDuePlan(stripeState.latest, { throwOnError: throwOnStripe });
+  if (pastDuePlan) {
+    return pastDuePlan;
+  }
+
   if (appsumoSub) {
     return appsumoSub;
   }
 
-  return freeSubscription(await resolveTrialGrace(stripeState.latest, { throwOnError: throwOnStripe }));
+  return freeSubscription(
+    await resolveTrialGrace(stripeState.latest, { throwOnError: throwOnStripe }),
+    pastDuePayment(stripeState.latest)
+  );
 }
 
 /**
  * Like getBestSubscription, but uses an already-resolved Stripe subscription (e.g. from a bulk
  * account snapshot) instead of making a per-customer Stripe call. Used by callers that resolve
  * many orgs at once (admin endpoints, the usage cron). Pass the customer's raw subscription from
- * the snapshot as `latestStripeSub` to apply the grace period after an unpaid trial.
+ * the snapshot as `latestStripeSub` to apply the grace period after an unpaid trial and to keep
+ * a paid plan on while Stripe retries a failed renewal.
  * Priority: CustomPlan > Override > Stripe > AppSumo > Free.
  */
 export async function getBestSubscriptionFromStripeSub(
@@ -782,12 +892,17 @@ export async function getBestSubscriptionFromStripeSub(
     return stripeSub;
   }
 
+  const pastDuePlan = await resolvePastDuePlan(latestStripeSub, lookup);
+  if (pastDuePlan) {
+    return pastDuePlan;
+  }
+
   const appsumoSub = await getAppSumoSubscription(organizationId, lookup);
   if (appsumoSub) {
     return appsumoSub;
   }
 
-  return freeSubscription(await resolveTrialGrace(latestStripeSub, lookup));
+  return freeSubscription(await resolveTrialGrace(latestStripeSub, lookup), pastDuePayment(latestStripeSub));
 }
 
 /**
@@ -860,7 +975,10 @@ export function siteRequiresPlan(
   return siteCreatedAt.slice(0, 10) >= FREE_PLAN_CUTOFF_DATE;
 }
 
-function freeSubscription(trial: { grace: TrialGrace; eventLimit: number } | null = null): FreeSubscriptionInfo {
+function freeSubscription(
+  trial: { grace: TrialGrace; eventLimit: number } | null = null,
+  pastDue: PastDuePayment | null = null
+): FreeSubscriptionInfo {
   return {
     source: "free",
     // The grace period keeps the trialed plan's allowance, so sites don't stop at the free one.
@@ -869,5 +987,6 @@ function freeSubscription(trial: { grace: TrialGrace; eventLimit: number } | nul
     planName: "free",
     status: "free",
     ...(trial && { trialGrace: trial.grace }),
+    ...(pastDue && { pastDue }),
   };
 }

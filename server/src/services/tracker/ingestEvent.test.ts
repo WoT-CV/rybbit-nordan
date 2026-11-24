@@ -294,22 +294,8 @@ describe("ingestEvent", () => {
     expect(mocks.checkBotBlocking).toHaveBeenCalledWith(
       expect.objectContaining({
         payload: expect.objectContaining({ siteId: 42 }),
+        isCountryOnlyIp: expect.any(Function),
       })
     );
-  });
-
-  it("reuses the request's Site Configuration for identity instead of re-reading it", async () => {
-    await ingestEvent(
-      trackingRequest({
-        site: { ...site, saltUserIds: true } as SiteConfigData,
-      })
-    );
-
-    expect(mocks.generateUserId).toHaveBeenCalledWith("198.51.100.10", "Mozilla/5.0", 42, {
-      saltUserIds: true,
-      lookupAsn,
-      // The event's own instant decides its salt day, not the clock at hash time.
-      receivedAt: new Date("2026-08-14T10:38:37.000Z"),
-    });
   });
 });

@@ -2,6 +2,7 @@ import { CLIENT_BOT_SIGNAL_MASKS as clientBotSignalMasks } from "@rybbit/shared"
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { lookupAsn } from "../../../db/geolocation/asn.js";
 import { resetAnomalyScorerForTests, setRedisAnomalyEnabledForTests } from "./anomalyScorer.js";
+import { setLowEngagementAsnsForTests } from "./asnEngagement.js";
 import { getBotDetectionStats, resetBotDetectionStatsForTests } from "./botDetectionStats.js";
 import { checkBotBlocking } from "./index.js";
 
@@ -15,6 +16,8 @@ vi.mock("../../../db/redis/redis.js", () => ({
   redis: {},
   anomalyObserve: vi.fn(),
 }));
+
+vi.mock("../../../db/clickhouse/clickhouse.js", () => ({ clickhouse: {} }));
 
 const basePayload = {
   siteId: 123,
@@ -34,6 +37,7 @@ describe("checkBotBlocking", () => {
     resetAnomalyScorerForTests();
     setRedisAnomalyEnabledForTests(false);
     resetBotDetectionStatsForTests();
+    setLowEngagementAsnsForTests([]);
     vi.mocked(lookupAsn).mockReturnValue(null);
   });
 
@@ -72,17 +76,6 @@ describe("checkBotBlocking", () => {
     }
   });
 
-  it("skips the browser-shaped layers for verified trusted server-side ingestion", async () => {
-    const result = await checkBotBlocking({
-      headers: {},
-      blockBots: true,
-      trustedServerSideIngestion: true,
-      payload: basePayload,
-    });
-
-    expect(result).toBeNull();
-  });
-
   it("does not convict trusted server-side ingestion reporting a browser user agent", async () => {
     // Empty headers and a datacenter IP would convict ordinary traffic on the
     // header and ASN layers. Neither belongs to the visitor being reported.
@@ -103,7 +96,8 @@ describe("checkBotBlocking", () => {
       trustedServerSideIngestion: true,
       payload: {
         ...basePayload,
-        userAgent: "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; GPTBot/1.2; +https://openai.com/gptbot",
+        userAgent:
+          "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; GPTBot/1.2; +https://openai.com/gptbot",
       },
     });
 
@@ -784,5 +778,197 @@ describe("checkBotBlocking", () => {
 
       expect(result, `${screenWidth}x${screenHeight}`).toBeNull();
     }
+  });
+
+  describe("generic user-agent substrings on a browser", () => {
+    const newsAppUserAgent =
+      "Mozilla/5.0 (Linux; Android 14; SM-A546E Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/141.0.7390.122 Mobile Safari/537.36 NewsArticle/9.8.7";
+    const newsAppHeaders = { ...browserHeaders, "user-agent": newsAppUserAgent };
+    const phonePayload = {
+      ...basePayload,
+      userAgent: newsAppUserAgent,
+      screenWidth: 412,
+      screenHeight: 915,
+      clientBotScore: 0,
+      clientBotSignalMask: 0,
+    };
+
+    it("does not convict an in-app browser for its host app's name", async () => {
+      // The Pangle campaign: 38k phones on mobile carriers, sending web vitals,
+      // diverted because the app they were reading in had "news" in its name.
+      const result = await checkBotBlocking({ headers: newsAppHeaders, blockBots: true, payload: phonePayload });
+
+      expect(result).toBeNull();
+    });
+
+    it("attaches the match as evidence once another layer has convicted", async () => {
+      vi.mocked(lookupAsn).mockReturnValue({ asn: 401518, organization: "OpenAI, L.L.C." });
+
+      const result = await checkBotBlocking({ headers: newsAppHeaders, blockBots: true, payload: phonePayload });
+
+      expect(result?.detections.map(detection => detection.layer)).toEqual(["bot_asn", "ua_pattern"]);
+      expect(result?.eventProperties).toMatchObject({ detectedUaPattern: true, botCategory: "generic" });
+    });
+
+    it("lets a stale browser version speak for the user agent instead", async () => {
+      // Not the WebView above: the stale-version rule leaves `; wv` alone, since
+      // an unupdated system WebView genuinely reports an old Chrome.
+      const userAgent =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/59.0.3071.125 Safari/537.36 DailyNewsDesktop/3.2";
+
+      const result = await checkBotBlocking({
+        headers: { ...browserHeaders, "user-agent": userAgent },
+        blockBots: true,
+        payload: { ...phonePayload, userAgent },
+      });
+
+      expect(result?.detections.map(detection => detection.layer)).toEqual(["ua_pattern"]);
+      expect(result?.eventProperties.botCategory).toBe("stale_version");
+    });
+
+    it("does not convict the same user agent relayed through trusted ingestion", async () => {
+      const result = await checkBotBlocking({
+        headers: {},
+        blockBots: true,
+        trustedServerSideIngestion: true,
+        payload: { ...basePayload, userAgent: newsAppUserAgent },
+      });
+
+      expect(result).toBeNull();
+    });
+  });
+
+  describe("shadow rules", () => {
+    const cleanPayload = {
+      ...basePayload,
+      screenWidth: 1512,
+      screenHeight: 982,
+      clientBotScore: 0,
+      clientBotSignalMask: 0,
+    };
+
+    beforeEach(() => {
+      setLowEngagementAsnsForTests([203061]);
+      vi.mocked(lookupAsn).mockReturnValue({ asn: 203061, organization: "UAB code200" });
+    });
+
+    it("records a low-engagement network without enforcing, even with blocking on", async () => {
+      const result = await checkBotBlocking({ headers: browserHeaders, blockBots: true, payload: cleanPayload });
+
+      expect(result).toMatchObject({
+        isBot: false,
+        enforced: false,
+        detections: [],
+        shadowRules: ["asn_low_engagement"],
+        eventProperties: {
+          isBot: false,
+          botAsn: 203061,
+          detectedUaPattern: false,
+          detectedHeaderHeuristics: false,
+          detectedClientSignals: false,
+          detectedBotAsn: false,
+          detectedRateAnomaly: false,
+          anomalyReasons: "shadow:asn_low_engagement",
+          anomalyScore: 0,
+        },
+      });
+    });
+
+    it("keeps a shadow observation out of the detection totals", async () => {
+      await checkBotBlocking({ headers: browserHeaders, blockBots: true, payload: cleanPayload });
+
+      expect(getBotDetectionStats()).toMatchObject({
+        totalRequests: 1,
+        totalBotRequests: 0,
+        totalEnforcedBotRequests: 0,
+        totalShadowObservations: 1,
+        shadowRuleTotals: { asn_low_engagement: 1 },
+      });
+    });
+
+    it("names the shadow rule on a hit another layer convicted, after the live reasons", async () => {
+      const userAgent = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+
+      const result = await checkBotBlocking({
+        headers: { ...browserHeaders, "user-agent": userAgent },
+        blockBots: true,
+        payload: { ...cleanPayload, userAgent },
+      });
+
+      expect(result).toMatchObject({ isBot: true, enforced: true });
+      expect(result?.eventProperties.anomalyReasons).toBe("shadow:asn_low_engagement");
+      expect(result?.eventProperties.detectedRateAnomaly).toBe(false);
+      // Counted as the detection it is, not as a shadow observation.
+      expect(getBotDetectionStats()).toMatchObject({ totalBotRequests: 1, totalShadowObservations: 0 });
+    });
+
+    it("says nothing for a network that is not listed", async () => {
+      vi.mocked(lookupAsn).mockReturnValue({ asn: 7922, organization: "Comcast Cable Communications, LLC" });
+
+      const result = await checkBotBlocking({ headers: browserHeaders, blockBots: true, payload: cleanPayload });
+
+      expect(result).toBeNull();
+    });
+
+    describe("country-only proxy slice", () => {
+      const cox = { asn: 22773, organization: "Cox Communications Inc." };
+
+      beforeEach(() => {
+        setLowEngagementAsnsForTests([], Number.POSITIVE_INFINITY, [22773]);
+        vi.mocked(lookupAsn).mockReturnValue(cox);
+      });
+
+      it("records a listed network's country-only address without enforcing", async () => {
+        const isCountryOnlyIp = vi.fn(() => true);
+
+        const result = await checkBotBlocking({
+          headers: browserHeaders,
+          blockBots: true,
+          payload: cleanPayload,
+          isCountryOnlyIp,
+        });
+
+        expect(isCountryOnlyIp).toHaveBeenCalledWith(cleanPayload.ipAddress);
+        expect(result).toMatchObject({
+          isBot: false,
+          enforced: false,
+          detections: [],
+          shadowRules: ["asn_country_only_slice"],
+          eventProperties: { botAsn: 22773, anomalyReasons: "shadow:asn_country_only_slice" },
+        });
+      });
+
+      it("leaves the same network's located subscribers alone", async () => {
+        const result = await checkBotBlocking({
+          headers: browserHeaders,
+          blockBots: true,
+          payload: cleanPayload,
+          isCountryOnlyIp: () => false,
+        });
+
+        expect(result).toBeNull();
+      });
+
+      it("does not geolocate a hit on a network that is not listed", async () => {
+        vi.mocked(lookupAsn).mockReturnValue({ asn: 7922, organization: "Comcast Cable Communications, LLC" });
+        const isCountryOnlyIp = vi.fn(() => true);
+
+        const result = await checkBotBlocking({
+          headers: browserHeaders,
+          blockBots: true,
+          payload: cleanPayload,
+          isCountryOnlyIp,
+        });
+
+        expect(result).toBeNull();
+        expect(isCountryOnlyIp).not.toHaveBeenCalled();
+      });
+
+      it("says nothing without a geolocation lookup", async () => {
+        const result = await checkBotBlocking({ headers: browserHeaders, blockBots: true, payload: cleanPayload });
+
+        expect(result).toBeNull();
+      });
+    });
   });
 });

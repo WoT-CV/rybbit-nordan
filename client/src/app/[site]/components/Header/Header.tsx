@@ -3,6 +3,8 @@
 import { usePathname } from "next/navigation";
 import { useGetSite } from "../../../../api/admin/hooks/useSites";
 import { FreePlanBanner } from "../../../../components/FreePlanBanner";
+import { ReferralSourcePrompt } from "../../../../components/ReferralSourcePrompt";
+import { PaymentFailedNotice } from "../../../../components/subscription/PaymentFailedNotice";
 import { useStore } from "../../../../lib/store";
 import { userStore } from "../../../../lib/userStore";
 import { PlanRequiredNotice, useCheckoutReturn } from "../../../components/PlanRequired";
@@ -53,7 +55,10 @@ export function Header() {
             <DemoSignupBanner />
             {/* <AffiliateBanner /> */}
             <FreePlanBanner />
+            {/* Sites stay on while Stripe retries the first charge after a trial. */}
+            <PaymentFailedNotice organizationId={siteMetadata?.organizationId ?? undefined} className="mt-4" />
             <UsageBanners />
+            <ReferralSourcePrompt className="mt-4" />
           </>
         )}
         {!isGlobe && !requiresPlan && <NoData />}

@@ -26,6 +26,7 @@ import { lifecycleEmailService } from "./services/lifecycleEmails/lifecycleEmail
 import { telemetryService } from "./services/telemetryService.js";
 import { handleIdentify } from "./services/tracker/identifyService.js";
 import { trackEvent } from "./services/tracker/trackEvent.js";
+import { startAsnEngagementRefresh } from "./services/tracker/botBlocking/asnEngagement.js";
 import { startSiteBaselineRefresh } from "./services/tracker/botBlocking/siteBaseline.js";
 import {
   USAGE_STATE_MESSAGE,
@@ -176,6 +177,8 @@ const start = async () => {
     // Every process runs this: the ClickHouse refresh is elected through Redis,
     // and each worker mirrors the shared result for the site-flood rules.
     startSiteBaselineRefresh();
+    // Same election, for the shadow-mode low-engagement network list.
+    startAsnEngagementRefresh();
 
     // Cron jobs should only run on the primary process (or in single-process mode)
     if (!cluster.isWorker) {
@@ -256,6 +259,11 @@ declare module "fastify" {
     bearerAuth?: boolean;
     /** Scope statements of that credential; null = unrestricted. */
     bearerStatements?: ScopeStatements | null;
+    /**
+     * False when that credential is one the session-only surfaces refuse: a
+     * scoped key, an organization-owned key, or any OAuth token.
+     */
+    bearerSessionEquivalent?: boolean;
     /** The role a permission guard admitted the caller with, on the site or organization it checked. */
     accessRole?: OrgRole;
   }

@@ -9,10 +9,9 @@ import { DialogHeader } from "./ui/dialog";
 import { DialogTitle } from "./ui/dialog";
 import { DialogTrigger } from "./ui/dialog";
 import { DialogFooter } from "./ui/dialog";
-import { DialogDescription } from "./ui/dialog";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
-import { AlertCircle, AlertTriangle, Building2 } from "lucide-react";
+import { AlertCircle, AlertTriangle } from "lucide-react";
 import { authClient } from "../lib/auth";
 import { toast } from "@/components/ui/sonner";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -105,13 +104,9 @@ export function CreateOrganizationDialog({ open, onOpenChange, onSuccess, trigge
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       {trigger && <DialogTrigger asChild>{trigger}</DialogTrigger>}
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="sm:max-w-md" aria-describedby={undefined}>
         <DialogHeader>
-          <DialogTitle className="text-2xl flex items-center gap-2">
-            <Building2 className="h-6 w-6" />
-            {t("Create Organization")}
-          </DialogTitle>
-          <DialogDescription>{t("Set up a new organization to add websites and users")}</DialogDescription>
+          <DialogTitle>{t("Create Organization")}</DialogTitle>
         </DialogHeader>
         <form onSubmit={handleSubmit} className="space-y-6">
           <div className="space-y-4">
@@ -161,7 +156,7 @@ export function CreateOrganizationDialog({ open, onOpenChange, onSuccess, trigge
                 <AlertDescription>{error}</AlertDescription>
               </Alert>
             )}
-            {subscription?.status === "active" || subscription?.status === "trialing" && (
+            {(subscription?.status === "active" || subscription?.status === "trialing") && (
               <Alert variant="warning">
                 <AlertTriangle className="h-4 w-4" />
                 <AlertTitle>{t("Subscription Will Not Carry Over")}</AlertTitle>
