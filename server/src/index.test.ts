@@ -21,6 +21,7 @@ const harness = vi.hoisted(() => {
     initializeClickhouse: vi.fn(),
     initPostgres: vi.fn(),
     baseline: vi.fn(),
+    asnEngagement: vi.fn(),
     telemetry: { startTelemetryCron: vi.fn() },
     usage: { startUsageCheckCron: vi.fn(), applyUsageStateMessage: vi.fn() },
     cleanup: { startCleanupCron: vi.fn(), stopCleanupCron: vi.fn() },
@@ -66,6 +67,9 @@ vi.mock("./services/tracker/pageviewQueue.js", () => ({ pageviewQueue: harness.p
 vi.mock("./services/tracker/identifyService.js", () => ({ handleIdentify: vi.fn() }));
 vi.mock("./services/tracker/trackEvent.js", () => ({ trackEvent: vi.fn() }));
 vi.mock("./services/tracker/botBlocking/siteBaseline.js", () => ({ startSiteBaselineRefresh: harness.baseline }));
+vi.mock("./services/tracker/botBlocking/asnEngagement.js", () => ({
+  startAsnEngagementRefresh: harness.asnEngagement,
+}));
 vi.mock("./services/telemetryService.js", () => ({ telemetryService: harness.telemetry }));
 vi.mock("./services/usageService.js", () => ({
   usageService: harness.usage,
@@ -124,6 +128,7 @@ describe("actual server entrypoint with isolated I/O", () => {
     await startAndWait();
     expect(harness.initializeClickhouse).toHaveBeenCalledOnce();
     expect(harness.initPostgres).toHaveBeenCalledOnce();
+    expect(harness.asnEngagement).toHaveBeenCalledOnce();
     expect(harness.weekly.startWeeklyReportCron).toHaveBeenCalledOnce();
     expect(harness.lifecycle.startLifecycleCron).not.toHaveBeenCalled();
     expect(harness.server.listen).toHaveBeenCalledWith({ port: 3001, host: "0.0.0.0" });
@@ -165,6 +170,7 @@ describe("actual server entrypoint with isolated I/O", () => {
     );
     expect(harness.initializeClickhouse).not.toHaveBeenCalled();
     expect(harness.initPostgres).not.toHaveBeenCalled();
+    expect(harness.asnEngagement).toHaveBeenCalledOnce();
     expect(harness.weekly.startWeeklyReportCron).not.toHaveBeenCalled();
     expect(harness.lifecycle.startLifecycleCron).not.toHaveBeenCalled();
     expect(harness.telemetry.startTelemetryCron).not.toHaveBeenCalled();
@@ -180,6 +186,7 @@ describe("actual server entrypoint with isolated I/O", () => {
     expect(process.exit).toHaveBeenCalledOnce();
     expect(harness.server.listen).not.toHaveBeenCalled();
     expect(harness.baseline).not.toHaveBeenCalled();
+    expect(harness.asnEngagement).not.toHaveBeenCalled();
     expect(harness.weekly.startWeeklyReportCron).not.toHaveBeenCalled();
     expect(harness.telemetry.startTelemetryCron).not.toHaveBeenCalled();
     expect(harness.usage.startUsageCheckCron).not.toHaveBeenCalled();
