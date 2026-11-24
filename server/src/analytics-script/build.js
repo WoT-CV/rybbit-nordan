@@ -1,5 +1,7 @@
 import { build } from "esbuild";
 import { existsSync, mkdirSync } from "fs";
+import { readFile, writeFile } from "node:fs/promises";
+import { brotliCompressSync, gzipSync } from "node:zlib";
 import { dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 
@@ -41,19 +43,25 @@ async function buildScript() {
     console.log("✅ Built script-full.js");
 
     // Build the minified version
+    const minifiedScript = "../../public/script.js";
     await build({
       entryPoints: ["./index.ts"],
       bundle: true,
       format: "iife",
       target: "es2020",
-      outfile: "../../public/script.js",
+      outfile: minifiedScript,
       minify: true,
       sourcemap: false,
       platform: "browser",
       alias: bundleContractFromSource,
     });
 
-    console.log("✅ Built script.js (minified)");
+    const script = await readFile(minifiedScript);
+    await Promise.all([
+      writeFile(`${minifiedScript}.gz`, gzipSync(script, { level: 9 })),
+      writeFile(`${minifiedScript}.br`, brotliCompressSync(script)),
+    ]);
+    console.log("✅ Built script.js and its compressed variants");
   } catch (error) {
     console.error("Build failed:", error);
     process.exit(1);
