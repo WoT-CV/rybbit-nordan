@@ -5,6 +5,12 @@
   "engines": {
     "node": ">=22.13.0"
   },
+  "devDependencies": {
+    "eslint": "9.39.1",
+    "eslint-config-next": "16.4.6",
+    "next": "16.4.6",
+    "typescript": "npm:@typescript/typescript6@6.0.2"
+  },
   "scripts": {
     "dev": "pnpm --filter @rybbit/shared build && pnpm -r --parallel --stream run dev",
     "dev:client": "pnpm --filter @rybbit/shared build && pnpm --filter client... --parallel --stream run dev",

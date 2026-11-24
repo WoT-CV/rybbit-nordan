@@ -11,8 +11,8 @@ const error = (line = 1, message = "An error\nposition-dependent frame", ruleId 
   severity: 2,
 });
 
-test("pins the native baseline, selects source TS/TSX, handles NUL and duplicate/untracked paths", () => {
-  assert.equal(BASE, "e69e843db903581a097500926147549f35d5306f");
+test("pins the upstream baseline, selects source TS/TSX, handles NUL and duplicate/untracked paths", () => {
+  assert.equal(BASE, "a46032b5bcdd72f176b259bd1c1ff35140167268");
   assert.deepEqual(
     sourcePaths(
       "client/src/a.ts\0client/src/a.ts\0client/src/[site]/b.tsx\0",

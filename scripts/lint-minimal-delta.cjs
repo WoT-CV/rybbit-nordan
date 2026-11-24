@@ -1,11 +1,10 @@
-// Compare only this fork's client source against the pinned native baseline.
+// Compare this fork's client source against the pinned upstream revision.
 // This is NOT a claim that inherited upstream lint debt has been repaired.
-const { createRequire } = require("node:module");
 const { execFileSync } = require("node:child_process");
 const { readFileSync } = require("node:fs");
 const path = require("node:path");
 
-const BASE = "e69e843db903581a097500926147549f35d5306f";
+const BASE = "a46032b5bcdd72f176b259bd1c1ff35140167268";
 const ROOT = path.resolve(__dirname, "..");
 function sourcePaths(...lists) {
   return [...new Set(lists.flatMap(list => list.split("\0")))]
@@ -58,12 +57,12 @@ async function main() {
     git(["diff", "--name-only", "--diff-filter=ACMR", "-z", BASE, "--", "client/src"]),
     git(["ls-files", "--others", "--exclude-standard", "-z", "--", "client/src"])
   );
-  const requireClient = createRequire(path.join(ROOT, "client/package.json"));
-  const { ESLint } = requireClient("eslint");
+  // ESLint's parser still needs the TypeScript 6 API. The apps use TypeScript 7.
+  const { ESLint } = require("eslint");
   const lint = new ESLint({
     cwd: path.join(ROOT, "client"),
     overrideConfigFile: true,
-    overrideConfig: requireClient("eslint-config-next/core-web-vitals"),
+    overrideConfig: require("eslint-config-next/core-web-vitals"),
   });
   const result = { base: BASE, files: files.length, inheritedErrors: 0, newErrors: [], warnings: [] };
   for (const file of files) {
