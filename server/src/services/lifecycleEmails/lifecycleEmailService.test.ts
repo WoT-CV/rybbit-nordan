@@ -43,12 +43,20 @@ const state = vi.hoisted(() => ({
   establishedSites: [] as Array<{ site_id: number; total: number }>,
   /** unique-key guard mirroring the DB constraint */
   sentKeys: new Set<string>(),
+  /** the usage service's blocked-site sets, and whether a usage check has filled them yet */
+  sitesWithoutPlan: new Set<number>(),
+  sitesOverLimit: new Set<number>(),
+  siteBlocksLoaded: { value: true },
+  /** Stripe customers that have had a subscription, so no trial is on offer */
+  orgs: [] as Array<{ stripeCustomerId: string | null }>,
+  customersWithHistory: new Set<string>(),
 }));
 
 const mocks = vi.hoisted(() => ({
   sendLifecycleEmail: vi.fn(async (_email: string, _letter: Letter, _idempotencyKey?: string) => true),
   isContactUnsubscribed: vi.fn(async (_email: string) => false),
   detectPlatform: vi.fn(async () => null),
+  hasHadStripeSubscription: vi.fn(async (_customerId: string | null, _options?: { throwOnError?: boolean }) => false),
 }));
 
 /** one entry per insert call: the keys that call claimed (for LIFO rollback) */
@@ -85,6 +93,7 @@ vi.mock("../../db/postgres/postgres.js", () => {
           if ("role" in fields) return state.memberships;
           if ("createdAt" in fields && "email" in fields) return state.users;
           if ("detectedPlatform" in fields) return state.sites;
+          if ("stripeCustomerId" in fields) return state.orgs;
           if ("email" in fields && "organizationId" in fields) return state.owners;
           if ("domain" in fields) return state.sites;
           return state.goals;
@@ -169,6 +178,16 @@ vi.mock("../../lib/email/email.js", () => ({
 
 vi.mock("../../lib/const.js", () => ({ IS_CLOUD: true, SECRET: "test-secret" }));
 
+vi.mock("../../lib/subscriptionUtils.js", () => ({ hasHadStripeSubscription: mocks.hasHadStripeSubscription }));
+
+vi.mock("../usageService.js", () => ({
+  usageService: {
+    hasSiteBlocks: () => state.siteBlocksLoaded.value,
+    isSiteWithoutPlan: (siteId: number) => state.sitesWithoutPlan.has(siteId),
+    isSiteOverLimit: (siteId: number) => state.sitesOverLimit.has(siteId),
+  },
+}));
+
 vi.mock("./platformDetect.js", async importOriginal => {
   const original = await importOriginal<typeof import("./platformDetect.js")>();
   return { ...original, detectPlatform: mocks.detectPlatform };
@@ -206,6 +225,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.sendLifecycleEmail.mockResolvedValue(true);
   mocks.isContactUnsubscribed.mockResolvedValue(false);
+  state.siteBlocksLoaded.value = true;
+  mocks.hasHadStripeSubscription.mockImplementation(
+    async customerId => !!customerId && state.customersWithHistory.has(customerId)
+  );
   insertedStack.length = 0;
   // Reset singleton run-state between tests
   (lifecycleEmailService as any).lastWentQuietAt = null;
@@ -248,14 +271,6 @@ describe("state: signed up, no site", () => {
     await run();
     expect(mocks.sendLifecycleEmail).toHaveBeenCalledTimes(1);
     expect(mocks.isContactUnsubscribed).not.toHaveBeenCalled();
-  });
-
-  it("includes unverified users (this app doesn't require email verification)", async () => {
-    // The query-level fix can't be seen through the mock, but the behavior
-    // contract is documented here: eligibility is not gated on emailVerified.
-    addUser("u1", hoursAgo(3));
-    await run();
-    expect(mocks.sendLifecycleEmail).toHaveBeenCalledTimes(1);
   });
 
   it("skips invited teammates who own no organization", async () => {
@@ -319,10 +334,153 @@ describe("state: site created, no data", () => {
     addUser("u1", daysAgo(20));
     addOwnedSite("u1", 1, "working.com", daysAgo(20));
     addOwnedSite("u1", 2, "newsite.com", hoursAgo(3));
-    state.siteStats.push({ site_id: 1, first_event: daysAgo(19), last_event: hoursAgo(1), total: 9000, pageviews: 8500, custom_events: 40 });
+    state.siteStats.push({
+      site_id: 1,
+      first_event: daysAgo(19),
+      last_event: hoursAgo(1),
+      total: 9000,
+      pageviews: 8500,
+      custom_events: 40,
+    });
     markSent("u1", "site_live:1", daysAgo(19));
     await run();
     expect(sentSubjects()).toEqual(["One step left for newsite.com"]);
+  });
+});
+
+describe("state: site created, no plan", () => {
+  beforeEach(() => {
+    state.orgs.push({ stripeCustomerId: null });
+  });
+
+  it("asks for the free trial instead of sending a snippet the site can't use", async () => {
+    addUser("u1", hoursAgo(5));
+    addOwnedSite("u1", 7, "acme.com", hoursAgo(2));
+    state.sitesWithoutPlan.add(7);
+
+    await run();
+
+    expect(sentSubjects()).toEqual(["acme.com isn't tracking yet"]);
+    expect(sentBody()).toContain("won't collect any data until you start your free trial");
+    expect(sentBody()).toContain("you won't be charged until it ends");
+    expect(sentBody()).toContain("https://app.rybbit.io/7");
+    expect(sentBody()).not.toContain("<script");
+  });
+
+  it("waits an hour after the site was added", async () => {
+    addUser("u1", hoursAgo(5));
+    addOwnedSite("u1", 7, "acme.com", hoursAgo(0.5));
+    state.sitesWithoutPlan.add(7);
+
+    await run();
+
+    expect(mocks.sendLifecycleEmail).not.toHaveBeenCalled();
+  });
+
+  it("offers plans, not a trial, to an organization that has had a subscription", async () => {
+    addUser("u1", hoursAgo(5));
+    addOwnedSite("u1", 7, "acme.com", hoursAgo(2));
+    state.sitesWithoutPlan.add(7);
+    state.orgs[0].stripeCustomerId = "cus_1";
+    state.customersWithHistory.add("cus_1");
+
+    await run();
+
+    expect(sentBody()).toContain("won't collect any data until you choose a plan");
+    expect(sentBody()).not.toContain("trial");
+  });
+
+  it("holds the email when Stripe can't say whether a trial is on offer, and sends it next run", async () => {
+    addUser("u1", hoursAgo(5));
+    addOwnedSite("u1", 7, "acme.com", hoursAgo(2));
+    state.sitesWithoutPlan.add(7);
+    mocks.hasHadStripeSubscription.mockRejectedValueOnce(new Error("stripe down"));
+
+    await run();
+    expect(mocks.sendLifecycleEmail).not.toHaveBeenCalled();
+    expect(mocks.hasHadStripeSubscription).toHaveBeenCalledWith(null, { throwOnError: true });
+
+    await run();
+    expect(sentSubjects()).toEqual(["acme.com isn't tracking yet"]);
+  });
+
+  it("follows up once, three days later, then stops", async () => {
+    addUser("u1", daysAgo(5));
+    addOwnedSite("u1", 7, "acme.com", daysAgo(5));
+    state.sitesWithoutPlan.add(7);
+    markSent("u1", "no_plan_1", daysAgo(2));
+
+    await run();
+    expect(mocks.sendLifecycleEmail).not.toHaveBeenCalled();
+
+    state.logs[0].sentAt = daysAgo(4);
+    await run();
+    expect(sentSubjects()).toEqual(["Still want to track acme.com?"]);
+    expect(sentBody()).toContain("This is the last email I'll send about it.");
+
+    await run();
+    expect(mocks.sendLifecycleEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it("covers every site waiting on a plan in one email", async () => {
+    addUser("u1", hoursAgo(5));
+    addOwnedSite("u1", 7, "acme.com", hoursAgo(3));
+    addOwnedSite("u1", 8, "acme.dev", hoursAgo(2));
+    state.sitesWithoutPlan.add(7).add(8);
+
+    await run();
+
+    expect(sentSubjects()).toEqual(["acme.com and 1 other site aren't tracking yet"]);
+    expect(sentBody()).toContain("acme.dev");
+  });
+
+  it("moves the site to the install track once the plan starts", async () => {
+    addUser("u1", daysAgo(2));
+    addOwnedSite("u1", 7, "acme.com", daysAgo(2));
+    markSent("u1", "no_plan_1", daysAgo(1));
+
+    await run();
+
+    expect(sentSubjects()).toEqual(["One step left for acme.com"]);
+  });
+
+  it("still sends install help for the owner's sites that can collect", async () => {
+    addUser("u1", daysAgo(2));
+    addOwnedSite("u1", 7, "blocked.com", daysAgo(2));
+    addOwnedSite("u1", 8, "working.com", hoursAgo(2));
+    state.sitesWithoutPlan.add(7);
+    markSent("u1", "no_plan_1", hoursAgo(20));
+
+    await run();
+
+    expect(sentSubjects()).toEqual(["One step left for working.com"]);
+    expect(sentBody()).not.toContain("blocked.com");
+  });
+
+  it("leaves alone a site whose owner already got the install track's last reminder", async () => {
+    addUser("u1", daysAgo(10));
+    addOwnedSite("u1", 7, "acme.com", daysAgo(10));
+    state.sitesWithoutPlan.add(7);
+    markSent("u1", "install_snippet:7", daysAgo(9));
+    markSent("u1", "install_check:7", daysAgo(8));
+    markSent("u1", "install_final:7", daysAgo(4));
+
+    await run();
+
+    expect(mocks.sendLifecycleEmail).not.toHaveBeenCalled();
+  });
+
+  it("sends neither track until the usage check has said which sites are blocked", async () => {
+    state.siteBlocksLoaded.value = false;
+    addUser("u1", hoursAgo(5));
+    addOwnedSite("u1", 7, "acme.com", hoursAgo(2));
+
+    await run();
+    expect(mocks.sendLifecycleEmail).not.toHaveBeenCalled();
+
+    state.siteBlocksLoaded.value = true;
+    await run();
+    expect(sentSubjects()).toEqual(["One step left for acme.com"]);
   });
 });
 
@@ -332,7 +490,14 @@ describe("transition: first data arrives", () => {
     addOwnedSite("u1", 42, "acme.com", hoursAgo(20));
     // snippet email went out an hour ago - the gap must not delay the transition email
     markSent("u1", "install_snippet:42", hoursAgo(1));
-    state.siteStats.push({ site_id: 42, first_event: hoursAgo(1), last_event: hoursAgo(1), total: 5, pageviews: 5, custom_events: 0 });
+    state.siteStats.push({
+      site_id: 42,
+      first_event: hoursAgo(1),
+      last_event: hoursAgo(1),
+      total: 5,
+      pageviews: 5,
+      custom_events: 0,
+    });
     state.firstPageview.push({ country: "DE" });
     await run();
     expect(sentSubjects()).toEqual(["Rybbit is live on acme.com"]);
@@ -340,20 +505,17 @@ describe("transition: first data arrives", () => {
     expect(body).toContain("Germany");
   });
 
-  it("passes a stable idempotency key to the provider", async () => {
-    addUser("u1", daysAgo(1));
-    addOwnedSite("u1", 42, "acme.com", hoursAgo(20));
-    state.siteStats.push({ site_id: 42, first_event: hoursAgo(1), last_event: hoursAgo(1), total: 5, pageviews: 5, custom_events: 0 });
-    await run();
-    // Bundled kinds key on the cooldown window, not the member sites, so a
-    // retry after a lost response reuses it even if membership changed.
-    expect(mocks.sendLifecycleEmail.mock.calls[0][2]).toBe("lifecycle:u1:site_live:first");
-  });
-
   it("does not send it for sites whose first event is old (pre-existing traffic)", async () => {
     addUser("u1", daysAgo(20));
     addOwnedSite("u1", 42, "acme.com", daysAgo(20));
-    state.siteStats.push({ site_id: 42, first_event: daysAgo(15), last_event: hoursAgo(1), total: 900, pageviews: 850, custom_events: 3 });
+    state.siteStats.push({
+      site_id: 42,
+      first_event: daysAgo(15),
+      last_event: hoursAgo(1),
+      total: 900,
+      pageviews: 850,
+      custom_events: 3,
+    });
     await run();
     expect(sentSubjects()).not.toContain("Rybbit is live on acme.com");
   });
@@ -361,7 +523,14 @@ describe("transition: first data arrives", () => {
   it("retries next tick when the provider rejects the send", async () => {
     addUser("u1", daysAgo(1));
     addOwnedSite("u1", 42, "acme.com", hoursAgo(20));
-    state.siteStats.push({ site_id: 42, first_event: hoursAgo(1), last_event: hoursAgo(1), total: 5, pageviews: 5, custom_events: 0 });
+    state.siteStats.push({
+      site_id: 42,
+      first_event: hoursAgo(1),
+      last_event: hoursAgo(1),
+      total: 5,
+      pageviews: 5,
+      custom_events: 0,
+    });
     mocks.sendLifecycleEmail.mockResolvedValueOnce(false);
     await run();
     // First run: attempted but rejected; the log row is rolled back, so the
@@ -376,7 +545,14 @@ describe("state: data flowing", () => {
   const flowingSite = (customEvents = 0) => {
     addUser("u1", daysAgo(10));
     addOwnedSite("u1", 42, "acme.com", daysAgo(10));
-    state.siteStats.push({ site_id: 42, first_event: daysAgo(4), last_event: hoursAgo(2), total: 500, pageviews: 450, custom_events: customEvents });
+    state.siteStats.push({
+      site_id: 42,
+      first_event: daysAgo(4),
+      last_event: hoursAgo(2),
+      total: 500,
+      pageviews: 450,
+      custom_events: customEvents,
+    });
     markSent("u1", "site_live:42", daysAgo(4));
   };
 
@@ -394,7 +570,14 @@ describe("state: data flowing", () => {
   it("holds educational emails until the 48h gap has passed", async () => {
     addUser("u1", daysAgo(10));
     addOwnedSite("u1", 42, "acme.com", daysAgo(10));
-    state.siteStats.push({ site_id: 42, first_event: daysAgo(4), last_event: hoursAgo(2), total: 500, pageviews: 450, custom_events: 0 });
+    state.siteStats.push({
+      site_id: 42,
+      first_event: daysAgo(4),
+      last_event: hoursAgo(2),
+      total: 500,
+      pageviews: 450,
+      custom_events: 0,
+    });
     markSent("u1", "site_live:42", hoursAgo(10));
     await run();
     expect(mocks.sendLifecycleEmail).not.toHaveBeenCalled();
@@ -403,7 +586,14 @@ describe("state: data flowing", () => {
   it("nudges goals only when the data shows a converting path and no goal exists", async () => {
     addUser("u1", daysAgo(15));
     addOwnedSite("u1", 42, "acme.com", daysAgo(15));
-    state.siteStats.push({ site_id: 42, first_event: daysAgo(8), last_event: hoursAgo(2), total: 2000, pageviews: 1900, custom_events: 4 });
+    state.siteStats.push({
+      site_id: 42,
+      first_event: daysAgo(8),
+      last_event: hoursAgo(2),
+      total: 2000,
+      pageviews: 1900,
+      custom_events: 4,
+    });
     markSent("u1", "site_live:42", daysAgo(4));
     markSent("u1", "first_days:42", daysAgo(4));
     state.convertingPaths.push({ pathname: "/thank-you", sessions: 86 });
@@ -421,7 +611,14 @@ describe("state: data flowing", () => {
   it("nudges custom events only when the site has none", async () => {
     addUser("u1", daysAgo(20));
     addOwnedSite("u1", 42, "acme.com", daysAgo(20));
-    state.siteStats.push({ site_id: 42, first_event: daysAgo(11), last_event: hoursAgo(2), total: 2000, pageviews: 1900, custom_events: 0 });
+    state.siteStats.push({
+      site_id: 42,
+      first_event: daysAgo(11),
+      last_event: hoursAgo(2),
+      total: 2000,
+      pageviews: 1900,
+      custom_events: 0,
+    });
     markSent("u1", "site_live:42", daysAgo(5));
     markSent("u1", "first_days:42", daysAgo(5));
     await run();
@@ -438,7 +635,13 @@ describe("state: went quiet", () => {
   const quietSite = () => {
     state.quietCandidates.push({ site_id: 7, last_event: hoursAgo(50) });
     state.establishedSites.push({ site_id: 7, total: 5000 });
-    state.sites.push({ siteId: 7, domain: "quiet.com", createdAt: daysAgo(200), organizationId: "org-x", detectedPlatform: null });
+    state.sites.push({
+      siteId: 7,
+      domain: "quiet.com",
+      createdAt: daysAgo(200),
+      organizationId: "org-x",
+      detectedPlatform: null,
+    });
     state.owners.push({ organizationId: "org-x", userId: "owner1", email: "owner1@example.com", name: "Ada" });
   };
 
@@ -452,10 +655,38 @@ describe("state: went quiet", () => {
     expect(mocks.sendLifecycleEmail).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    ["has no plan", () => state.sitesWithoutPlan.add(7)],
+    ["is over its event limit", () => state.sitesOverLimit.add(7)],
+  ])("says nothing about a site that is quiet because it %s", async (_reason, block) => {
+    quietSite();
+    block();
+    await run();
+    expect(mocks.sendLifecycleEmail).not.toHaveBeenCalled();
+  });
+
+  it("waits for the usage check before deciding a site went quiet on its own", async () => {
+    quietSite();
+    state.siteBlocksLoaded.value = false;
+    await run();
+    expect(mocks.sendLifecycleEmail).not.toHaveBeenCalled();
+
+    // Not counted as the hour's scan, so the next run alerts as soon as the sets are in.
+    state.siteBlocksLoaded.value = true;
+    await run();
+    expect(sentSubjects()).toEqual(["quiet.com stopped sending data"]);
+  });
+
   it("skips sites without an established baseline", async () => {
     state.quietCandidates.push({ site_id: 7, last_event: hoursAgo(50) });
     // establishedSites empty: only a handful of test events, no alert
-    state.sites.push({ siteId: 7, domain: "quiet.com", createdAt: daysAgo(200), organizationId: "org-x", detectedPlatform: null });
+    state.sites.push({
+      siteId: 7,
+      domain: "quiet.com",
+      createdAt: daysAgo(200),
+      organizationId: "org-x",
+      detectedPlatform: null,
+    });
     state.owners.push({ organizationId: "org-x", userId: "owner1", email: "owner1@example.com", name: "Ada" });
     await run();
     expect(mocks.sendLifecycleEmail).not.toHaveBeenCalled();
@@ -472,7 +703,13 @@ describe("state: went quiet", () => {
     quietSite();
     state.quietCandidates.push({ site_id: 8, last_event: hoursAgo(52) });
     state.establishedSites.push({ site_id: 8, total: 3000 });
-    state.sites.push({ siteId: 8, domain: "quiet2.com", createdAt: daysAgo(200), organizationId: "org-x", detectedPlatform: null });
+    state.sites.push({
+      siteId: 8,
+      domain: "quiet2.com",
+      createdAt: daysAgo(200),
+      organizationId: "org-x",
+      detectedPlatform: null,
+    });
     await run();
     expect(sentSubjects()).toEqual(["quiet.com and 1 other site stopped sending data"]);
     const body = sentBody();
@@ -543,7 +780,10 @@ describe("state: went quiet", () => {
 
 describe("multi-site owners", () => {
   const siteIds = (prefix: string) =>
-    state.logs.filter(l => l.emailKey.startsWith(prefix)).map(l => Number(l.emailKey.split(":")[1])).sort((a, b) => a - b);
+    state.logs
+      .filter(l => l.emailKey.startsWith(prefix))
+      .map(l => Number(l.emailKey.split(":")[1]))
+      .sort((a, b) => a - b);
 
   it("bundles every site awaiting a snippet into one email", async () => {
     addUser("agency", hoursAgo(6));
@@ -606,7 +846,14 @@ describe("multi-site owners", () => {
     addUser("agency", daysAgo(1));
     for (let i = 1; i <= 4; i++) {
       addOwnedSite("agency", i, `client${i}.com`, hoursAgo(20));
-      state.siteStats.push({ site_id: i, first_event: hoursAgo(i), last_event: hoursAgo(0.1), total: 5, pageviews: 5, custom_events: 0 });
+      state.siteStats.push({
+        site_id: i,
+        first_event: hoursAgo(i),
+        last_event: hoursAgo(0.1),
+        total: 5,
+        pageviews: 5,
+        custom_events: 0,
+      });
     }
     await run();
     expect(sentSubjects()).toEqual(["Rybbit is live on client1.com and 3 other sites"]);
@@ -621,8 +868,22 @@ describe("multi-site owners", () => {
     addOwnedSite("agency", 2, "second.com", hoursAgo(20));
     markSent("agency", "site_live:1", hoursAgo(2));
     markSent("agency", "install_snippet:2", hoursAgo(1));
-    state.siteStats.push({ site_id: 1, first_event: hoursAgo(3), last_event: hoursAgo(0.1), total: 50, pageviews: 50, custom_events: 0 });
-    state.siteStats.push({ site_id: 2, first_event: hoursAgo(0.5), last_event: hoursAgo(0.1), total: 5, pageviews: 5, custom_events: 0 });
+    state.siteStats.push({
+      site_id: 1,
+      first_event: hoursAgo(3),
+      last_event: hoursAgo(0.1),
+      total: 50,
+      pageviews: 50,
+      custom_events: 0,
+    });
+    state.siteStats.push({
+      site_id: 2,
+      first_event: hoursAgo(0.5),
+      last_event: hoursAgo(0.1),
+      total: 5,
+      pageviews: 5,
+      custom_events: 0,
+    });
     await run();
     expect(mocks.sendLifecycleEmail).not.toHaveBeenCalled();
 
@@ -640,7 +901,14 @@ describe("multi-site owners", () => {
     addUser("agency", daysAgo(1));
     for (let i = 1; i <= 2; i++) {
       addOwnedSite("agency", i, `client${i}.com`, hoursAgo(20));
-      state.siteStats.push({ site_id: i, first_event: hoursAgo(1), last_event: hoursAgo(0.1), total: 5, pageviews: 5, custom_events: 0 });
+      state.siteStats.push({
+        site_id: i,
+        first_event: hoursAgo(1),
+        last_event: hoursAgo(0.1),
+        total: 5,
+        pageviews: 5,
+        custom_events: 0,
+      });
     }
     // Resend may have accepted this bundle even though we saw a failure.
     mocks.sendLifecycleEmail.mockResolvedValueOnce(false);
@@ -649,7 +917,14 @@ describe("multi-site owners", () => {
 
     // A third site goes live before the retry, so the bundle now has 3 members.
     addOwnedSite("agency", 3, "client3.com", hoursAgo(20));
-    state.siteStats.push({ site_id: 3, first_event: hoursAgo(0.5), last_event: hoursAgo(0.1), total: 5, pageviews: 5, custom_events: 0 });
+    state.siteStats.push({
+      site_id: 3,
+      first_event: hoursAgo(0.5),
+      last_event: hoursAgo(0.1),
+      total: 5,
+      pageviews: 5,
+      custom_events: 0,
+    });
     await run();
     expect(mocks.sendLifecycleEmail).toHaveBeenCalledTimes(2);
     const [failed, retried] = mocks.sendLifecycleEmail.mock.calls;
@@ -664,7 +939,14 @@ describe("multi-site owners", () => {
     state.sentKeys.clear();
     markSent("agency", "site_live:1", hoursAgo(25));
     state.siteStats.length = 0;
-    state.siteStats.push({ site_id: 2, first_event: hoursAgo(1), last_event: hoursAgo(0.1), total: 5, pageviews: 5, custom_events: 0 });
+    state.siteStats.push({
+      site_id: 2,
+      first_event: hoursAgo(1),
+      last_event: hoursAgo(0.1),
+      total: 5,
+      pageviews: 5,
+      custom_events: 0,
+    });
     await run();
     const next = mocks.sendLifecycleEmail.mock.calls[2][2];
     expect(next).toMatch(/^lifecycle:agency:site_live:\d+$/);

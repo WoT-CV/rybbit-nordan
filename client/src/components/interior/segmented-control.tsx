@@ -37,7 +37,7 @@ export type SegmentedControlProps<T extends string = string> = {
   onValueChange?: (value: T) => void;
   "aria-label"?: string;
   "aria-labelledby"?: string;
-  // sm matches the 28px compact controls, md the 36px default (ui/tabs).
+  // sm matches the 32px compact controls (Button/Select/Input sm), md the 36px default (ui/tabs).
   size?: "sm" | "md";
   // "overlay" floats over a map or image (the globe).
   variant?: "default" | "overlay";
@@ -49,7 +49,7 @@ type SegmentRect = { left: number; width: number };
 type SegmentLayout = { width: number; rects: SegmentRect[] };
 
 const SIZES = {
-  sm: { track: "p-0.5", segment: "h-6 gap-1.5 px-2 text-xs" },
+  sm: { track: "p-0.5", segment: "h-7 gap-1.5 px-2.5 text-xs" },
   md: { track: "p-1", segment: "h-7 gap-2 px-3 text-sm" },
 } as const;
 
@@ -99,7 +99,7 @@ export function interpolateSegment(rects: readonly SegmentRect[], position: numb
 }
 
 // Next enabled index from `from` in `step` direction, wrapping; -1 if none.
-export function seekEnabled(options: readonly { disabled?: boolean }[], from: number, step: 1 | -1): number {
+function seekEnabled(options: readonly { disabled?: boolean }[], from: number, step: 1 | -1): number {
   const count = options.length;
   for (let k = 1; k <= count; k++) {
     const i = (((from + step * k) % count) + count) % count;

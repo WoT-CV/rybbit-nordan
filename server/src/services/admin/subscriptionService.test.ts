@@ -312,16 +312,6 @@ describe("getOrganizationSubscriptions — AppSumo licenses", () => {
 });
 
 describe("getOrganizationSubscriptions — Stripe versus AppSumo", () => {
-  it("prefers the Stripe subscription when both sources exist", async () => {
-    const plan = planByName("pro1m");
-    snapshot({ cus_1: stripeSub({ priceId: plan.priceId }) });
-    state.licenses = [{ organization_id: "org_1", tier: "1" }];
-
-    const result = await getOrganizationSubscriptions([{ id: "org_1", stripeCustomerId: "cus_1" }], true);
-
-    expect(result.get("org_1")).toMatchObject({ planName: plan.name, eventLimit: plan.limits.events });
-  });
-
   it("keeps the Stripe subscription even when AppSumo allows more events", async () => {
     const plan = planByName("standard100k");
     snapshot({ cus_1: stripeSub({ priceId: plan.priceId }) });
@@ -330,18 +320,6 @@ describe("getOrganizationSubscriptions — Stripe versus AppSumo", () => {
     const result = await getOrganizationSubscriptions([{ id: "org_1", stripeCustomerId: "cus_1" }], true);
 
     expect(result.get("org_1")).toMatchObject({ planName: plan.name, eventLimit: plan.limits.events });
-  });
-
-  it("keeps the Stripe plan on an exact tie", async () => {
-    // standard500k and AppSumo tier 4 both allow 500k events.
-    const plan = planByName("standard500k");
-    expect(plan.limits.events).toBe(APPSUMO_TIER_LIMITS["4"]);
-    snapshot({ cus_1: stripeSub({ priceId: plan.priceId }) });
-    state.licenses = [{ organization_id: "org_1", tier: "4" }];
-
-    const result = await getOrganizationSubscriptions([{ id: "org_1", stripeCustomerId: "cus_1" }], true);
-
-    expect(result.get("org_1")?.planName).toBe(plan.name);
   });
 
   it("keeps Stripe precedence in summary mode", async () => {

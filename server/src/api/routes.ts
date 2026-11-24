@@ -133,6 +133,7 @@ import {
 import { connectGSC, disconnectGSC, getGSCData, getGSCStatus, gscCallback, selectGSCProperty } from "./gsc/index.js";
 import { updateMemberSiteAccess } from "./memberAccess/index.js";
 import { listTeams, createTeam, updateTeam, deleteTeam } from "./teams/index.js";
+import { signDpa } from "./dpa/signDpa.js";
 import {
   deleteSessionReplay,
   getSessionReplayEvents,
@@ -176,6 +177,7 @@ import {
   getSubscription,
   handleWebhook,
   previewSubscriptionUpdate,
+  retryPayment,
   submitCancellationFeedback,
   updateSubscription,
 } from "./stripe/index.js";
@@ -558,6 +560,17 @@ async function organizationsRoutes(fastify: FastifyInstance) {
 
   // Member site access management (admin/owner only)
   fastify.put("/organizations/:organizationId/members/:memberId/sites", org("members:manage"), updateMemberSiteAccess);
+
+  // Data Processing Agreement: a countersigned agreement with Rybbit Cloud, so self-hosted has none.
+  if (IS_CLOUD) {
+    const dpa = org("dpa:manage");
+    fastify.post(
+      "/organizations/:organizationId/dpa",
+      // Each signature launches a browser to print the PDF.
+      { ...dpa, bodyLimit: 16 * 1024, config: { ...dpa.config, rateLimit: { max: 10, timeWindow: "1 hour" } } },
+      signDpa
+    );
+  }
 }
 
 async function teamsRoutes(fastify: FastifyInstance) {
@@ -640,6 +653,7 @@ async function stripeAdminRoutes(fastify: FastifyInstance) {
     // Stripe Routes
     fastify.post("/stripe/create-checkout-session", authenticated("deny-scoped"), createCheckoutSession);
     fastify.post("/stripe/create-portal-session", authenticated("deny-scoped"), createPortalSession);
+    fastify.post("/stripe/retry-payment", authenticated("deny-scoped"), retryPayment);
     fastify.post("/stripe/preview-subscription-update", authenticated("deny-scoped"), previewSubscriptionUpdate);
     fastify.post("/stripe/update-subscription", authenticated("deny-scoped"), updateSubscription);
     fastify.get("/stripe/subscription", authenticated("deny-scoped"), getSubscription);

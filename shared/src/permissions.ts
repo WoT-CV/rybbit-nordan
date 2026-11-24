@@ -123,6 +123,9 @@ export const PERMISSIONS = {
   "members:manage": { minRole: "admin", scope: write("org") },
   "teams:manage": { minRole: "admin", scope: write("org") },
   "apikeys:manage": { minRole: "admin", scope: "deny-scoped" },
+  // Signing the Data Processing Agreement binds the company, so only admins may
+  // do it, and never with an API key or OAuth token.
+  "dpa:manage": { minRole: "admin", scope: "deny-scoped" },
   // Enforced by better-auth's organization access control (orgRoles in the
   // server's auth.ts); listed here so the client can ask for it by name.
   "org:rename": { minRole: "admin", scope: "deny-scoped" },
@@ -158,6 +161,18 @@ export function canAssignRole(actorRole: string | null | undefined, targetRole: 
     return false;
   }
   return roleHasPermission(actorRole, "members:manage") && ROLE_RANK[actorRole] >= ROLE_RANK[targetRole];
+}
+
+/**
+ * Whether the role carries a permission that scoped and third-party
+ * credentials never get ("deny-scoped": minting API keys, billing, signing the
+ * DPA). Granting such a role hands those powers to the grantee's own sign-in,
+ * so a credential that is refused them itself must not be able to grant it.
+ */
+export function roleHoldsSessionOnlyPermission(role: string | null | undefined): boolean {
+  return ALL_PERMISSIONS.some(
+    permission => PERMISSIONS[permission].scope === "deny-scoped" && roleHasPermission(role, permission)
+  );
 }
 
 /** The roles someone holding `actorRole` may give to others, highest first. */

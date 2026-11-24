@@ -115,7 +115,7 @@ export function PlanStep({
         ) : (
           <div className="p-4 rounded-lg border border-neutral-200 dark:border-neutral-800 text-center">
             <p className="text-sm text-neutral-500 dark:text-neutral-400">
-              {t("Need more than 20M events? Contact us for a custom plan.")}
+              {t("For more than 20M events, contact us for a custom plan.")}
             </p>
             <a
               href="mailto:hello@rybbit.com"
@@ -129,14 +129,9 @@ export function PlanStep({
         <div className="flex flex-col gap-4">
           {/* Subscribe button */}
           {eventLimit !== "Custom" && (
-            <Button
-              className="w-full transition-all duration-300 h-11 bg-emerald-600 hover:bg-emerald-500 text-white"
-              onClick={onSubscribe}
-              disabled={isLoading}
-              variant="success"
-            >
+            <Button className="w-full" onClick={onSubscribe} disabled={isLoading} variant="success">
               {isLoading ? t("Loading...") : trialEligible ? t("Start free trial") : t("Continue to checkout")}
-              <ArrowRight className="ml-2 h-4 w-4" />
+              <ArrowRight className="h-4 w-4" />
             </Button>
           )}
 

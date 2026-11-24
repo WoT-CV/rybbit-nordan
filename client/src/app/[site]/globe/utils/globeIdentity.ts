@@ -2,6 +2,7 @@ import type { LiveSessionLocation } from "@/api/analytics/endpoints/sessions";
 import { frogAvatarSVG } from "@/lib/frogAvatar";
 import { getUserAvatarUrl } from "@/lib/userAvatar";
 import { getUserDisplayName } from "@/lib/utils";
+import { escapeHtml } from "./escapeHtml";
 import { renderCountryFlag } from "./renderCountryFlag";
 
 type GlobeIdentity = {
@@ -12,12 +13,6 @@ type GlobeIdentity = {
 
 export const locationIdentityKey = (location: Pick<LiveSessionLocation, "lat" | "lon" | "city" | "country">): string =>
   JSON.stringify([location.lat, location.lon, location.city, location.country]);
-
-export const escapeGlobeHTML = (value: unknown): string =>
-  String(value ?? "").replace(
-    /[&<>"']/g,
-    character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]!
-  );
 
 export function globeIdentityKey(identity: GlobeIdentity): string {
   return JSON.stringify([identity.user_id, getUserDisplayName(identity), getUserAvatarUrl(identity.traits)]);
@@ -31,7 +26,7 @@ export function globeAvatarHTML(identity: GlobeIdentity, size: number): string {
   if (!url) return frog;
   return `<span data-globe-avatar style="display:block;position:relative;width:${size}px;height:${size}px">
     <span data-globe-fallback>${frog}</span>
-    <img src="${escapeGlobeHTML(url)}" alt="" width="${size}" height="${size}" loading="lazy" referrerpolicy="no-referrer"
+    <img src="${escapeHtml(url)}" alt="" width="${size}" height="${size}" loading="lazy" referrerpolicy="no-referrer"
       style="position:absolute;inset:0;display:block;width:100%;height:100%;object-fit:contain;opacity:0" />
   </span>`;
 }
@@ -73,11 +68,11 @@ export function setGlobeTooltip(element: HTMLElement, html: string): void {
 export function locationTooltipHTML(location: LiveSessionLocation): string {
   const sample = location.count === 1 ? location.sample : null;
   const identity = sample
-    ? `<div class="flex items-center gap-2 mb-2">${globeAvatarHTML(sample, 28)}<span class="text-sm font-medium text-white">${escapeGlobeHTML(getUserDisplayName(sample))}</span></div>`
+    ? `<div class="flex items-center gap-2 mb-2">${globeAvatarHTML(sample, 28)}<span class="text-sm font-medium text-white">${escapeHtml(getUserDisplayName(sample))}</span></div>`
     : "";
   return `<div class="bg-neutral-850 border border-neutral-750 rounded-lg p-2 shadow-lg" style="pointer-events:none">
     ${identity}
-    <div class="flex items-center gap-2 mb-1">${renderCountryFlag(location.country)}<span class="text-sm font-medium text-white">${escapeGlobeHTML(location.city || "Unknown")}</span></div>
-    <div class="text-sm"><span class="font-bold text-accent-400">${location.count.toLocaleString()}</span><span class="text-neutral-300"> sessions</span></div>
+    <div class="flex items-center gap-2 mb-1">${renderCountryFlag(location.country)}<span class="text-sm font-medium text-white">${escapeHtml(location.city || "Unknown")}</span></div>
+    <div class="text-sm"><span class="font-bold text-accent-400">${escapeHtml(location.count.toLocaleString())}</span><span class="text-neutral-300"> sessions</span></div>
   </div>`;
 }

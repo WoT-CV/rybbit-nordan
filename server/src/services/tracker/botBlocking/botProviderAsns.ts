@@ -85,15 +85,12 @@ export const CURATED_BOT_PROVIDER_ASNS: readonly CuratedBotProviderAsnEntry[] = 
 export const EXTRA_DATACENTER_ASNS: readonly number[] = [
   30236, // Cronomagic Canada Inc. — 103 sites / 168 visitors / 0 interactions in 3d
   50077, // SYN LTD — 141 sites / 691 visitors / 0 interactions in 3d
-  64445, // NetJoin srl — 117 sites / 458 visitors / 0 interactions in 3d
   134756, // CHINANET Nanjing Jishan IDC network — 295 sites / 204 visitors / 0 interactions in 3d
   209372, // WS Telecom Inc — 384 sites / 1286 visitors / 1 interaction in 3d
   213541, // WS Telecom Inc — 166 sites / 311 visitors / 0 interactions in 3d
 ];
 
 const EXTRA_DATACENTER_ASN_SET: ReadonlySet<number> = new Set(EXTRA_DATACENTER_ASNS);
-
-export const CURATED_BOT_PROVIDER_ASN_COUNT = CURATED_BOT_PROVIDER_ASNS.length;
 
 const CURATED_BOT_PROVIDER_ASN_MAP: ReadonlyMap<number, CuratedBotProviderAsnEntry> = new Map(
   CURATED_BOT_PROVIDER_ASNS.map(entry => [entry.asn, entry])

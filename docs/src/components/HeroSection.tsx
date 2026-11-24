@@ -4,6 +4,7 @@ import { DomainStartForm } from "@/components/DomainStartForm";
 import { HeroDataLine } from "@/components/HeroDataLine";
 import { WatchfulFrog } from "@/components/deco/WatchfulFrog";
 import { TrackedButton } from "@/components/TrackedButton";
+import { toDemoEmbedUrl } from "@/lib/const";
 import { ExternalLink } from "lucide-react";
 import { useExtracted } from "next-intl";
 
@@ -89,13 +90,16 @@ export function HeroSection({ title, subtitle, showEUFlag = true, showGitHubStar
 
         {logoBand}
 
-        <div className="relative min-w-0 border-t border-neutral-200 bg-neutral-100 p-2 [background-image:radial-gradient(circle,rgba(0,0,0,0.08)_1px,transparent_1px)] [background-size:14px_14px] dark:border-neutral-800 dark:bg-neutral-900 dark:[background-image:radial-gradient(circle,rgba(255,255,255,0.07)_1px,transparent_1px)] sm:p-3">
+        <div className="relative min-w-0 border-t border-neutral-200 bg-neutral-100 p-2 dark:border-neutral-800 dark:bg-neutral-900 sm:p-3">
           <GridCrosses />
           {/* Peeking over the demo window; the browser card below is
-              `relative`, so DOM order lets it occlude the frog's body. */}
-          <div className="pointer-events-none absolute -top-12 right-10 hidden w-24 -rotate-2 text-neutral-950 opacity-[0.12] dark:text-white dark:opacity-[0.09] md:block lg:right-16 lg:w-28">
-            <WatchfulFrog />
-          </div>
+              `relative`, so DOM order lets it occlude the frog's body. Not
+              with a logo band: the frog would rise over a customer's logo. */}
+          {!logoBand && (
+            <div className="pointer-events-none absolute -top-12 right-10 hidden w-24 -rotate-2 text-neutral-950 opacity-[0.12] dark:text-white dark:opacity-[0.09] md:block lg:right-16 lg:w-28">
+              <WatchfulFrog />
+            </div>
+          )}
           <div className="relative min-w-0 max-w-full overflow-hidden rounded-lg border border-neutral-300 bg-white dark:border-neutral-700 dark:bg-neutral-950">
             <div className="grid h-10 grid-cols-[1fr_auto_1fr] items-center gap-2 border-b border-neutral-200 px-3 dark:border-neutral-800 sm:px-4">
               {/* Real macOS behavior: the glyphs only appear when you mouse
@@ -152,8 +156,10 @@ export function HeroSection({ title, subtitle, showEUFlag = true, showGitHubStar
                 mobile — a scaled viewport would land between the demo's
                 responsive breakpoints. The two values must stay reciprocal. */}
             <div className="h-[500px] min-w-0 max-w-full overflow-hidden md:h-[600px] lg:h-[650px]">
+              {/* A week, not the default "today": early in the visitor's day that is a near-empty
+                  dashboard with every change deep in the red. */}
               <iframe
-                src="https://demo.rybbit.com/81/main"
+                src={toDemoEmbedUrl("https://demo.rybbit.com/81/main?wellKnown=last-7-days")}
                 className="block h-full w-full border-none md:h-[117.6%] md:w-[117.6%] md:origin-top-left md:scale-[0.85]"
                 title="Rybbit Analytics Demo"
               />
